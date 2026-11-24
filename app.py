@@ -471,6 +471,12 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "audit_id": f"ED-{audit_hash}",
+        "worker_name": params.get("worker_name", ""),
+        "employer_name": params.get("employer_name", ""),
+        "role_title": params.get("role_title", ""),
+        "admission_date": adm_date.strftime("%d/%m/%Y"),
+        "dismissal_date": dism_date.strftime("%d/%m/%Y"),
+        "termination_type": term_type,
         "origin": "Calculado por motor próprio decimal (Python Decimal) — não homologado como API oficial PJe-Calc",
         "tables_version": TABLES_VERSION,
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -478,7 +484,150 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         "bruto_atualizado": bruto_atualizado,
         "abatimentos": abatimentos,
         "liquido_devido": liquido_devido,
+        "ai_opinion": params.get("ai_opinion") or {},
+        "lawyer_narrative": params.get("lawyer_narrative", ""),
     }
+
+
+def build_printable_dossier_html(calc: Dict[str, Any]) -> str:
+    """Gera relatório completo timbrado (HTML/PDF via navegador) para arquivamento do escritório."""
+    ai_op = calc.get("ai_opinion") or {}
+    irregs = ai_op.get("irregularities_found") or []
+    checklist = ai_op.get("recommended_claims_checklist") or []
+
+    rows_verbas = "".join(
+        f"""
+        <tr>
+          <td>{v['Código']}</td>
+          <td><strong>{v['Verba']}</strong><br><small style="color:#475569;">{v['Fórmula']}</small></td>
+          <td>{v['Quantidade']}</td>
+          <td>{v['Percentual']}</td>
+          <td style="text-align:right;">{fmt_brl(v['Base de Cálculo'])}</td>
+          <td style="text-align:right;">{fmt_brl(v['Valor Original'])}</td>
+          <td style="text-align:right;">{fmt_brl(v['Reflexos'])}</td>
+          <td style="text-align:right;"><strong>{fmt_brl(v['Total Apurado'])}</strong></td>
+        </tr>
+        """
+        for v in calc["verbas"]
+    )
+
+    irregs_html = ""
+    if irregs:
+        irregs_rows = "".join(
+            f"<tr><td><strong>{i.get('categoria','')}</strong></td><td>{i.get('origem_evidencia','')}</td>"
+            f"<td>{i.get('descricao','')}</td><td>{i.get('fundamento_juridico','')}</td></tr>"
+            for i in irregs
+        )
+        irregs_html = f"""
+        <h3>Irregularidades e Brechas Identificadas</h3>
+        <table>
+          <thead><tr><th>Categoria</th><th>Evidência</th><th>Descrição</th><th>Fundamento</th></tr></thead>
+          <tbody>{irregs_rows}</tbody>
+        </table>
+        """
+
+    checklist_html = ""
+    if checklist:
+        items_li = "".join(f"<li>{c}</li>" for c in checklist)
+        checklist_html = f"<h3>Pedidos Recomendados para a Petição Inicial</h3><ul>{items_li}</ul>"
+
+    parecer_html = ""
+    if ai_op.get("viability_conclusion") or ai_op.get("stability_alert") or ai_op.get("medical_leave_summary"):
+        parecer_html = f"""
+        <div class="box">
+          <h3>Parecer Preliminar de Viabilidade</h3>
+          {f'<p style="color:#991B1B;"><strong>Alerta de Estabilidade:</strong> {ai_op["stability_alert"]}</p>' if ai_op.get("stability_alert") else ""}
+          {f'<p><strong>Atestados / Afastamentos / ASO:</strong> {ai_op["medical_leave_summary"]}</p>' if ai_op.get("medical_leave_summary") else ""}
+          {f'<p>{ai_op["viability_conclusion"]}</p>' if ai_op.get("viability_conclusion") else ""}
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Dossiê Preliminar — {calc['audit_id']}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; color: #0F2537; margin: 32px; line-height: 1.45; }}
+    .header {{ background: #0B1B2B; color: #FFFFFF; padding: 20px 24px; border-radius: 8px; }}
+    .header h1 {{ margin: 0 0 4px 0; font-size: 20px; }}
+    .header p {{ margin: 0; font-size: 12px; color: #CBD5E1; }}
+    .meta {{ display: flex; flex-wrap: wrap; gap: 18px; margin: 16px 0; font-size: 13px; background: #F8FAFC; padding: 12px 16px; border: 1px solid #E2E8F0; border-radius: 6px; }}
+    .box {{ background: #F8FAFC; border-left: 4px solid #0B1B2B; padding: 12px 16px; margin: 16px 0; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }}
+    th, td {{ border: 1px solid #CBD5E1; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #F1F5F9; font-weight: bold; }}
+    .totals {{ margin-top: 18px; text-align: right; font-size: 14px; }}
+    .totals .final {{ font-size: 18px; font-weight: bold; color: #15803D; }}
+    .footer {{ margin-top: 28px; font-size: 11px; color: #64748B; border-top: 1px solid #E2E8F0; padding-top: 10px; }}
+    @media print {{ body {{ margin: 12mm; }} }}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>ED Cálculos Trabalhistas — Dossiê de Avaliação Preliminar & Auditoria</h1>
+    <p>Identificador de Auditoria: {calc['audit_id']} • Gerado em {calc['generated_at']} • Tabelas {calc['tables_version']}</p>
+  </div>
+  <div class="meta">
+    <div><strong>Reclamante:</strong> {calc.get('worker_name','')}</div>
+    <div><strong>Reclamada:</strong> {calc.get('employer_name','')}</div>
+    <div><strong>Cargo:</strong> {calc.get('role_title','')}</div>
+    <div><strong>Período:</strong> {calc.get('admission_date','')} a {calc.get('dismissal_date','')}</div>
+  </div>
+  {parecer_html}
+  {irregs_html}
+  {checklist_html}
+  <h3>Memória de Cálculo Auditável — Pedidos Liquidados</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Cód.</th><th>Verba / Fórmula</th><th>Qtd.</th><th>Perc.</th>
+        <th style="text-align:right;">Base</th><th style="text-align:right;">Original</th>
+        <th style="text-align:right;">Reflexos</th><th style="text-align:right;">Total</th>
+      </tr>
+    </thead>
+    <tbody>{rows_verbas}</tbody>
+  </table>
+  <div class="totals">
+    <div>Total Apurado das Verbas: <strong>{fmt_brl(calc['bruto_atualizado'])}</strong></div>
+    <div>(-) Valores Já Pagos no TRCT: <strong>-{fmt_brl(calc['abatimentos'])}</strong></div>
+    <div class="final">Valor da Causa / Restituição a Pedir: {fmt_brl(calc['liquido_devido'])}</div>
+  </div>
+  <div class="footer">
+    Origem do cálculo: {calc['origin']}. Para salvar em PDF, pressione Ctrl+P (ou Cmd+P) e escolha "Salvar como PDF".
+  </div>
+</body>
+</html>"""
+
+
+def build_complete_excel_bytes(calc: Dict[str, Any]) -> bytes:
+    """Gera planilha Excel multi-abas com Resumo, Verbas Liquidadas e Parecer/Irregularidades."""
+    buf = io.BytesIO()
+    df_verbas = pd.DataFrame(calc["verbas"])
+    for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"]:
+        if col in df_verbas.columns:
+            df_verbas[col] = df_verbas[col].apply(fmt_brl)
+
+    df_resumo = pd.DataFrame([
+        {"Campo": "Código de Auditoria", "Valor": calc["audit_id"]},
+        {"Campo": "Data/Hora Geração", "Valor": calc["generated_at"]},
+        {"Campo": "Reclamante (Cliente)", "Valor": calc.get("worker_name", "")},
+        {"Campo": "Reclamada (Empresa)", "Valor": calc.get("employer_name", "")},
+        {"Campo": "Período Contratual", "Valor": f"{calc.get('admission_date','')} a {calc.get('dismissal_date','')}"},
+        {"Campo": "Total Apurado das Verbas", "Valor": fmt_brl(calc["bruto_atualizado"])},
+        {"Campo": "(-) Total Já Pago no TRCT", "Valor": fmt_brl(calc["abatimentos"])},
+        {"Campo": "Valor da Causa / Restituição", "Valor": fmt_brl(calc["liquido_devido"])},
+    ])
+
+    ai_op = calc.get("ai_opinion") or {}
+    irregs = ai_op.get("irregularities_found") or []
+    df_irregs = pd.DataFrame(irregs) if irregs else pd.DataFrame([{"Aviso": "Nenhuma irregularidade estruturada registrada."}])
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_resumo.to_excel(writer, index=False, sheet_name="Resumo_Dossie")
+        df_verbas.to_excel(writer, index=False, sheet_name="Pedidos_Liquidados")
+        df_irregs.to_excel(writer, index=False, sheet_name="Parecer_Irregularidades")
+    return buf.getvalue()
 
 
 # ==============================================================================
@@ -486,20 +635,17 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 # ==============================================================================
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
-    st.caption("SaaS Jurídico • Parecer Pré-Processual & Auditoria")
+    st.caption("Parecer Pré-Processual & Auditoria")
     st.divider()
     menu = st.radio(
         "Navegação",
         [
             "Avaliação Preliminar & Auditoria",
             "Meus Cálculos e Relatórios",
-            "Central de Atualizações Legais",
-            "Assinaturas e LGPD",
         ],
     )
     st.divider()
     st.caption(f"Tabelas ativas: `{TABLES_VERSION}`")
-    st.caption("Modo: Multi-tenant isolado")
 
 
 # ==============================================================================
@@ -740,6 +886,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
                 "worker_name": cliente_nome,
                 "employer_name": empresa_nome,
+                "role_title": cargo_funcao,
                 "admission_date": adm_pre,
                 "dismissal_date": dism_pre,
                 "termination_type": motivo_saida,
@@ -764,6 +911,8 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "inc_noturno": total_not > 0,
                 "night_hours": total_not,
                 "night_pct": 20,
+                "ai_opinion": ext_pre,
+                "lawyer_narrative": lawyer_narrative,
             })
 
             if restituicao_atestados > 0:
@@ -815,44 +964,53 @@ if menu == "Avaliação Preliminar & Auditoria":
             with st.expander("Copiar Texto dos Pedidos Liquidados para a Petição Inicial (Art. 840, § 1º CLT)", expanded=True):
                 st.text_area("Minuta pronta para colar na inicial:", value="\n".join(linhas_pedidos), height=220)
 
-            excel_pre = io.BytesIO()
-            with pd.ExcelWriter(excel_pre, engine="openpyxl") as writer:
-                df_pre.to_excel(writer, index=False, sheet_name="Pedidos_Liquidados")
-            st.download_button(
-                "Baixar Planilha de Pedidos Liquidados para Anexar na Inicial (.XLSX)",
-                data=excel_pre.getvalue(),
-                file_name=f"Inicial_Trabalhista_{res_pre['audit_id']}.xlsx",
+            dl1, dl2 = st.columns(2)
+            dl1.download_button(
+                "Baixar Dossiê Completo em Excel (.XLSX — Resumo + Verbas + Parecer)",
+                data=build_complete_excel_bytes(res_pre),
+                file_name=f"Dossie_Trabalhista_{res_pre['audit_id']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            dl2.download_button(
+                "Baixar Relatório Timbrado para Imprimir / Salvar em PDF (.HTML)",
+                data=build_printable_dossier_html(res_pre).encode("utf-8"),
+                file_name=f"Relatorio_Dossie_{res_pre['audit_id']}.html",
+                mime="text/html",
+                use_container_width=True,
             )
 
 elif menu == "Meus Cálculos e Relatórios":
-    st.title("Meus Cálculos e Relatórios Auditáveis")
+    st.title("Meus Cálculos e Relatórios Salvos")
+    st.caption("Baixe o dossiê completo em Excel (.XLSX) ou o relatório timbrado (.HTML — abra no navegador e pressione Ctrl+P para salvar em PDF).")
     if not st.session_state.calculations_history:
         st.info("Nenhuma avaliação realizada nesta sessão ainda.")
     else:
-        for calc in st.session_state.calculations_history:
-            with st.expander(f"{calc['audit_id']} • {calc['generated_at']} • Valor da Causa: {fmt_brl(calc['liquido_devido'])}", expanded=True):
+        for idx, calc in enumerate(st.session_state.calculations_history):
+            titulo_exp = (
+                f"{calc['audit_id']} • {calc.get('worker_name', 'Cliente')} x {calc.get('employer_name', 'Empresa')} "
+                f"• Valor da Causa: {fmt_brl(calc['liquido_devido'])}"
+            )
+            with st.expander(titulo_exp, expanded=(idx == 0)):
                 df_rep = pd.DataFrame(calc["verbas"])
                 for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"]:
                     df_rep[col] = df_rep[col].apply(fmt_brl)
                 st.dataframe(df_rep, use_container_width=True, hide_index=True)
 
-elif menu == "Central de Atualizações Legais":
-    st.title("Central de Atualizações Legais e Tabelas")
-    st.write(f"Versão vigente das tabelas: **{TABLES_VERSION}**")
-    st.dataframe(
-        pd.DataFrame([
-            {"Fonte": "Previdência Social / RFB", "Norma": "Tabela Progressiva INSS e IRRF 2026", "Status": "Vigente (Referência)"},
-            {"Fonte": "CLT Art. 58 §1º e Art. 73", "Norma": "Tolerância 5/10 min e Hora Noturna Ficta (52m30s)", "Status": "Homologado no Motor"},
-            {"Fonte": "CSJT / PJe-Calc", "Norma": "Exportação .PJC nativa", "Status": "Bloqueada até validação oficial"},
-        ]),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-elif menu == "Assinaturas e LGPD":
-    st.title("Planos Comerciais e Conformidade LGPD")
-    p1, p2, p3 = st.columns(3)
-    p1.metric("Plano Individual", "R$ 99/mês", "1 usuário")
-    p2.metric("Plano Profissional", "R$ 199/mês", "Até 5 usuários")
-    p3.metric("Plano Escritório", "R$ 399/mês", "Multiusuário + Auditoria")
+                b1, b2 = st.columns(2)
+                b1.download_button(
+                    "Exportar Dossiê Excel (.XLSX)",
+                    data=build_complete_excel_bytes(calc),
+                    file_name=f"Dossie_Trabalhista_{calc['audit_id']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{calc['audit_id']}_{idx}",
+                    use_container_width=True,
+                )
+                b2.download_button(
+                    "Exportar Relatório Timbrado / PDF (.HTML)",
+                    data=build_printable_dossier_html(calc).encode("utf-8"),
+                    file_name=f"Relatorio_Dossie_{calc['audit_id']}.html",
+                    mime="text/html",
+                    key=f"dl_html_{calc['audit_id']}_{idx}",
+                    use_container_width=True,
+                )
