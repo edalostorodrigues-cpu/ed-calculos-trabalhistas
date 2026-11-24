@@ -688,6 +688,317 @@ def chat_with_case_strategist(
 
 
 # ==============================================================================
+# 6. MOTOR DE CÁLCULO DECIMAL EXATO E EXPORTAÇÃO XLSX / PDF
+# ==============================================================================
+def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Executa a liquidação trabalhista determinística em Decimal exato."""
+    adm_dt: date = params["admission_date"]
+    dism_dt: date = params["dismissal_date"]
+    term_type: str = str(params.get("termination_type") or "sem_justa_causa")
+    divisor = max(1, f_int(params.get("monthly_divisor"), 220))
+
+    base_sal = d_money(params.get("base_salary"))
+    commissions = d_money(params.get("commissions"))
+    insal_val = d_money(params.get("insalubrity"))
+    plus_pct = Decimal(str(f_float(params.get("plus_acumulo_pct"), 0.0))) / Decimal("100")
+    dif_equip = d_money(params.get("dif_equiparacao_mensal"))
+
+    plus_mensal = (base_sal * plus_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+    rem_base = base_sal + commissions + insal_val + plus_mensal + dif_equip
+    hora_normal = (rem_base / Decimal(str(divisor))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+    verbas: List[Dict[str, Any]] = []
+    period_str = f"{adm_dt.strftime('%d/%m/%Y')} a {dism_dt.strftime('%d/%m/%Y')}"
+
+    def add_verba(
+        cod: str,
+        nome: str,
+        base_calc: Decimal,
+        formula: str,
+        qtd: str,
+        pct: str,
+        valor_orig: Decimal,
+        reflexos: Decimal = Decimal("0.00"),
+        inc_fgts: bool = True,
+    ) -> None:
+        orig_q = valor_orig.quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
+        tot_q = (orig_q + refl_q).quantize(CENT, rounding=ROUND_HALF_UP)
+        if tot_q <= Decimal("0.00"):
+            return
+        verbas.append({
+            "Código": cod,
+            "Verba": nome,
+            "Período": period_str,
+            "Base de Cálculo": base_calc.quantize(CENT, rounding=ROUND_HALF_UP),
+            "Fórmula": formula,
+            "Quantidade": qtd,
+            "Percentual": pct,
+            "Valor Original": orig_q,
+            "Reflexos": refl_q,
+            "Total Apurado": tot_q,
+            "Incide FGTS": inc_fgts,
+        })
+
+    # 1. Saldo de Salário
+    if params.get("inc_saldo_salario"):
+        dias_s = max(0, min(31, f_int(params.get("saldo_dias"), dism_dt.day)))
+        val_saldo = (rem_base / Decimal("30") * Decimal(str(dias_s))).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-01", "Saldo de Salário", rem_base, "(Remuneração / 30) × Dias", f"{dias_s} dias", "100%", val_saldo, inc_fgts=True)
+
+    # 2. Aviso-Prévio Indenizado (Lei 12.506/2011)
+    anos_completos = max(0, (dism_dt - adm_dt).days // 365)
+    dias_aviso = min(90, 30 + anos_completos * 3)
+    if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "justa_causa", "acordo"):
+        fator_aviso = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
+        val_aviso = (rem_base / Decimal("30") * Decimal(str(dias_aviso)) * fator_aviso).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-02", f"Aviso-Prévio Indenizado ({dias_aviso} dias)", rem_base, "(Remuneração / 30) × Dias Aviso", f"{dias_aviso} dias", "50%" if term_type == "acordo" else "100%", val_aviso, inc_fgts=True)
+
+    # 3. 13º Salário Proporcional e Férias Proporcionais + 1/3 + Vencidas
+    meses_ano = dism_dt.month if dism_dt.day >= 15 else max(0, dism_dt.month - 1)
+    if params.get("inc_13") and meses_ano > 0:
+        val_13 = (rem_base / Decimal("12") * Decimal(str(meses_ano))).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-03A", "13º Salário Proporcional (c/ Projeção)", rem_base, "(Remuneração / 12) × Avos", f"{meses_ano}/12 avos", "100%", val_13, inc_fgts=True)
+
+    if params.get("inc_ferias"):
+        avos_ferias = max(1, ((dism_dt.year - adm_dt.year) * 12 + (dism_dt.month - adm_dt.month)) % 12 or 12)
+        val_ferias_prop = (rem_base / Decimal("12") * Decimal(str(avos_ferias))).quantize(CENT, rounding=ROUND_HALF_UP)
+        terco_prop = (val_ferias_prop / Decimal("3")).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-03B", "Férias Proporcionais + 1/3 Constitucional (c/ Projeção)", rem_base, "((Remuneração / 12) × Avos) + 1/3", f"{avos_ferias}/12 avos", "133,33%", val_ferias_prop, terco_prop, inc_fgts=False)
+
+    ferias_venc = max(0, f_int(params.get("periodos_ferias_vencidas"), 0))
+    if ferias_venc > 0:
+        val_fv = (rem_base * Decimal(str(ferias_venc)) * Decimal("2")).quantize(CENT, rounding=ROUND_HALF_UP)
+        terco_fv = (val_fv / Decimal("3")).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-03C", "Férias Vencidas em Dobro + 1/3 (Art. 137 CLT)", rem_base, "(Remuneração × 2) × Períodos + 1/3", f"{ferias_venc} per.", "200% + 1/3", val_fv, terco_fv, inc_fgts=False)
+
+    # 4. Adicional de Insalubridade / Periculosidade Retroativo
+    meses_contrato = max(1, min(60, (dism_dt.year - adm_dt.year) * 12 + (dism_dt.month - adm_dt.month) + 1))
+    fator_refl_hab = Decimal("0.225") if params.get("inc_reflexos_completos") else Decimal("0.00")
+
+    if params.get("inc_adicional_retroativo") and insal_val > Decimal("0.00"):
+        orig_adic = (insal_val * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_adic = (orig_adic * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba(
+            "VER-04B",
+            f"Adicional Retroativo — {params.get('adicional_label', 'Insalubridade/Periculosidade')}",
+            insal_val,
+            "Adicional Mensal × Meses Imprescritos + Reflexos",
+            f"{meses_contrato} meses",
+            str(params.get("adicional_pct_label", "")),
+            orig_adic,
+            refl_adic,
+            inc_fgts=True,
+        )
+
+    # 5. Horas Extras 50%, 100%, Intrajornada e Adicional Noturno
+    if params.get("inc_he50") and f_float(params.get("he50_hours"), 0.0) > 0:
+        h50 = Decimal(str(f_float(params.get("he50_hours"), 0.0)))
+        orig_he50 = (hora_normal * Decimal("1.50") * h50).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_he50 = (orig_he50 * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-05A", "Horas Extras 50% + DSR e Reflexos", hora_normal, "(Hora Normal × 1,50) × Horas + DSR/Reflexos", f"{h50:.2f}h", "+50%", orig_he50, refl_he50, inc_fgts=True)
+
+    if params.get("inc_he100") and f_float(params.get("he100_hours"), 0.0) > 0:
+        h100 = Decimal(str(f_float(params.get("he100_hours"), 0.0)))
+        orig_he100 = (hora_normal * Decimal("2.00") * h100).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_he100 = (orig_he100 * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-05B", "Horas Extras 100% (Domingos/Feriados) + Reflexos", hora_normal, "(Hora Normal × 2,00) × Horas + Reflexos", f"{h100:.2f}h", "+100%", orig_he100, refl_he100, inc_fgts=True)
+
+    if params.get("inc_intrajornada") and f_float(params.get("intrajornada_hours"), 0.0) > 0:
+        hintra = Decimal(str(f_float(params.get("intrajornada_hours"), 0.0)))
+        orig_intra = (hora_normal * Decimal("1.50") * hintra).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-05C", "Intervalo Intrajornada Suprimido (+50% — Art. 71, § 4º CLT)", hora_normal, "(Hora Normal × 1,50) × Horas Suprimidas", f"{hintra:.2f}h", "+50%", orig_intra, inc_fgts=False)
+
+    if params.get("inc_noturno") and f_float(params.get("night_hours"), 0.0) > 0:
+        hnot = Decimal(str(f_float(params.get("night_hours"), 0.0)))
+        orig_not = (hora_normal * Decimal("0.20") * hnot).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_not = (orig_not * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-06", "Adicional Noturno (20%) + Hora Ficta e Reflexos", hora_normal, "(Hora Normal × 0,20) × Horas Fictas + Reflexos", f"{hnot:.2f}h", "+20%", orig_not, refl_not, inc_fgts=True)
+
+    # 6. Período sem registro CTPS, Acúmulo de Função, Equiparação e Estabilidade
+    meses_sem_reg = max(0, f_int(params.get("meses_sem_registro"), 0))
+    if meses_sem_reg > 0:
+        verbas_sem_reg = (rem_base * Decimal("0.272") * Decimal(str(meses_sem_reg))).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-07A", "Reconhecimento de Vínculo / Período Sem Registro CTPS (13º, Férias+1/3 e FGTS)", rem_base, "(Remuneração × 27,2%) × Meses Sem Registro", f"{meses_sem_reg} meses", "27,2%", verbas_sem_reg, inc_fgts=False)
+
+    if plus_mensal > Decimal("0.00"):
+        orig_plus = (plus_mensal * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_plus = (orig_plus * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-07B", "Plus Salarial por Acúmulo / Desvio de Função + Reflexos", base_sal, "(Salário × %) × Meses + Reflexos", f"{meses_contrato} meses", f"{f_float(params.get('plus_acumulo_pct'), 0.0):g}%", orig_plus, refl_plus, inc_fgts=True)
+
+    if dif_equip > Decimal("0.00"):
+        orig_eq = (dif_equip * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_eq = (orig_eq * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-07C", "Diferenças Salariais por Equiparação (Art. 461 CLT) + Reflexos", dif_equip, "Diferença Mensal × Meses + Reflexos", f"{meses_contrato} meses", "100%", orig_eq, refl_eq, inc_fgts=True)
+
+    meses_estab = max(0, f_int(params.get("meses_estabilidade"), 0))
+    if meses_estab > 0:
+        ind_estab = (rem_base * Decimal(str(meses_estab)) * Decimal("1.272")).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-08", "Indenização Estabilidade Provisória Violada (Salários + 13º + Férias + FGTS)", rem_base, "(Remuneração × 1,272) × Meses Restantes", f"{meses_estab} meses", "100%", ind_estab, inc_fgts=False)
+
+    # 7. FGTS (8%) + Multa Rescisória configurável (%)
+    if params.get("inc_fgts"):
+        base_fgts_verbas = sum((v["Total Apurado"] for v in verbas if v.get("Incide FGTS")), Decimal("0.00"))
+        fgts_sobre_verbas = (base_fgts_verbas * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
+        fgts_faltante = d_money(params.get("fgts_nao_depositado"))
+        fgts_contrato_estimado = (rem_base * Decimal(str(meses_contrato)) * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
+        base_para_multa = fgts_contrato_estimado + fgts_sobre_verbas + fgts_faltante
+        multa_pct = Decimal(str(f_float(params.get("fgts_multa_pct"), 40.0))) / Decimal("100")
+        multa_fgts_val = (base_para_multa * multa_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+        total_fgts_item = fgts_sobre_verbas + fgts_faltante
+        if total_fgts_item > Decimal("0.00") or multa_fgts_val > Decimal("0.00"):
+            add_verba(
+                "VER-09",
+                f"FGTS (8% Verbas + Depósitos Faltantes) + Multa Rescisória ({f_float(params.get('fgts_multa_pct'), 40.0):g}%)",
+                base_para_multa,
+                f"FGTS 8% + Multa {f_float(params.get('fgts_multa_pct'), 40.0):g}% sobre Saldo Total FGTS",
+                f"{meses_contrato} meses",
+                f"{f_float(params.get('fgts_multa_pct'), 40.0):g}%",
+                total_fgts_item,
+                multa_fgts_val,
+                inc_fgts=False,
+            )
+
+    # 8. Multas Arts. 477 e 467 da CLT
+    if params.get("inc_multa_477"):
+        add_verba("VER-10A", "Multa por Atraso na Quitação Rescisória (Art. 477, § 8º CLT)", rem_base, "1 Remuneração Mensal", "1 mês", "100%", rem_base, inc_fgts=False)
+
+    if params.get("inc_multa_467"):
+        base_467 = sum((v["Total Apurado"] for v in verbas if v["Código"] in ("VER-01", "VER-02", "VER-03A", "VER-03B")), Decimal("0.00"))
+        multa_467_val = (base_467 * Decimal("0.50")).quantize(CENT, rounding=ROUND_HALF_UP)
+        add_verba("VER-10B", "Multa de 50% sobre Verbas Rescisórias Incontroversas (Art. 467 CLT)", base_467, "50% × Verbas Rescisórias", "1", "50%", multa_467_val, inc_fgts=False)
+
+    bruto_total = sum((v["Total Apurado"] for v in verbas), Decimal("0.00")).quantize(CENT, rounding=ROUND_HALF_UP)
+    abatimentos = d_money(params.get("offsets"))
+    liquido = max(Decimal("0.00"), bruto_total - abatimentos).quantize(CENT, rounding=ROUND_HALF_UP)
+
+    raw_sig = f"{params.get('worker_name')}|{params.get('employer_name')}|{adm_dt}|{dism_dt}|{liquido}"
+    audit_hash = "ED-" + hashlib.sha256(raw_sig.encode("utf-8")).hexdigest()[:8].upper()
+
+    return {
+        "audit_id": audit_hash,
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "office_header": str(params.get("office_header") or "Escritório de Advocacia Trabalhista"),
+        "worker_name": str(params.get("worker_name") or "Cliente"),
+        "employer_name": str(params.get("employer_name") or "Empresa"),
+        "role_title": str(params.get("role_title") or ""),
+        "admission_date": adm_dt.strftime("%d/%m/%Y"),
+        "dismissal_date": dism_dt.strftime("%d/%m/%Y"),
+        "termination_type": term_type,
+        "base_remuneracao": rem_base,
+        "verbas": verbas,
+        "bruto_atualizado": bruto_total,
+        "abatimentos": abatimentos,
+        "liquido_devido": liquido,
+        "ai_opinion": params.get("ai_opinion") or {},
+        "lawyer_narrative": str(params.get("lawyer_narrative") or ""),
+    }
+
+
+def build_complete_excel_bytes(calc: Dict[str, Any]) -> bytes:
+    """Gera planilha Excel (.XLSX) com Resumo, Verbas Liquidadas e Parecer Técnico."""
+    output = io.BytesIO()
+    resumo_rows = [
+        {"Campo": "Escritório / Timbre", "Valor": calc.get("office_header", "")},
+        {"Campo": "Código de Auditoria", "Valor": calc.get("audit_id", "")},
+        {"Campo": "Data/Hora Emissão", "Valor": calc.get("generated_at", "")},
+        {"Campo": "Reclamante (Cliente)", "Valor": calc.get("worker_name", "")},
+        {"Campo": "Reclamada (Empresa)", "Valor": calc.get("employer_name", "")},
+        {"Campo": "Cargo / Função", "Valor": calc.get("role_title", "")},
+        {"Campo": "Período Contratual", "Valor": f"{calc.get('admission_date')} a {calc.get('dismissal_date')}"},
+        {"Campo": "Remuneração Base Apurada", "Valor": fmt_brl(calc.get("base_remuneracao", Decimal("0.00")))},
+        {"Campo": "Total Bruto das Verbas", "Valor": fmt_brl(calc.get("bruto_atualizado", Decimal("0.00")))},
+        {"Campo": "(-) Abatimentos TRCT", "Valor": fmt_brl(calc.get("abatimentos", Decimal("0.00")))},
+        {"Campo": "VALOR TOTAL DA CAUSA", "Valor": fmt_brl(calc.get("liquido_devido", Decimal("0.00")))},
+    ]
+    df_resumo = pd.DataFrame(resumo_rows)
+
+    verbas_export = []
+    for v in (calc.get("verbas") or []):
+        verbas_export.append({
+            "Código": v.get("Código"),
+            "Verba": v.get("Verba"),
+            "Período": v.get("Período"),
+            "Quantidade": v.get("Quantidade"),
+            "Percentual": v.get("Percentual"),
+            "Base de Cálculo (R$)": float(d_money(v.get("Base de Cálculo"))),
+            "Fórmula": v.get("Fórmula"),
+            "Valor Original (R$)": float(d_money(v.get("Valor Original"))),
+            "Reflexos (R$)": float(d_money(v.get("Reflexos"))),
+            "Total Apurado (R$)": float(d_money(v.get("Total Apurado"))),
+        })
+    df_verbas = pd.DataFrame(verbas_export)
+
+    op = calc.get("ai_opinion") or {}
+    parecer_rows = [
+        {"Tópico": "Diagnóstico NR-15 / NR-16", "Conteúdo": str(op.get("nr_technical_assessment") or "Não aplicável")},
+        {"Tópico": "Alerta de Estabilidade", "Conteúdo": str(op.get("stability_alert") or "Nenhum")},
+        {"Tópico": "Atestados / ASO / INSS", "Conteúdo": str(op.get("medical_leave_summary") or "Nenhum")},
+        {"Tópico": "Conclusão de Viabilidade", "Conteúdo": str(op.get("viability_conclusion") or "")},
+        {"Tópico": "Relato do Caso", "Conteúdo": str(calc.get("lawyer_narrative") or "")},
+    ]
+    df_parecer = pd.DataFrame(parecer_rows)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_resumo.to_excel(writer, sheet_name="Resumo_Causa", index=False)
+        df_verbas.to_excel(writer, sheet_name="Memoria_Verbas", index=False)
+        df_parecer.to_excel(writer, sheet_name="Parecer_Tecnico", index=False)
+
+    return output.getvalue()
+
+
+def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
+    """Gera relatório oficial em PDF (fpdf2) com timbre, memória de cálculo e parecer."""
+    def _latin(txt: Any) -> str:
+        return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, _latin(calc.get("office_header", "ED Cálculos Trabalhistas")), ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, _latin(f"Dossiê Pré-Processual e Liquidação (Art. 840, § 1º CLT) | ID: {calc.get('audit_id')} | Emissão: {calc.get('generated_at')}"), ln=True)
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, _latin(f"Reclamante: {calc.get('worker_name')}  |  Reclamada: {calc.get('employer_name')}"), ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, _latin(f"Cargo: {calc.get('role_title')}  |  Contrato: {calc.get('admission_date')} a {calc.get('dismissal_date')}  |  Remuneração Base: {fmt_brl(calc.get('base_remuneracao'))}"), ln=True)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, _latin("QUADRO DE PEDIDOS LIQUIDADOS"), ln=True)
+    pdf.set_font("Helvetica", "", 8.5)
+    for v in (calc.get("verbas") or []):
+        linha = f"[{v.get('Código')}] {v.get('Verba')} ({v.get('Quantidade')}) — Orig: {fmt_brl(v.get('Valor Original'))} | Refl: {fmt_brl(v.get('Reflexos'))} | Total: {fmt_brl(v.get('Total Apurado'))}"
+        pdf.multi_cell(0, 5, _latin(linha))
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, _latin(f"Total Bruto: {fmt_brl(calc.get('bruto_atualizado'))}   |   (-) Abatimentos TRCT: {fmt_brl(calc.get('abatimentos'))}"), ln=True)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, _latin(f"VALOR TOTAL ATRIBUÍDO À CAUSA: {fmt_brl(calc.get('liquido_devido'))}"), ln=True)
+
+    op = calc.get("ai_opinion") or {}
+    if op.get("nr_technical_assessment") or op.get("viability_conclusion"):
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _latin("PARECER TÉCNICO E ESTRATÉGICO"), ln=True)
+        pdf.set_font("Helvetica", "", 8.5)
+        if op.get("nr_technical_assessment"):
+            pdf.multi_cell(0, 5, _latin(f"NR-15 / NR-16: {op.get('nr_technical_assessment')}"))
+        if op.get("viability_conclusion"):
+            pdf.multi_cell(0, 5, _latin(f"Viabilidade: {op.get('viability_conclusion')}"))
+
+    raw_pdf = pdf.output()
+    if isinstance(raw_pdf, (bytes, bytearray)):
+        return bytes(raw_pdf)
+    return str(raw_pdf).encode("latin-1", errors="replace")
+
+
+# ==============================================================================
 # 7. MENU LATERAL
 # ==============================================================================
 with st.sidebar:
