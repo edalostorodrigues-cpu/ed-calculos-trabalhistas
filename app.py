@@ -26,6 +26,137 @@ except ImportError:
 
 
 # ==============================================================================
+# 1. CONFIGURAÇÃO DA PÁGINA E ESTILO EXECUTIVO
+# ==============================================================================
+st.set_page_config(
+    page_title="ED Cálculos Trabalhistas",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #F4F6F9; color: #0F2537; }
+    section[data-testid="stSidebar"] { background-color: #0B1B2B; color: #FFFFFF; }
+    section[data-testid="stSidebar"] * { color: #F8FAFC; }
+    section[data-testid="stSidebar"] button {
+        background-color: #16324A !important;
+        color: #FFFFFF !important;
+        border: 1px solid #2A4F70 !important;
+    }
+    section[data-testid="stSidebar"] button:hover {
+        background-color: #1E4363 !important;
+        border-color: #60A5FA !important;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 14px 18px;
+        box-shadow: 0 1px 2px rgba(15, 37, 55, 0.04);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ==============================================================================
+# 2. TABELAS HISTÓRICAS VERSIONADAS E UTILITÁRIOS DECIMAIS EXATOS
+# ==============================================================================
+TABLES_VERSION = "2026.11-estavel"
+CENT = Decimal("0.01")
+
+HISTORICAL_MIN_WAGE: List[tuple[date, Decimal]] = [
+    (date(2026, 1, 1), Decimal("1621.00")),
+    (date(2025, 1, 1), Decimal("1518.00")),
+    (date(2024, 1, 1), Decimal("1412.00")),
+    (date(2023, 5, 1), Decimal("1320.00")),
+    (date(2023, 1, 1), Decimal("1302.00")),
+    (date(2022, 1, 1), Decimal("1212.00")),
+    (date(2021, 1, 1), Decimal("1100.00")),
+]
+
+
+def d_money(val: Any) -> Decimal:
+    """Converte qualquer entrada numérica/texto para Decimal exato com 2 casas."""
+    if val is None:
+        return Decimal("0.00")
+    if isinstance(val, Decimal):
+        return val.quantize(CENT, rounding=ROUND_HALF_UP)
+    try:
+        s = str(val).strip().replace("R$", "").replace(" ", "")
+        if not s:
+            return Decimal("0.00")
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            s = s.replace(",", ".")
+        return Decimal(s).quantize(CENT, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return Decimal("0.00")
+
+
+def f_float(val: Any, default: float = 0.0) -> float:
+    """Converte valor opcional (incluindo None vindo da IA) para float seguro."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def f_int(val: Any, default: int = 0) -> int:
+    """Converte valor opcional (incluindo None vindo da IA) para int seguro."""
+    if val is None:
+        return default
+    try:
+        return int(round(float(val)))
+    except (TypeError, ValueError):
+        return default
+
+
+def fmt_brl(val: Any) -> str:
+    """Formata Decimal ou float no padrão monetário brasileiro."""
+    dec = d_money(val)
+    sign = "-" if dec < Decimal("0.00") else ""
+    abs_val = abs(dec)
+    inteiro, frac = f"{abs_val:.2f}".split(".")
+    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
+    return f"{sign}R$ {inteiro_fmt},{frac}"
+
+
+def get_historical_min_wage(ref_date: date) -> Decimal:
+    """Retorna o salário mínimo nacional vigente na data de referência."""
+    for start_dt, mw in HISTORICAL_MIN_WAGE:
+        if ref_date >= start_dt:
+            return mw
+    return HISTORICAL_MIN_WAGE[-1][1]
+
+
+def parse_hhmm(raw: Any) -> Optional[int]:
+    """Converte string HH:MM para minutos inteiros desde 00:00."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or ":" not in s:
+        return None
+    parts = s.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        if 0 <= h <= 29 and 0 <= m <= 59:
+            return h * 60 + m
+    except ValueError:
+        return None
+    return None
+
+
+# ==============================================================================
 # 3. CONEXÃO NA NUVEM (SUPABASE REST NATIVO) E ESTADO DA SESSÃO
 # ==============================================================================
 def get_supabase_credentials() -> tuple[Optional[str], Optional[str]]:
@@ -172,20 +303,11 @@ if "selected_chat_case_id" not in st.session_state:
     st.session_state.selected_chat_case_id = "caso_atual"
 if "cloud_connected" not in st.session_state:
     st.session_state.cloud_connected = False
-    if not s or ":" not in s:
-        return None
-    parts = s.split(":")
-    if len(parts) < 2:
-        return None
-    try:
-        h, m = int(parts[0]), int(parts[1])
-        if 0 <= h <= 29 and 0 <= m <= 59:
-            return h * 60 + m
-    except ValueError:
-        return None
-    return None
 
 
+# ==============================================================================
+# 4. APURADOR DETERMINÍSTICO DE CARTÃO DE PONTO (EM MINUTOS INTEIROS)
+# ==============================================================================
 def calc_night_minutes(start_min: int, end_min: int) -> int:
     """Calcula minutos trabalhados no período noturno urbano (22h às 05h)."""
     if end_min <= start_min:
