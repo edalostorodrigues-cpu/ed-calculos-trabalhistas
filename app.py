@@ -208,13 +208,11 @@ def _deserialize_calc_from_cloud(raw_calc: Dict[str, Any]) -> Dict[str, Any]:
         verbas_restored.append(v_copy)
     calc["verbas"] = verbas_restored
     return calc
-
-
-def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool]:
+def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool, str]:
     """Carrega todos os clientes e históricos de chat salvos na nuvem Supabase."""
     sb_url, sb_key = get_supabase_credentials()
     if not sb_url or not sb_key:
-        return [], {}, False
+        return [], {}, False, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes"
     try:
         endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?select=*&order=updated_at.desc"
         req = urllib.request.Request(
@@ -242,16 +240,16 @@ def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict
                 if isinstance(ch, str):
                     ch = json.loads(ch)
                 chats_out[cid] = ch if isinstance(ch, list) else []
-        return calcs_out, chats_out, True
-    except Exception:
-        return [], {}, False
+        return calcs_out, chats_out, True, "Conectada"
+    except Exception as exc:
+        return [], {}, False, str(exc)
 
 
-def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]]) -> bool:
+def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]]) -> tuple[bool, str]:
     """Salva ou atualiza (upsert) um cliente e seu histórico de chat no Supabase."""
     sb_url, sb_key = get_supabase_credentials()
     if not sb_url or not sb_key:
-        return False
+        return False, "Secrets ausentes"
     try:
         client_key = f"{str(calc.get('worker_name', '')).strip().lower()}|{str(calc.get('employer_name', '')).strip().lower()}"
         body = {
@@ -277,14 +275,16 @@ def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
-            return resp.status in (200, 201, 204)
-    except Exception:
-        return False
+            ok = resp.status in (200, 201, 204)
+            return ok, "OK" if ok else f"HTTP {resp.status}"
+    except Exception as exc:
+        return False, str(exc)
 
 
 if "cloud_loaded_once" not in st.session_state:
-    cloud_calcs, cloud_chats, cloud_ok = supabase_load_all_cases()
+    cloud_calcs, cloud_chats, cloud_ok, cloud_msg = supabase_load_all_cases()
     st.session_state.cloud_connected = cloud_ok
+    st.session_state.cloud_status_detail = cloud_msg
     st.session_state.calculations_history = cloud_calcs
     st.session_state.case_chat_threads = {"caso_atual": [], **cloud_chats}
     st.session_state.cloud_loaded_once = True
@@ -1019,11 +1019,13 @@ with st.sidebar:
         ],
     )
     st.divider()
-    st.caption(f"Tabelas ativas: `{TABLES_VERSION}`")
+    st.markdown(f"**Tabelas ativas:** <span style='background:#16324A;color:#93C5FD;padding:2px 8px;border-radius:6px;font-family:monospace;font-size:12px;'>{TABLES_VERSION}</span>", unsafe_allow_html=True)
     if st.session_state.get("cloud_connected"):
-        st.caption("Nuvem Supabase: `Conectada ☁️`")
+        st.markdown("**Nuvem Supabase:** <span style='background:#14532D;color:#86EFAC;padding:2px 8px;border-radius:6px;font-size:12px;'>Conectada ☁️</span>", unsafe_allow_html=True)
     else:
-        st.caption("Nuvem Supabase: `Modo Sessão Local`")
+        st.markdown("**Nuvem Supabase:** <span style='background:#7F1D1D;color:#FCA5A5;padding:2px 8px;border-radius:6px;font-size:12px;'>Desconectada</span>", unsafe_allow_html=True)
+        if st.session_state.get("cloud_status_detail"):
+            st.caption(f"Detalhe: {st.session_state['cloud_status_detail']}")
     if st.session_state.calculations_history:
         st.divider()
         # Agrupa por cliente/empresa para nunca duplicar o mesmo cliente na lista lateral
@@ -1455,8 +1457,12 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.session_state.case_chat_threads[res_pre["audit_id"]] = final_case_msgs
             st.session_state.selected_chat_case_id = res_pre["audit_id"]
             st.session_state["chat_case_selector_widget"] = res_pre["audit_id"]
-            if supabase_upsert_case(res_pre, final_case_msgs):
+            up_ok, up_msg = supabase_upsert_case(res_pre, final_case_msgs)
+            if up_ok:
                 st.session_state.cloud_connected = True
+                st.session_state.cloud_status_detail = "Conectada"
+            else:
+                st.session_state.cloud_status_detail = up_msg
             st.success(f"Cálculo preliminar pronto para ajuizamento! Código: **{res_pre['audit_id']}**")
 
             k1, k2, k3 = st.columns(3)
