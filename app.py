@@ -786,6 +786,10 @@ if menu == "Avaliação Preliminar & Auditoria":
 
     with st.form("preliminary_eval_form"):
         st.subheader("2. Conferência das Condições do Contrato e Pedidos")
+        if ext_pre:
+            st.success("Campos abaixo preenchidos automaticamente com base no seu relato e nos documentos anexados. Ajuste apenas se desejar alterar algo.")
+        else:
+            st.caption("Preenchimento inicial de exemplo — clique em 'Analisar Relato + Documentos' acima para preencher automaticamente ou edite diretamente abaixo.")
         p1, p2, p3 = st.columns(3)
         cliente_nome = p1.text_input("Nome do Cliente (Reclamante) *", value=ext_pre.get("worker_name") or "João da Silva")
         empresa_nome = p2.text_input("Empresa (Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
@@ -840,11 +844,13 @@ if menu == "Avaliação Preliminar & Auditoria":
         ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=bool(ext_pre.get("sugerir_aviso_previo", True)))
         ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=bool(ext_pre.get("sugerir_13_e_ferias", True)))
         ped_fgts = v3.checkbox("Diferenças de FGTS (8%) + Multa Rescisória", value=bool(ext_pre.get("sugerir_fgts_e_multa", True)))
+        rest_auto = float(ext_pre.get("restituicao_atestados_ou_descontos") or 0.0)
         restituicao_atestados = v3.number_input(
             "Restituição de Atestados / Descontos Indevidos (R$)",
             min_value=0.0,
-            value=float(ext_pre.get("restituicao_atestados_ou_descontos") or 0.0),
+            value=rest_auto,
             step=50.0,
+            help="Preenchido automaticamente se constar desconto indevido no TRCT/contracheque/atestado, ou informe manualmente o total em R$ a restituir.",
         )
 
         avaliar_btn = st.form_submit_button("Gerar Cálculos e Quadro de Pedidos para Ajuizamento", type="primary")
