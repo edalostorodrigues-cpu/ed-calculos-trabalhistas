@@ -791,6 +791,143 @@ elif menu == "Dashboard Executivo":
     c4.metric("Plano Ativo", "Escritório • R$ 399/mês")
 
 elif menu == "Liquidação de Sentença (Upload)":
+    st.title("Liquidação de Sentença Judicial (Upload Automático + Revisão)")
+    st.markdown("Envie o **Cartão de Ponto (CSV/Excel)** e a **Sentença/Contracheque (PDF/TXT)** para extração assistida, revisão humana obrigatória e cálculo decimal.")
+
+    col_u1, col_u2 = st.columns(2)
+    with col_u1:
+        up_ponto = st.file_uploader("1. Cartão de Ponto (.csv ou .xlsx)", type=["csv", "xlsx"], key="liq_ponto")
+        if up_ponto is not None:
+            if up_ponto.name.endswith(".csv"):
+                raw_txt = up_ponto.getvalue().decode("utf-8", errors="ignore")
+                sep = ";" if ";" in raw_txt.splitlines()[0] else ","
+                df_in = pd.read_csv(io.StringIO(raw_txt), sep=sep)
+            else:
+                df_in = pd.read_excel(up_ponto)
+            st.session_state.timecard_result = process_timecard_dataframe(df_in)
+            st.success("Cartão de ponto apurado automaticamente!")
+
+    with col_u2:
+        up_doc = st.file_uploader("2. Sentença ou Contracheque (.pdf ou .txt)", type=["pdf", "txt"], key="liq_doc")
+        if up_doc is not None and st.button("Extrair Dados da Sentença (Gemini)", key="btn_liq_gemini"):
+            try:
+                mime = "application/pdf" if up_doc.name.endswith(".pdf") else "text/plain"
+                st.session_state.extracted_ai_data = extract_document_with_gemini(up_doc.getvalue(), mime)
+                st.session_state.extraction_confirmed = False
+                st.success("Dados extraídos! Confirme abaixo antes de calcular.")
+            except Exception as exc:
+                st.warning(f"Extração via Gemini indisponível ({exc}). Preencha manualmente abaixo.")
+
+    if st.session_state.extracted_ai_data:
+        st.json(st.session_state.extracted_ai_data)
+        st.session_state.extraction_confirmed = st.checkbox(
+            "Confirmo que revisei os dados extraídos do documento",
+            value=st.session_state.extraction_confirmed,
+        )
+
+    tc_liq = st.session_state.timecard_result
+    ext_liq = st.session_state.extracted_ai_data or {}
+
+    with st.form("liquidacao_sentenca_form"):
+        f1, f2, f3 = st.columns(3)
+        proc_num = f1.text_input("Número do Processo *", value=ext_liq.get("process_number") or "0001245-88.2025.5.04.0012")
+        trab_nome = f2.text_input("Reclamante *", value=ext_liq.get("worker_name") or "Carlos Eduardo Pereira")
+        emp_nome = f3.text_input("Reclamada *", value=ext_liq.get("employer_name") or "Metalúrgica Sul Horizonte Ltda.")
+
+        f4, f5, f6, f7 = st.columns(4)
+        adm_liq = f4.date_input("Admissão *", value=date(2023, 3, 10), key="adm_liq")
+        dism_liq = f5.date_input("Desligamento *", value=date(2026, 10, 31), key="dism_liq")
+        sal_liq = f6.number_input("Salário-Base (R$) *", min_value=0.0, value=float(ext_liq.get("base_salary") or 3450.00), step=50.0)
+        div_liq = f7.number_input("Divisor Mensal *", min_value=1, max_value=300, value=int(ext_liq.get("monthly_divisor") or 220))
+
+        f8, f9, f10, f11 = st.columns(4)
+        he50_liq = f8.number_input("Horas Extras 50% (h)", min_value=0.0, value=float(tc_liq["he50_hours"]) if tc_liq else 24.0)
+        he100_liq = f9.number_input("Horas Extras 100% (h)", min_value=0.0, value=float(tc_liq["he100_hours"]) if tc_liq else 0.0)
+        intra_liq = f10.number_input("Intrajornada Suprimida (h)", min_value=0.0, value=float(tc_liq["intrajornada_hours"]) if tc_liq else 0.0)
+        not_liq = f11.number_input("Horas Noturnas Fictas (h)", min_value=0.0, value=float(tc_liq["night_ficta_hours"]) if tc_liq else 0.0)
+
+        f12, f13, f14 = st.columns(3)
+        juros_liq = f12.number_input("Juros Acumulados (%)", min_value=0.0, value=3.0, step=0.5)
+        corr_liq = f13.number_input("Correção Monetária (%)", min_value=0.0, value=4.2, step=0.5)
+        abat_liq = f14.number_input("Abatimentos / Valores Pagos (R$)", min_value=0.0, value=0.0, step=50.0)
+
+        calc_liq_btn = st.form_submit_button("Executar Liquidação Decimal", type="primary")
+
+    if calc_liq_btn:
+        if st.session_state.extracted_ai_data and not st.session_state.extraction_confirmed:
+            st.error("Marque a caixa de confirmação dos dados extraídos antes de calcular.")
+        elif sal_liq <= 0 or not proc_num.strip():
+            st.error("Preencha o número do processo e o salário-base.")
+        else:
+            res_liq = run_labor_calculation({
+                "process_number": proc_num,
+                "worker_name": trab_nome,
+                "employer_name": emp_nome,
+                "admission_date": adm_liq,
+                "dismissal_date": dism_liq,
+                "termination_type": "sem_justa_causa",
+                "monthly_divisor": div_liq,
+                "base_salary": sal_liq,
+                "commissions": 0.0,
+                "insalubrity": 0.0,
+                "offsets": abat_liq,
+                "inc_saldo_salario": True,
+                "saldo_dias": dism_liq.day,
+                "inc_aviso_previo": True,
+                "inc_13": True,
+                "inc_ferias": True,
+                "inc_fgts": True,
+                "inc_he50": he50_liq > 0,
+                "he50_hours": he50_liq,
+                "he50_pct": 50,
+                "inc_he100": he100_liq > 0,
+                "he100_hours": he100_liq,
+                "inc_intrajornada": intra_liq > 0,
+                "intrajornada_hours": intra_liq,
+                "inc_noturno": not_liq > 0,
+                "night_hours": not_liq,
+                "night_pct": 20,
+                "apply_inss": True,
+                "apply_irrf": True,
+                "apply_interest": True,
+                "interest_pct": juros_liq,
+                "correction_pct": corr_liq,
+            })
+            st.session_state.calculations_history.insert(0, res_liq)
+            st.success(f"Liquidação concluída! Auditoria: **{res_liq['audit_id']}**")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Bruto Atualizado", fmt_brl(res_liq["bruto_atualizado"]))
+            m2.metric("Descontos (INSS + IRRF + Abat.)", fmt_brl(res_liq["total_descontos"]))
+            m3.metric("Líquido Devido", fmt_brl(res_liq["liquido_devido"]))
+            df_liq = pd.DataFrame(res_liq["verbas"])
+            for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
+                df_liq[col] = df_liq[col].apply(fmt_brl)
+            st.dataframe(df_liq, use_container_width=True, hide_index=True)
+
+elif menu == "Meus Cálculos e Relatórios":
+    st.title("Meus Cálculos e Relatórios Auditáveis")
+    if not st.session_state.calculations_history:
+        st.info("Nenhum cálculo realizado nesta sessão ainda. Use 'Avaliação Preliminar (Pré-Processo)' ou 'Liquidação de Sentença (Upload)'.")
+    else:
+        for calc in st.session_state.calculations_history:
+            with st.expander(f"{calc['audit_id']} • Gerado em {calc['generated_at']} • Líquido: {fmt_brl(calc['liquido_devido'])}", expanded=True):
+                st.caption(f"Origem: {calc['origin']} | Tabelas: {calc['tables_version']}")
+                df_rep = pd.DataFrame(calc["verbas"])
+                for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
+                    df_rep[col] = df_rep[col].apply(fmt_brl)
+                st.dataframe(df_rep, use_container_width=True, hide_index=True)
+
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    df_rep.to_excel(writer, index=False, sheet_name="Memoria_Calculo")
+                st.download_button(
+                    f"Baixar Planilha Auditável ({calc['audit_id']}.xlsx)",
+                    data=buf.getvalue(),
+                    file_name=f"{calc['audit_id']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_{calc['audit_id']}",
+                )
+
 elif menu == "Central de Atualizações Legais":
     st.title("Central de Atualizações Legais e Tabelas")
     st.write(f"Versão vigente das tabelas: **{TABLES_VERSION}**")
