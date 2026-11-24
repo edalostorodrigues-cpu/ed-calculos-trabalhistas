@@ -582,7 +582,7 @@ with st.sidebar:
     if st.session_state.calculations_history:
         st.divider()
         st.caption(f"Clientes analisados ({len(st.session_state.calculations_history)}) — clique para abrir o chat:")
-        for c_sb in st.session_state.calculations_history:
+        for idx_sb, c_sb in enumerate(st.session_state.calculations_history):
             cid_sb = str(c_sb["audit_id"])
             msgs_count = len(st.session_state.case_chat_threads.get(cid_sb, []))
             badge_chat = f" 💬{msgs_count}" if msgs_count > 0 else ""
@@ -590,7 +590,7 @@ with st.sidebar:
             btn_prefix = "▶ " if is_selected_sb else ""
             if st.button(
                 f"{btn_prefix}{c_sb.get('worker_name', 'Cliente')} ({fmt_brl(c_sb['liquido_devido'])}){badge_chat}",
-                key=f"sb_select_case_{cid_sb}",
+                key=f"sb_select_case_{cid_sb}_{idx_sb}",
                 use_container_width=True,
             ):
                 st.session_state.selected_chat_case_id = cid_sb
