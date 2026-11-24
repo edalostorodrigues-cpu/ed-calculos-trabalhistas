@@ -538,6 +538,44 @@ def chat_with_case_strategist(
     if last_err:
         raise last_err
     return "Não foi possível obter resposta do Gemini no momento."
+
+
+# ==============================================================================
+# 6. MOTOR DE CÁLCULO DECIMAL EXATO (MEMÓRIA AUDITÁVEL POR VERBA)
+# ==============================================================================
+def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Executa o cálculo trabalhista determinístico em Python Decimal exato."""
+    adm_date: date = params["admission_date"]
+    dism_date: date = params["dismissal_date"]
+    term_type: str = str(params["termination_type"])
+    divisor = Decimal(str(max(1, f_int(params.get("monthly_divisor"), 220))))
+
+    base_salary = d_money(params.get("base_salary", 0))
+    commissions = d_money(params.get("commissions", 0))
+    insalubrity = d_money(params.get("insalubrity", 0))
+    remuneration = base_salary + commissions + insalubrity
+    hourly_rate = remuneration / divisor
+
+    total_days = max(1, (dism_date - adm_date).days + 1)
+    years_worked = max(0, total_days // 365)
+    meses_contrato = max(1, (dism_date.year - adm_date.year) * 12 + (dism_date.month - adm_date.month) + 1)
+    meses_prescricao = min(60, meses_contrato)
+
+    verbas: List[Dict[str, Any]] = []
+
+    def add_verba(
+        code: str,
+        name: str,
+        period: str,
+        base: Decimal,
+        formula: str,
+        qty: str,
+        pct_str: str,
+        orig: Decimal,
+        reflexos: Decimal = Decimal("0.00"),
+        incide_fgts: bool = True,
+    ):
+        orig_q = orig.quantize(CENT, rounding=ROUND_HALF_UP)
         refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
         total_item = orig_q + refl_q
         verbas.append({
