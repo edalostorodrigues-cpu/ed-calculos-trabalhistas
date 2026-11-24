@@ -220,13 +220,94 @@ def _build_supabase_headers(sb_key: str, extra: Optional[Dict[str, str]] = None)
     return headers
 
 
-def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool, str]:
-    """Carrega todos os clientes e históricos de chat salvos na nuvem Supabase."""
+def supabase_auth_sign_in(email: str, password: str) -> tuple[bool, Dict[str, Any], str]:
+    """Autentica advogado/usuário via Supabase Auth (E-mail e Senha)."""
+    sb_url, sb_key = get_supabase_credentials()
+    if not sb_url or not sb_key:
+        return False, {}, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes."
+    try:
+        endpoint = f"{sb_url}/auth/v1/token?grant_type=password"
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"email": email.strip().lower(), "password": password}).encode("utf-8"),
+            headers=_build_supabase_headers(sb_key, {"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        user_obj = data.get("user") or {}
+        meta = user_obj.get("user_metadata") or {}
+        profile = {
+            "email": str(user_obj.get("email") or email.strip().lower()),
+            "full_name": str(meta.get("full_name") or email.split("@")[0]),
+            "office_header": str(meta.get("office_header") or "Escritório de Advocacia Trabalhista — Parecer Pré-Processual"),
+            "access_token": str(data.get("access_token") or ""),
+        }
+        return True, profile, "OK"
+    except urllib.error.HTTPError as http_err:
+        err_body = http_err.read().decode("utf-8", errors="ignore")
+        if "Invalid login credentials" in err_body:
+            return False, {}, "E-mail ou senha incorretos."
+        if "Email not confirmed" in err_body:
+            return False, {}, "Confirme seu e-mail antes de entrar (ou desative 'Confirm email' no Supabase Auth)."
+        return False, {}, f"Erro ao entrar ({http_err.code}): {err_body}"
+    except Exception as exc:
+        return False, {}, str(exc)
+
+
+def supabase_auth_sign_up(email: str, password: str, full_name: str, office_header: str) -> tuple[bool, Optional[Dict[str, Any]], str]:
+    """Cadastra novo advogado/escritório via Supabase Auth."""
+    sb_url, sb_key = get_supabase_credentials()
+    if not sb_url or not sb_key:
+        return False, None, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes."
+    try:
+        endpoint = f"{sb_url}/auth/v1/signup"
+        payload = {
+            "email": email.strip().lower(),
+            "password": password,
+            "data": {
+                "full_name": full_name.strip(),
+                "office_header": office_header.strip() or f"{full_name.strip()} — Advocacia Trabalhista",
+            },
+        }
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=_build_supabase_headers(sb_key, {"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        user_obj = data.get("user") or data
+        access_tok = str(data.get("access_token") or "")
+        if access_tok:
+            profile = {
+                "email": str(user_obj.get("email") or email.strip().lower()),
+                "full_name": full_name.strip(),
+                "office_header": office_header.strip() or f"{full_name.strip()} — Advocacia Trabalhista",
+                "access_token": access_tok,
+            }
+            return True, profile, "Conta criada e conectada com sucesso!"
+        return True, None, "Conta criada! Verifique seu e-mail para confirmar o cadastro ou faça login na aba 'Entrar'."
+    except urllib.error.HTTPError as http_err:
+        err_body = http_err.read().decode("utf-8", errors="ignore")
+        if "User already registered" in err_body:
+            return False, None, "Este e-mail já está cadastrado. Acesse a aba 'Entrar'."
+        return False, None, f"Erro no cadastro ({http_err.code}): {err_body}"
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def supabase_load_all_cases(office_email: str) -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool, str]:
+    """Carrega apenas os clientes e históricos de chat pertencentes ao usuário/escritório autenticado."""
     sb_url, sb_key = get_supabase_credentials()
     if not sb_url or not sb_key:
         return [], {}, False, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes"
+    if not office_email:
+        return [], {}, False, "Usuário não autenticado"
     try:
-        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?select=*&order=updated_at.desc"
+        email_q = urllib.parse.quote(office_email.strip().lower(), safe="")
+        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?office_email=eq.{email_q}&select=*&order=updated_at.desc"
         req = urllib.request.Request(
             endpoint,
             headers=_build_supabase_headers(sb_key, {"Accept": "application/json"}),
@@ -253,15 +334,19 @@ def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict
         return [], {}, False, str(exc)
 
 
-def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]]) -> tuple[bool, str]:
-    """Salva ou atualiza (upsert) um cliente e seu histórico de chat no Supabase."""
+def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]], office_email: str) -> tuple[bool, str]:
+    """Salva ou atualiza (upsert) um cliente e seu histórico de chat isolado por escritório."""
     sb_url, sb_key = get_supabase_credentials()
     if not sb_url or not sb_key:
         return False, "Secrets ausentes"
+    if not office_email:
+        return False, "Usuário não autenticado"
     try:
-        client_key = f"{str(calc.get('worker_name', '')).strip().lower()}|{str(calc.get('employer_name', '')).strip().lower()}"
+        owner_clean = office_email.strip().lower()
+        client_key = f"{owner_clean}|{str(calc.get('worker_name', '')).strip().lower()}|{str(calc.get('employer_name', '')).strip().lower()}"
         body = {
             "client_key": client_key,
+            "office_email": owner_clean,
             "audit_id": str(calc["audit_id"]),
             "worker_name": str(calc.get("worker_name") or "Cliente"),
             "employer_name": str(calc.get("employer_name") or "Empresa"),
@@ -290,14 +375,8 @@ def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]
         return False, str(exc)
 
 
-if "cloud_loaded_once" not in st.session_state:
-    cloud_calcs, cloud_chats, cloud_ok, cloud_msg = supabase_load_all_cases()
-    st.session_state.cloud_connected = cloud_ok
-    st.session_state.cloud_status_detail = cloud_msg
-    st.session_state.calculations_history = cloud_calcs
-    st.session_state.case_chat_threads = {"caso_atual": [], **cloud_chats}
-    st.session_state.cloud_loaded_once = True
-
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
 if "calculations_history" not in st.session_state:
     st.session_state.calculations_history = []
 if "timecard_result" not in st.session_state:
@@ -312,87 +391,8 @@ if "selected_chat_case_id" not in st.session_state:
     st.session_state.selected_chat_case_id = "caso_atual"
 if "cloud_connected" not in st.session_state:
     st.session_state.cloud_connected = False
-
-
-# ==============================================================================
-# 4. APURADOR DETERMINÍSTICO DE CARTÃO DE PONTO (EM MINUTOS INTEIROS)
-# ==============================================================================
-def calc_night_minutes(start_min: int, end_min: int) -> int:
-    """Calcula minutos trabalhados no período noturno urbano (22h às 05h)."""
-    if end_min <= start_min:
-        return 0
-    night = 0
-    for n_start, n_end in [(0, 300), (1320, 1740)]:
-        ov_s = max(start_min, n_start)
-        ov_e = min(end_min, n_end)
-        if ov_e > ov_s:
-            night += ov_e - ov_s
-    return night
-
-
-def process_timecard_dataframe(df: pd.DataFrame, daily_limit_min: int = 480) -> Dict[str, Any]:
-    """Apura horas extras 50%/100%, intrajornada suprimida e redução ficta noturna."""
-    rows_out: List[Dict[str, Any]] = []
-    tot_he50_min = 0
-    tot_he100_min = 0
-    tot_intra_min = 0
-    tot_night_ficta_min = 0
-    incomplete_days = 0
-
-    for _, row in df.iterrows():
-        dt_str = str(row.get("Data", "")).strip()
-        dia_sem = str(row.get("Dia", row.get("DiaSemana", ""))).strip().upper()
-        feriado = str(row.get("Feriado", "N")).strip().upper() in ("S", "SIM", "1", "TRUE") or dia_sem == "DOM"
-
-        e1 = parse_hhmm(row.get("Entrada1"))
-        s1 = parse_hhmm(row.get("Saida1"))
-        e2 = parse_hhmm(row.get("Entrada2"))
-        s2 = parse_hhmm(row.get("Saida2"))
-
-        if e1 is None or s1 is None:
-            incomplete_days += 1
-            rows_out.append({
-                "Data": dt_str,
-                "Dia": dia_sem,
-                "HE 50% (h)": 0.0,
-                "HE 100% (h)": 0.0,
-                "Intrajornada (h)": 0.0,
-                "Noturna Ficta (h)": 0.0,
-                "Status": "Batida incompleta (revisar)",
-            })
-            continue
-
-        p1_end = s1 + 1440 if s1 < e1 else s1
-        w1 = max(0, p1_end - e1)
-        n1 = calc_night_minutes(e1, p1_end)
-
-        w2, n2, break_min = 0, 0, 0
-        if e2 is not None and s2 is not None:
-            p2_start = e2 + 1440 if e2 < p1_end else e2
-            p2_end = s2 + 1440 if s2 < p2_start else s2
-            break_min = max(0, p2_start - p1_end)
-            w2 = max(0, p2_end - p2_start)
-            n2 = calc_night_minutes(p2_start, p2_end)
-
-        worked = w1 + w2
-        night_clock = n1 + n2
-        night_ficta = round(night_clock * (60.0 / 52.5))
-
-        intra_sup = 0
-        if worked > 360 and break_min < 60:
-            intra_sup = 60 - break_min
-        elif 240 < worked <= 360 and break_min < 15:
-            intra_sup = 15 - break_min
-
-        he50 = 0
-        he100 = 0
-        if feriado:
-            he100 = worked
-        else:
-            diff = worked - daily_limit_min
-            if diff > 10:
-                he50 = diff
-
+if "cloud_status_detail" not in st.session_state:
+    st.session_state.cloud_status_detail = ""
         tot_he50_min += he50
         tot_he100_min += he100
         tot_intra_min += intra_sup
@@ -419,606 +419,76 @@ def process_timecard_dataframe(df: pd.DataFrame, daily_limit_min: int = 480) -> 
 
 
 # ==============================================================================
-# 5. ANÁLISE CRUZADA POR GEMINI (DOCUMENTOS + FOTOS + RELATO LIVRE)
+# 7. PORTAL DE AUTENTICAÇÃO (LOGIN / CADASTRO) E MENU LATERAL
 # ==============================================================================
-class PaidItem(BaseModel):
-    verba: str
-    valor: float = 0.0
+if not st.session_state.get("auth_user"):
+    _, auth_col, _ = st.columns([1, 1.4, 1])
+    with auth_col:
+        st.markdown("## ⚖️ ED Cálculos Trabalhistas")
+        st.caption("Parecer Pré-Processual, Visão Técnica (NR-15/16) & Liquidação Art. 840 CLT")
+        with st.container(border=True):
+            tab_login, tab_signup = st.tabs(["Entrar na Conta", "Cadastrar Novo Usuário / Escritório"])
+
+            with tab_login:
+                with st.form("login_auth_form"):
+                    login_email = st.text_input("E-mail profissional *", placeholder="advogado@escritorio.com.br")
+                    login_pass = st.text_input("Senha *", type="password", placeholder="••••••••")
+                    login_submit = st.form_submit_button("Entrar no Sistema", type="primary", use_container_width=True)
+
+                if login_submit:
+                    if not login_email.strip() or not login_pass:
+                        st.error("Informe seu e-mail e sua senha.")
+                    else:
+                        with st.spinner("Autenticando no Supabase..."):
+                            ok_auth, user_prof, auth_msg = supabase_auth_sign_in(login_email, login_pass)
+                        if ok_auth:
+                            st.session_state.auth_user = user_prof
+                            c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(user_prof["email"])
+                            st.session_state.cloud_connected = c_ok
+                            st.session_state.cloud_status_detail = c_msg
+                            st.session_state.calculations_history = c_calcs
+                            st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
+                            st.rerun()
+                        else:
+                            st.error(auth_msg)
+
+            with tab_signup:
+                with st.form("signup_auth_form"):
+                    reg_name = st.text_input("Nome do Advogado(a) / Responsável *", placeholder="Dr. Eduardo Dalosto")
+                    reg_office = st.text_input("Nome do Escritório / OAB (Timbre dos PDFs) *", placeholder="Dalosto Advocacia Trabalhista — OAB/RS 00.000")
+                    reg_email = st.text_input("E-mail para acesso *", placeholder="contato@escritorio.com.br")
+                    reg_pass = st.text_input("Crie uma senha (mín. 6 caracteres) *", type="password")
+                    reg_pass_conf = st.text_input("Confirme a senha *", type="password")
+                    signup_submit = st.form_submit_button("Criar Conta e Acessar", type="primary", use_container_width=True)
+
+                if signup_submit:
+                    if not reg_name.strip() or not reg_email.strip() or len(reg_pass) < 6:
+                        st.error("Preencha nome, e-mail válido e senha com no mínimo 6 caracteres.")
+                    elif reg_pass != reg_pass_conf:
+                        st.error("As senhas digitadas não conferem.")
+                    else:
+                        with st.spinner("Criando conta do escritório..."):
+                            ok_reg, new_prof, reg_msg = supabase_auth_sign_up(reg_email, reg_pass, reg_name, reg_office)
+                        if ok_reg and new_prof:
+                            st.session_state.auth_user = new_prof
+                            c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(new_prof["email"])
+                            st.session_state.cloud_connected = c_ok
+                            st.session_state.cloud_status_detail = c_msg
+                            st.session_state.calculations_history = c_calcs
+                            st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
+                            st.rerun()
+                        elif ok_reg:
+                            st.success(reg_msg)
+                        else:
+                            st.error(reg_msg)
+    st.stop()
+
+current_user: Dict[str, Any] = st.session_state.auth_user
+current_office_email: str = str(current_user.get("email") or "").strip().lower()
 
-
-class IrregularityFinding(BaseModel):
-    categoria: str
-    origem_evidencia: str
-    descricao: str
-    fundamento_juridico: str
-    tese_ou_pedido_sugerido: str
-
-
-class ExtractedCaseData(BaseModel):
-    worker_name: Optional[str] = None
-    employer_name: Optional[str] = None
-    role_title: Optional[str] = None
-    admission_date: Optional[str] = None
-    dismissal_date: Optional[str] = None
-    termination_type: Optional[str] = None
-    base_salary: Optional[float] = None
-    commissions: Optional[float] = None
-    monthly_divisor: Optional[int] = None
-    weekly_he50_hours: Optional[float] = None
-    monthly_sundays_worked: Optional[int] = None
-    suppressed_break_minutes: Optional[int] = None
-    weekly_night_hours: Optional[float] = None
-    adicional_sugerido: Optional[str] = None
-    adicional_percentual_sugerido: Optional[float] = None
-    nr_technical_assessment: Optional[str] = None
-    multa_fgts_percentual_sugerido: Optional[float] = None
-    meses_sem_registro_ctps: Optional[int] = None
-    plus_salarial_acumulo_pct: Optional[float] = None
-    diferenca_equiparacao_mensal: Optional[float] = None
-    periodos_ferias_vencidas: Optional[int] = None
-    restituicao_atestados_ou_descontos: Optional[float] = None
-    fgts_nao_depositado_contrato: Optional[float] = None
-    meses_estabilidade_restantes: Optional[int] = None
-    sugerir_saldo_salario: bool = True
-    sugerir_aviso_previo: bool = True
-    sugerir_13_e_ferias: bool = True
-    sugerir_fgts_e_multa: bool = True
-    sugerir_multa_477: bool = False
-    sugerir_multa_467: bool = False
-    trct_paid_items: List[PaidItem] = Field(default_factory=list)
-    irregularities_found: List[IrregularityFinding] = Field(default_factory=list)
-    medical_leave_summary: Optional[str] = None
-    stability_alert: Optional[str] = None
-    viability_conclusion: Optional[str] = None
-    petition_draft_topics: Optional[str] = None
-    recommended_claims_checklist: List[str] = Field(default_factory=list)
-    ambiguities: List[str] = Field(default_factory=list)
-
-
-def get_gemini_api_key() -> Optional[str]:
-    """Obtém a GEMINI_API_KEY via st.secrets ou variáveis de ambiente."""
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            val = str(st.secrets["GEMINI_API_KEY"]).strip()
-            if val:
-                return val
-    except Exception:
-        pass
-    env_val = os.environ.get("GEMINI_API_KEY", "").strip()
-    return env_val or None
-
-
-def generate_gemini_with_fallback(client: Any, contents: List[Any], config: Any) -> Any:
-    """Chama o modelo Gemini ativo com descoberta dinâmica via API e fallback automático."""
-    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
-    try:
-        for m in client.models.list():
-            m_name = str(getattr(m, "name", "") or "").replace("models/", "")
-            if "gemini" in m_name and "embedding" not in m_name and "imagen" not in m_name and m_name not in models_to_try:
-                models_to_try.append(m_name)
-    except Exception:
-        pass
-
-    last_err: Optional[Exception] = None
-    for model_name in models_to_try:
-        try:
-            return client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-        except Exception as exc:
-            last_err = exc
-            err_s = str(exc)
-            if "404" in err_s or "NOT_FOUND" in err_s or "no longer available" in err_s:
-                continue
-            raise
-    if last_err:
-        raise last_err
-    raise RuntimeError("Nenhum modelo Gemini disponível.")
-
-
-def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Executa análise jurídica, técnica (NR-15/NR-16) e documental com Gemini."""
-    api_key = get_gemini_api_key()
-    if not api_key or not GENAI_AVAILABLE:
-        raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
-
-    client = genai.Client(api_key=api_key)
-    contents: List[Any] = [
-        (
-            "Você é um advogado trabalhista sênior, perito técnico em NRs e auditor de cálculos judiciais. "
-            "Analise em conjunto o RELATO DO ADVOGADO (entrevista com o cliente) e TODOS OS DOCUMENTOS E FOTOS ANEXADOS "
-            "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos INSS, ASO, PPP, LTCAT, PGR, CCT e "
-            "FOTOS DO AMBIENTE DE TRABALHO / EPIs / EQUIPAMENTOS). "
-            "Sua missão:\n"
-            "1) Extrair datas (incluindo início real se houve período sem registro), salário-base, comissões/'por fora', jornada habitual, "
-            "valores já pagos no TRCT, descontos indevidos (ex.: atestados médicos descontados), saldo de FGTS não depositado no contrato "
-            "(fgts_nao_depositado_contrato), meses sem registro na CTPS (meses_sem_registro_ctps), percentual de plus salarial por acúmulo/desvio "
-            "de função (plus_salarial_acumulo_pct), diferença mensal por equiparação salarial (diferenca_equiparacao_mensal), "
-            "períodos de férias vencidas não gozadas (periodos_ferias_vencidas) e meses de estabilidade provisória violados (meses_estabilidade_restantes).\n"
-            "2) AVALIAÇÃO TÉCNICA DE INSALUBRIDADE (NR-15) E PERICULOSIDADE (NR-16): examine fotos do local de trabalho, produtos químicos, "
-            "câmara fria, ruído, agentes biológicos, inflamáveis, alta tensão, explosivos ou uso de motocicleta (art. 193 §4º CLT), "
-            "bem como PPP/LTCAT/contracheques. Preencha 'adicional_sugerido' com uma das opções exatas: "
-            "'Nenhum', 'Insalubridade (sobre Salário Mínimo)' ou 'Periculosidade (sobre Salário-Base)', "
-            "preencha 'adicional_percentual_sugerido' com o número do percentual (ex.: 10, 20, 40 ou 30; 0 se Nenhum), "
-            "e detalhe obrigatoriamente em 'nr_technical_assessment' o diagnóstico explícito (ex.: 'IDENTIFICADA INSALUBRIDADE 20% - NR-15 Anexo ...' "
-            "ou 'NÃO IDENTIFICADO AGENTE INSALUBRE/PERICULOSO'), o que foi observado nas fotos/relato e a necessidade de perícia judicial (Art. 195 CLT).\n"
-            "3) Identificar irregularidades, nulidades e brechas jurídicas (estabilidade B91, gestante, CIPA, atestados descontados, "
-            "ASO inapto, rescisão indireta, multa art. 477 §8º CLT, multa art. 467 CLT, horas extras, intrajornada, vínculo sem registro, "
-            "acúmulo/desvio de função, equiparação salarial), além de 'multa_fgts_percentual_sugerido' (ex.: 40.0 na dispensa sem justa causa, "
-            "20.0 no acordo, ou 10.0 se o relato/TRCT mostrar que já pagaram 30% e falta a diferença).\n"
-            "sugerir_multa_477 e sugerir_multa_467.\n"
-            "6) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
-        )
-    ]
-
-    if lawyer_narrative.strip():
-        contents.append(f"=== RELATO DO ADVOGADO / FATOS NARRADOS PELO CLIENTE ===\n{lawyer_narrative.strip()}")
-
-    for item in files_payload:
-        contents.append(f"=== DOCUMENTO ANEXADO: {item['name']} ===")
-        contents.append(types.Part.from_bytes(data=item["bytes"], mime_type=item["mime"]))
-
-    response = generate_gemini_with_fallback(
-        client=client,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ExtractedCaseData,
-            temperature=0.0,
-        ),
-    )
-
-    parsed: Dict[str, Any] = {}
-    if getattr(response, "parsed", None) is not None:
-        if hasattr(response.parsed, "model_dump"):
-            parsed = response.parsed.model_dump()
-        elif isinstance(response.parsed, dict):
-            parsed = response.parsed
-    if not parsed and getattr(response, "text", None):
-        parsed = json.loads(response.text)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Resposta estruturada do Gemini vazia ou inválida.")
-    return parsed
-
-
-def chat_with_case_strategist(
-    user_message: str,
-    chat_history: List[Dict[str, str]],
-    lawyer_narrative: str,
-    extracted_data: Dict[str, Any],
-    latest_calc: Optional[Dict[str, Any]] = None,
-    all_saved_cases: Optional[List[Dict[str, Any]]] = None,
-) -> str:
-    """Chat jurídico multi-turno real com o Gemini (memória contínua + acesso a todos os clientes da sessão)."""
-    api_key = get_gemini_api_key()
-    if not api_key or not GENAI_AVAILABLE:
-        raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
-
-    client = genai.Client(api_key=api_key)
-
-    system_blocks = [
-        "Você é um Advogado Trabalhista Sênior, Parecerista Jurídico e Perito em Cálculos Trabalhistas no Brasil (CLT, Reforma Trabalhista, Constituição Federal, Súmulas e OJs do TST, NRs 15 e 16).",
-        "Você está conversando em tempo real com o advogado titular dentro do sistema 'ED Cálculos Trabalhistas'.",
-        "Responda sempre no mais alto nível técnico-jurídico, de forma natural, interativa, clara e resolutiva — exatamente como um sócio sênior debatendo estratégia processual.",
-        "IMPORTANTE: O advogado pode ter analisado vários clientes nesta sessão (ex.: Pedro, João, Maria). Você tem acesso completo ao CASO SELECIONADO NO CHAT e também ao DOSSIÊ DE TODOS OS OUTROS CLIENTES ANALISADOS NA SESSÃO, podendo responder perguntas sobre qualquer um deles a qualquer momento.",
-        "Você pode:\n"
-        "- Discutir teses, ônus da prova (Art. 818 CLT), riscos de sucumbência e jurisprudência atualizada do TST/TRTs;\n"
-        "- Incorporar novos fatos que o advogado trouxer na conversa e explicar o impacto jurídico e financeiro;\n"
-        "- Redigir tópicos completos da Petição Inicial (Dos Fatos, Do Direito e Dos Pedidos), quesitos periciais (insalubridade/periculosidade) ou perguntas para audiência de instrução;\n"
-        "- Responder dúvidas sobre o cliente selecionado ou sobre qualquer outro cliente já analisado na sessão.",
-        f"\n=== CASO EM FOCO SELECIONADO NO CHAT ===\nRelato: {lawyer_narrative.strip() or '(Nenhum relato preenchido ainda)'}",
-    ]
-
-    if extracted_data:
-        safe_ext = {k: v for k, v in extracted_data.items() if v not in (None, "", [], {})}
-        system_blocks.append(f"\n=== PARECER E DADOS EXTRAÍDOS DO CASO EM FOCO ===\n{json.dumps(safe_ext, ensure_ascii=False, default=str)}")
-
-    if latest_calc:
-        verbas_resumo = [
-            f"- {v.get('Verba')}: {fmt_brl(v.get('Total Apurado', Decimal('0.00')))}"
-            for v in (latest_calc.get("verbas") or [])
-        ]
-        system_blocks.append(
-            "\n=== LIQUIDAÇÃO DO CASO EM FOCO ===\n"
-            f"Cliente: {latest_calc.get('worker_name')} x {latest_calc.get('employer_name')} (ID: {latest_calc.get('audit_id')})\n"
-            f"Cargo: {latest_calc.get('role_title', '')} | Período: {latest_calc.get('admission_date', '')} a {latest_calc.get('dismissal_date', '')}\n"
-            f"Total Bruto: {fmt_brl(latest_calc.get('bruto_atualizado', Decimal('0.00')))} | "
-            f"Abatimentos TRCT: {fmt_brl(latest_calc.get('abatimentos', Decimal('0.00')))} | "
-            f"Valor da Causa: {fmt_brl(latest_calc.get('liquido_devido', Decimal('0.00')))}\n"
-            + "\n".join(verbas_resumo)
-        )
-
-    if all_saved_cases:
-        outros_resumos: List[str] = []
-        for c_item in all_saved_cases:
-            v_list = ", ".join(
-                f"{vv.get('Verba')} ({fmt_brl(vv.get('Total Apurado', Decimal('0.00')))})"
-                for vv in (c_item.get("verbas") or [])
-            )
-            op_item = c_item.get("ai_opinion") or {}
-            outros_resumos.append(
-                f"* Cliente: {c_item.get('worker_name')} x {c_item.get('employer_name')} [{c_item.get('audit_id')}] | "
-                f"Período: {c_item.get('admission_date')} a {c_item.get('dismissal_date')} | "
-                f"Valor da Causa: {fmt_brl(c_item.get('liquido_devido', Decimal('0.00')))}\n"
-                f"  Relato: {str(c_item.get('lawyer_narrative') or '')[:600]}\n"
-                f"  Diagnóstico NR/Parecer: {op_item.get('nr_technical_assessment') or ''} | {op_item.get('viability_conclusion') or ''}\n"
-                f"  Verbas: {v_list}"
-            )
-        system_blocks.append("\n=== TODOS OS CLIENTES ANALISADOS NESTA SESSÃO (MEMÓRIA MULTI-CLIENTE) ===\n" + "\n".join(outros_resumos))
-
-    sdk_history: List[Any] = []
-    for msg in chat_history[-16:]:
-        role_sdk = "user" if msg.get("role") == "user" else "model"
-        txt_sdk = str(msg.get("content") or "").strip()
-        if txt_sdk:
-            sdk_history.append(
-                types.Content(
-                    role=role_sdk,
-                    parts=[types.Part.from_text(text=txt_sdk)],
-                )
-            )
-
-    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
-    try:
-        for m in client.models.list():
-            m_name = str(getattr(m, "name", "") or "").replace("models/", "")
-            if "gemini" in m_name and "embedding" not in m_name and "imagen" not in m_name and m_name not in models_to_try:
-                models_to_try.append(m_name)
-    except Exception:
-        pass
-
-    last_err: Optional[Exception] = None
-    for model_name in models_to_try:
-        try:
-            chat_session = client.chats.create(
-                model=model_name,
-                history=sdk_history,
-                config=types.GenerateContentConfig(
-                    system_instruction="\n".join(system_blocks),
-                    temperature=0.35,
-                ),
-            )
-            response = chat_session.send_message(user_message)
-            reply_txt = (getattr(response, "text", None) or "").strip()
-            if reply_txt:
-                return reply_txt
-        except Exception as exc:
-            last_err = exc
-            err_s = str(exc)
-            if "404" in err_s or "NOT_FOUND" in err_s or "no longer available" in err_s:
-                continue
-            raise
-
-    if last_err:
-        raise last_err
-    return "Não foi possível obter resposta do Gemini no momento."
-
-
-# ==============================================================================
-# 6. MOTOR DE CÁLCULO DECIMAL EXATO E EXPORTAÇÃO XLSX / PDF
-# ==============================================================================
-def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Executa a liquidação trabalhista determinística em Decimal exato."""
-    adm_dt: date = params["admission_date"]
-    dism_dt: date = params["dismissal_date"]
-    term_type: str = str(params.get("termination_type") or "sem_justa_causa")
-    divisor = max(1, f_int(params.get("monthly_divisor"), 220))
-
-    base_sal = d_money(params.get("base_salary"))
-    commissions = d_money(params.get("commissions"))
-    insal_val = d_money(params.get("insalubrity"))
-    plus_pct = Decimal(str(f_float(params.get("plus_acumulo_pct"), 0.0))) / Decimal("100")
-    dif_equip = d_money(params.get("dif_equiparacao_mensal"))
-
-    plus_mensal = (base_sal * plus_pct).quantize(CENT, rounding=ROUND_HALF_UP)
-    rem_base = base_sal + commissions + insal_val + plus_mensal + dif_equip
-    hora_normal = (rem_base / Decimal(str(divisor))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-
-    verbas: List[Dict[str, Any]] = []
-    period_str = f"{adm_dt.strftime('%d/%m/%Y')} a {dism_dt.strftime('%d/%m/%Y')}"
-
-    def add_verba(
-        cod: str,
-        nome: str,
-        base_calc: Decimal,
-        formula: str,
-        qtd: str,
-        pct: str,
-        valor_orig: Decimal,
-        reflexos: Decimal = Decimal("0.00"),
-        inc_fgts: bool = True,
-    ) -> None:
-        orig_q = valor_orig.quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
-        tot_q = (orig_q + refl_q).quantize(CENT, rounding=ROUND_HALF_UP)
-        if tot_q <= Decimal("0.00"):
-            return
-        verbas.append({
-            "Código": cod,
-            "Verba": nome,
-            "Período": period_str,
-            "Base de Cálculo": base_calc.quantize(CENT, rounding=ROUND_HALF_UP),
-            "Fórmula": formula,
-            "Quantidade": qtd,
-            "Percentual": pct,
-            "Valor Original": orig_q,
-            "Reflexos": refl_q,
-            "Total Apurado": tot_q,
-            "Incide FGTS": inc_fgts,
-        })
-
-    # 1. Saldo de Salário
-    if params.get("inc_saldo_salario"):
-        dias_s = max(0, min(31, f_int(params.get("saldo_dias"), dism_dt.day)))
-        val_saldo = (rem_base / Decimal("30") * Decimal(str(dias_s))).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-01", "Saldo de Salário", rem_base, "(Remuneração / 30) × Dias", f"{dias_s} dias", "100%", val_saldo, inc_fgts=True)
-
-    # 2. Aviso-Prévio Indenizado (Lei 12.506/2011)
-    anos_completos = max(0, (dism_dt - adm_dt).days // 365)
-    dias_aviso = min(90, 30 + anos_completos * 3)
-    if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "justa_causa", "acordo"):
-        fator_aviso = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
-        val_aviso = (rem_base / Decimal("30") * Decimal(str(dias_aviso)) * fator_aviso).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-02", f"Aviso-Prévio Indenizado ({dias_aviso} dias)", rem_base, "(Remuneração / 30) × Dias Aviso", f"{dias_aviso} dias", "50%" if term_type == "acordo" else "100%", val_aviso, inc_fgts=True)
-
-    # 3. 13º Salário Proporcional e Férias Proporcionais + 1/3 + Vencidas
-    meses_ano = dism_dt.month if dism_dt.day >= 15 else max(0, dism_dt.month - 1)
-    if params.get("inc_13") and meses_ano > 0:
-        val_13 = (rem_base / Decimal("12") * Decimal(str(meses_ano))).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-03A", "13º Salário Proporcional (c/ Projeção)", rem_base, "(Remuneração / 12) × Avos", f"{meses_ano}/12 avos", "100%", val_13, inc_fgts=True)
-
-    if params.get("inc_ferias"):
-        avos_ferias = max(1, ((dism_dt.year - adm_dt.year) * 12 + (dism_dt.month - adm_dt.month)) % 12 or 12)
-        val_ferias_prop = (rem_base / Decimal("12") * Decimal(str(avos_ferias))).quantize(CENT, rounding=ROUND_HALF_UP)
-        terco_prop = (val_ferias_prop / Decimal("3")).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-03B", "Férias Proporcionais + 1/3 Constitucional (c/ Projeção)", rem_base, "((Remuneração / 12) × Avos) + 1/3", f"{avos_ferias}/12 avos", "133,33%", val_ferias_prop, terco_prop, inc_fgts=False)
-
-    ferias_venc = max(0, f_int(params.get("periodos_ferias_vencidas"), 0))
-    if ferias_venc > 0:
-        val_fv = (rem_base * Decimal(str(ferias_venc)) * Decimal("2")).quantize(CENT, rounding=ROUND_HALF_UP)
-        terco_fv = (val_fv / Decimal("3")).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-03C", "Férias Vencidas em Dobro + 1/3 (Art. 137 CLT)", rem_base, "(Remuneração × 2) × Períodos + 1/3", f"{ferias_venc} per.", "200% + 1/3", val_fv, terco_fv, inc_fgts=False)
-
-    # 4. Adicional de Insalubridade / Periculosidade Retroativo
-    meses_contrato = max(1, min(60, (dism_dt.year - adm_dt.year) * 12 + (dism_dt.month - adm_dt.month) + 1))
-    fator_refl_hab = Decimal("0.225") if params.get("inc_reflexos_completos") else Decimal("0.00")
-
-    if params.get("inc_adicional_retroativo") and insal_val > Decimal("0.00"):
-        orig_adic = (insal_val * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_adic = (orig_adic * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba(
-            "VER-04B",
-            f"Adicional Retroativo — {params.get('adicional_label', 'Insalubridade/Periculosidade')}",
-            insal_val,
-            "Adicional Mensal × Meses Imprescritos + Reflexos",
-            f"{meses_contrato} meses",
-            str(params.get("adicional_pct_label", "")),
-            orig_adic,
-            refl_adic,
-            inc_fgts=True,
-        )
-
-    # 5. Horas Extras 50%, 100%, Intrajornada e Adicional Noturno
-    if params.get("inc_he50") and f_float(params.get("he50_hours"), 0.0) > 0:
-        h50 = Decimal(str(f_float(params.get("he50_hours"), 0.0)))
-        orig_he50 = (hora_normal * Decimal("1.50") * h50).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_he50 = (orig_he50 * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-05A", "Horas Extras 50% + DSR e Reflexos", hora_normal, "(Hora Normal × 1,50) × Horas + DSR/Reflexos", f"{h50:.2f}h", "+50%", orig_he50, refl_he50, inc_fgts=True)
-
-    if params.get("inc_he100") and f_float(params.get("he100_hours"), 0.0) > 0:
-        h100 = Decimal(str(f_float(params.get("he100_hours"), 0.0)))
-        orig_he100 = (hora_normal * Decimal("2.00") * h100).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_he100 = (orig_he100 * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-05B", "Horas Extras 100% (Domingos/Feriados) + Reflexos", hora_normal, "(Hora Normal × 2,00) × Horas + Reflexos", f"{h100:.2f}h", "+100%", orig_he100, refl_he100, inc_fgts=True)
-
-    if params.get("inc_intrajornada") and f_float(params.get("intrajornada_hours"), 0.0) > 0:
-        hintra = Decimal(str(f_float(params.get("intrajornada_hours"), 0.0)))
-        orig_intra = (hora_normal * Decimal("1.50") * hintra).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-05C", "Intervalo Intrajornada Suprimido (+50% — Art. 71, § 4º CLT)", hora_normal, "(Hora Normal × 1,50) × Horas Suprimidas", f"{hintra:.2f}h", "+50%", orig_intra, inc_fgts=False)
-
-    if params.get("inc_noturno") and f_float(params.get("night_hours"), 0.0) > 0:
-        hnot = Decimal(str(f_float(params.get("night_hours"), 0.0)))
-        orig_not = (hora_normal * Decimal("0.20") * hnot).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_not = (orig_not * (Decimal("0.1667") + fator_refl_hab)).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-06", "Adicional Noturno (20%) + Hora Ficta e Reflexos", hora_normal, "(Hora Normal × 0,20) × Horas Fictas + Reflexos", f"{hnot:.2f}h", "+20%", orig_not, refl_not, inc_fgts=True)
-
-    # 6. Período sem registro CTPS, Acúmulo de Função, Equiparação e Estabilidade
-    meses_sem_reg = max(0, f_int(params.get("meses_sem_registro"), 0))
-    if meses_sem_reg > 0:
-        verbas_sem_reg = (rem_base * Decimal("0.272") * Decimal(str(meses_sem_reg))).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-07A", "Reconhecimento de Vínculo / Período Sem Registro CTPS (13º, Férias+1/3 e FGTS)", rem_base, "(Remuneração × 27,2%) × Meses Sem Registro", f"{meses_sem_reg} meses", "27,2%", verbas_sem_reg, inc_fgts=False)
-
-    if plus_mensal > Decimal("0.00"):
-        orig_plus = (plus_mensal * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_plus = (orig_plus * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-07B", "Plus Salarial por Acúmulo / Desvio de Função + Reflexos", base_sal, "(Salário × %) × Meses + Reflexos", f"{meses_contrato} meses", f"{f_float(params.get('plus_acumulo_pct'), 0.0):g}%", orig_plus, refl_plus, inc_fgts=True)
-
-    if dif_equip > Decimal("0.00"):
-        orig_eq = (dif_equip * Decimal(str(meses_contrato))).quantize(CENT, rounding=ROUND_HALF_UP)
-        refl_eq = (orig_eq * fator_refl_hab).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-07C", "Diferenças Salariais por Equiparação (Art. 461 CLT) + Reflexos", dif_equip, "Diferença Mensal × Meses + Reflexos", f"{meses_contrato} meses", "100%", orig_eq, refl_eq, inc_fgts=True)
-
-    meses_estab = max(0, f_int(params.get("meses_estabilidade"), 0))
-    if meses_estab > 0:
-        ind_estab = (rem_base * Decimal(str(meses_estab)) * Decimal("1.272")).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-08", "Indenização Estabilidade Provisória Violada (Salários + 13º + Férias + FGTS)", rem_base, "(Remuneração × 1,272) × Meses Restantes", f"{meses_estab} meses", "100%", ind_estab, inc_fgts=False)
-
-    # 7. FGTS (8%) + Multa Rescisória configurável (%)
-    if params.get("inc_fgts"):
-        base_fgts_verbas = sum((v["Total Apurado"] for v in verbas if v.get("Incide FGTS")), Decimal("0.00"))
-        fgts_sobre_verbas = (base_fgts_verbas * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
-        fgts_faltante = d_money(params.get("fgts_nao_depositado"))
-        fgts_contrato_estimado = (rem_base * Decimal(str(meses_contrato)) * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
-        base_para_multa = fgts_contrato_estimado + fgts_sobre_verbas + fgts_faltante
-        multa_pct = Decimal(str(f_float(params.get("fgts_multa_pct"), 40.0))) / Decimal("100")
-        multa_fgts_val = (base_para_multa * multa_pct).quantize(CENT, rounding=ROUND_HALF_UP)
-        total_fgts_item = fgts_sobre_verbas + fgts_faltante
-        if total_fgts_item > Decimal("0.00") or multa_fgts_val > Decimal("0.00"):
-            add_verba(
-                "VER-09",
-                f"FGTS (8% Verbas + Depósitos Faltantes) + Multa Rescisória ({f_float(params.get('fgts_multa_pct'), 40.0):g}%)",
-                base_para_multa,
-                f"FGTS 8% + Multa {f_float(params.get('fgts_multa_pct'), 40.0):g}% sobre Saldo Total FGTS",
-                f"{meses_contrato} meses",
-                f"{f_float(params.get('fgts_multa_pct'), 40.0):g}%",
-                total_fgts_item,
-                multa_fgts_val,
-                inc_fgts=False,
-            )
-
-    # 8. Multas Arts. 477 e 467 da CLT
-    if params.get("inc_multa_477"):
-        add_verba("VER-10A", "Multa por Atraso na Quitação Rescisória (Art. 477, § 8º CLT)", rem_base, "1 Remuneração Mensal", "1 mês", "100%", rem_base, inc_fgts=False)
-
-    if params.get("inc_multa_467"):
-        base_467 = sum((v["Total Apurado"] for v in verbas if v["Código"] in ("VER-01", "VER-02", "VER-03A", "VER-03B")), Decimal("0.00"))
-        multa_467_val = (base_467 * Decimal("0.50")).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-10B", "Multa de 50% sobre Verbas Rescisórias Incontroversas (Art. 467 CLT)", base_467, "50% × Verbas Rescisórias", "1", "50%", multa_467_val, inc_fgts=False)
-
-    bruto_total = sum((v["Total Apurado"] for v in verbas), Decimal("0.00")).quantize(CENT, rounding=ROUND_HALF_UP)
-    abatimentos = d_money(params.get("offsets"))
-    liquido = max(Decimal("0.00"), bruto_total - abatimentos).quantize(CENT, rounding=ROUND_HALF_UP)
-
-    raw_sig = f"{params.get('worker_name')}|{params.get('employer_name')}|{adm_dt}|{dism_dt}|{liquido}"
-    audit_hash = "ED-" + hashlib.sha256(raw_sig.encode("utf-8")).hexdigest()[:8].upper()
-
-    return {
-        "audit_id": audit_hash,
-        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "office_header": str(params.get("office_header") or "Escritório de Advocacia Trabalhista"),
-        "worker_name": str(params.get("worker_name") or "Cliente"),
-        "employer_name": str(params.get("employer_name") or "Empresa"),
-        "role_title": str(params.get("role_title") or ""),
-        "admission_date": adm_dt.strftime("%d/%m/%Y"),
-        "dismissal_date": dism_dt.strftime("%d/%m/%Y"),
-        "termination_type": term_type,
-        "base_remuneracao": rem_base,
-        "verbas": verbas,
-        "bruto_atualizado": bruto_total,
-        "abatimentos": abatimentos,
-        "liquido_devido": liquido,
-        "ai_opinion": params.get("ai_opinion") or {},
-        "lawyer_narrative": str(params.get("lawyer_narrative") or ""),
-    }
-
-
-def build_complete_excel_bytes(calc: Dict[str, Any]) -> bytes:
-    """Gera planilha Excel (.XLSX) com Resumo, Verbas Liquidadas e Parecer Técnico."""
-    output = io.BytesIO()
-    resumo_rows = [
-        {"Campo": "Escritório / Timbre", "Valor": calc.get("office_header", "")},
-        {"Campo": "Código de Auditoria", "Valor": calc.get("audit_id", "")},
-        {"Campo": "Data/Hora Emissão", "Valor": calc.get("generated_at", "")},
-        {"Campo": "Reclamante (Cliente)", "Valor": calc.get("worker_name", "")},
-        {"Campo": "Reclamada (Empresa)", "Valor": calc.get("employer_name", "")},
-        {"Campo": "Cargo / Função", "Valor": calc.get("role_title", "")},
-        {"Campo": "Período Contratual", "Valor": f"{calc.get('admission_date')} a {calc.get('dismissal_date')}"},
-        {"Campo": "Remuneração Base Apurada", "Valor": fmt_brl(calc.get("base_remuneracao", Decimal("0.00")))},
-        {"Campo": "Total Bruto das Verbas", "Valor": fmt_brl(calc.get("bruto_atualizado", Decimal("0.00")))},
-        {"Campo": "(-) Abatimentos TRCT", "Valor": fmt_brl(calc.get("abatimentos", Decimal("0.00")))},
-        {"Campo": "VALOR TOTAL DA CAUSA", "Valor": fmt_brl(calc.get("liquido_devido", Decimal("0.00")))},
-    ]
-    df_resumo = pd.DataFrame(resumo_rows)
-
-    verbas_export = []
-    for v in (calc.get("verbas") or []):
-        verbas_export.append({
-            "Código": v.get("Código"),
-            "Verba": v.get("Verba"),
-            "Período": v.get("Período"),
-            "Quantidade": v.get("Quantidade"),
-            "Percentual": v.get("Percentual"),
-            "Base de Cálculo (R$)": float(d_money(v.get("Base de Cálculo"))),
-            "Fórmula": v.get("Fórmula"),
-            "Valor Original (R$)": float(d_money(v.get("Valor Original"))),
-            "Reflexos (R$)": float(d_money(v.get("Reflexos"))),
-            "Total Apurado (R$)": float(d_money(v.get("Total Apurado"))),
-        })
-    df_verbas = pd.DataFrame(verbas_export)
-
-    op = calc.get("ai_opinion") or {}
-    parecer_rows = [
-        {"Tópico": "Diagnóstico NR-15 / NR-16", "Conteúdo": str(op.get("nr_technical_assessment") or "Não aplicável")},
-        {"Tópico": "Alerta de Estabilidade", "Conteúdo": str(op.get("stability_alert") or "Nenhum")},
-        {"Tópico": "Atestados / ASO / INSS", "Conteúdo": str(op.get("medical_leave_summary") or "Nenhum")},
-        {"Tópico": "Conclusão de Viabilidade", "Conteúdo": str(op.get("viability_conclusion") or "")},
-        {"Tópico": "Relato do Caso", "Conteúdo": str(calc.get("lawyer_narrative") or "")},
-    ]
-    df_parecer = pd.DataFrame(parecer_rows)
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_resumo.to_excel(writer, sheet_name="Resumo_Causa", index=False)
-        df_verbas.to_excel(writer, sheet_name="Memoria_Verbas", index=False)
-        df_parecer.to_excel(writer, sheet_name="Parecer_Tecnico", index=False)
-
-    return output.getvalue()
-
-
-def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
-    """Gera relatório oficial em PDF (fpdf2) com timbre, memória de cálculo e parecer."""
-    def _latin(txt: Any) -> str:
-        return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
-
-    pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    usable_w = pdf.epw
-
-    def _safe_multi(text: str, line_h: float = 5.0) -> None:
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(usable_w, line_h, _latin(text))
-
-    pdf.set_font("Helvetica", "B", 13)
-    _safe_multi(calc.get("office_header", "ED Cálculos Trabalhistas"), 7)
-    pdf.set_font("Helvetica", "", 9)
-    _safe_multi(f"Dossiê Pré-Processual e Liquidação (Art. 840, § 1º CLT) | ID: {calc.get('audit_id')} | Emissão: {calc.get('generated_at')}", 5)
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 10)
-    _safe_multi(f"Reclamante: {calc.get('worker_name')}  |  Reclamada: {calc.get('employer_name')}", 6)
-    pdf.set_font("Helvetica", "", 9)
-    _safe_multi(f"Cargo: {calc.get('role_title')}  |  Contrato: {calc.get('admission_date')} a {calc.get('dismissal_date')}  |  Remuneração Base: {fmt_brl(calc.get('base_remuneracao'))}", 5)
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 10)
-    _safe_multi("QUADRO DE PEDIDOS LIQUIDADOS", 6)
-    pdf.set_font("Helvetica", "", 8.5)
-    for v in (calc.get("verbas") or []):
-        linha = f"[{v.get('Código')}] {v.get('Verba')} ({v.get('Quantidade')}) — Orig: {fmt_brl(v.get('Valor Original'))} | Refl: {fmt_brl(v.get('Reflexos'))} | Total: {fmt_brl(v.get('Total Apurado'))}"
-        _safe_multi(linha, 5)
-
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "B", 10)
-    _safe_multi(f"Total Bruto: {fmt_brl(calc.get('bruto_atualizado'))}   |   (-) Abatimentos TRCT: {fmt_brl(calc.get('abatimentos'))}", 6)
-    pdf.set_font("Helvetica", "B", 11)
-    _safe_multi(f"VALOR TOTAL ATRIBUÍDO À CAUSA: {fmt_brl(calc.get('liquido_devido'))}", 7)
-
-    op = calc.get("ai_opinion") or {}
-    if op.get("nr_technical_assessment") or op.get("viability_conclusion"):
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "B", 10)
-        _safe_multi("PARECER TÉCNICO E ESTRATÉGICO", 6)
-        pdf.set_font("Helvetica", "", 8.5)
-        if op.get("nr_technical_assessment"):
-            _safe_multi(f"NR-15 / NR-16: {op.get('nr_technical_assessment')}", 5)
-        if op.get("viability_conclusion"):
-            _safe_multi(f"Viabilidade: {op.get('viability_conclusion')}", 5)
-
-    raw_pdf = pdf.output()
-    if isinstance(raw_pdf, (bytes, bytearray)):
-        return bytes(raw_pdf)
-    return str(raw_pdf).encode("latin-1", errors="replace")
-
-
-# ==============================================================================
-# 7. MENU LATERAL
-# ==============================================================================
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
-    st.caption("Parecer Pré-Processual & Auditoria")
+    st.caption(f"👤 {current_user.get('full_name', 'Advogado')} ({current_office_email})")
     st.divider()
     menu = st.radio(
         "Navegação",
@@ -1036,13 +506,22 @@ with st.sidebar:
         if st.session_state.get("cloud_status_detail"):
             st.caption(f"Detalhe: {st.session_state['cloud_status_detail']}")
         if st.button("Reconectar Nuvem", key="sb_reconnect_cloud_btn", use_container_width=True):
-            c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases()
+            c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(current_office_email)
             st.session_state.cloud_connected = c_ok
             st.session_state.cloud_status_detail = c_msg
             if c_ok:
                 st.session_state.calculations_history = c_calcs
                 st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
             st.rerun()
+
+    st.divider()
+    if st.button("Sair da Conta (Logout)", key="sb_logout_btn", use_container_width=True):
+        st.session_state.auth_user = None
+        st.session_state.calculations_history = []
+        st.session_state.case_chat_threads = {"caso_atual": []}
+        st.session_state.extracted_ai_data = None
+        st.session_state.timecard_result = None
+        st.rerun()
 
 
 # ==============================================================================
@@ -1198,7 +677,7 @@ if menu == "Avaliação Preliminar & Auditoria":
 
         office_timbre = st.text_input(
             "Timbre do Escritório / Advogado e OAB (aparece no topo do PDF)",
-            value="Escritório de Advocacia Trabalhista — Parecer Pré-Processual",
+            value=str(current_user.get("office_header") or "Escritório de Advocacia Trabalhista — Parecer Pré-Processual"),
         )
 
         p1, p2, p3 = st.columns(3)
@@ -1450,7 +929,7 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.session_state.case_chat_threads[res_pre["audit_id"]] = final_case_msgs
             st.session_state.selected_chat_case_id = res_pre["audit_id"]
             st.session_state["chat_case_selector_widget"] = res_pre["audit_id"]
-            up_ok, up_msg = supabase_upsert_case(res_pre, final_case_msgs)
+            up_ok, up_msg = supabase_upsert_case(res_pre, final_case_msgs, current_office_email)
             if up_ok:
                 st.session_state.cloud_connected = True
                 st.session_state.cloud_status_detail = "Conectada"
@@ -1548,7 +1027,7 @@ if menu == "Avaliação Preliminar & Auditoria":
             if active_case_id != "caso_atual":
                 calc_to_sync = next((c for c in st.session_state.calculations_history if c["audit_id"] == active_case_id), None)
                 if calc_to_sync:
-                    supabase_upsert_case(calc_to_sync, [])
+                    supabase_upsert_case(calc_to_sync, [], current_office_email)
             st.rerun()
 
         current_thread = st.session_state.case_chat_threads[active_case_id]
@@ -1603,7 +1082,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                     )
                 st.session_state.case_chat_threads[active_case_id].append({"role": "assistant", "content": ai_reply_wide})
                 if active_case_id != "caso_atual" and ctx_calc is not None:
-                    supabase_upsert_case(ctx_calc, st.session_state.case_chat_threads[active_case_id])
+                    supabase_upsert_case(ctx_calc, st.session_state.case_chat_threads[active_case_id], current_office_email)
                 st.rerun()
             except Exception as wide_chat_exc:
                 st.error(f"Erro no chat: {wide_chat_exc}")
