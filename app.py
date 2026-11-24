@@ -14,7 +14,6 @@ import pandas as pd
 import streamlit as st
 from pydantic import BaseModel
 
-# SDK oficial Google GenAI (usado exclusivamente para extração assistida de documentos)
 try:
     from google import genai
     from google.genai import types
@@ -24,7 +23,199 @@ except ImportError:
 
 
 # ==============================================================================
-# 5. EXTRAÇÃO ASSISTIDA POR GEMINI (ANÁLISE COMPLETA DO DOSSIÊ TRABALHISTA)
+# 1. CONFIGURAÇÃO DA PÁGINA E IDENTIDADE VISUAL
+# ==============================================================================
+st.set_page_config(
+    page_title="ED Cálculos Trabalhistas — Avaliação Preliminar & Auditoria",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #F4F6F9; }
+    section[data-testid="stSidebar"] { background-color: #0B1B2B; color: #FFFFFF; }
+    section[data-testid="stSidebar"] * { color: #F8FAFC !important; }
+    .stMetric {
+        background-color: #FFFFFF;
+        padding: 14px 18px;
+        border-radius: 10px;
+        border: 1px solid #E2E8F0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ==============================================================================
+# 2. TABELAS HISTÓRICAS E CONSTANTES DECIMAIS
+# ==============================================================================
+TABLES_VERSION = "2026.11-ref"
+CENT = Decimal("0.01")
+
+INSS_BRACKETS = [
+    (Decimal("1518.00"), Decimal("0.075")),
+    (Decimal("2793.88"), Decimal("0.09")),
+    (Decimal("4190.83"), Decimal("0.12")),
+    (Decimal("8157.41"), Decimal("0.14")),
+]
+
+IRRF_BRACKETS = [
+    (Decimal("2259.20"), Decimal("0.00"), Decimal("0.00")),
+    (Decimal("2826.65"), Decimal("0.075"), Decimal("169.44")),
+    (Decimal("3751.05"), Decimal("0.15"), Decimal("381.44")),
+    (Decimal("4664.68"), Decimal("0.225"), Decimal("662.77")),
+    (Decimal("999999999.00"), Decimal("0.275"), Decimal("896.00")),
+]
+
+
+def d_money(val: Any) -> Decimal:
+    if val is None or val == "":
+        return Decimal("0.00")
+    return Decimal(str(val)).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def fmt_brl(val: Decimal) -> str:
+    q = d_money(val)
+    sign = "-" if q < 0 else ""
+    abs_q = abs(q)
+    inteiro, dec = f"{abs_q:.2f}".split(".")
+    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
+    return f"{sign}R$ {inteiro_fmt},{dec}"
+
+
+# ==============================================================================
+# 3. ESTADO DA SESSÃO
+# ==============================================================================
+if "calculations_history" not in st.session_state:
+    st.session_state.calculations_history = []
+if "timecard_result" not in st.session_state:
+    st.session_state.timecard_result = None
+if "extracted_ai_data" not in st.session_state:
+    st.session_state.extracted_ai_data = None
+if "extraction_confirmed" not in st.session_state:
+    st.session_state.extraction_confirmed = False
+
+
+# ==============================================================================
+# 4. APURADOR DETERMINÍSTICO DE CARTÃO DE PONTO (EM MINUTOS INTEIROS, SEM IA)
+# ==============================================================================
+def parse_hhmm(val: Any) -> Optional[int]:
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    if not s or ":" not in s:
+        return None
+    parts = s.split(":")
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        if 0 <= h <= 29 and 0 <= m <= 59:
+            return h * 60 + m
+    except ValueError:
+        return None
+    return None
+
+
+def calc_night_minutes(start_min: int, end_min: int) -> int:
+    if end_min <= start_min:
+        return 0
+    night = 0
+    for n_start, n_end in [(0, 300), (1320, 1740)]:
+        ov_s = max(start_min, n_start)
+        ov_e = min(end_min, n_end)
+        if ov_e > ov_s:
+            night += ov_e - ov_s
+    return night
+
+
+def process_timecard_dataframe(df: pd.DataFrame, daily_limit_min: int = 480) -> Dict[str, Any]:
+    rows_out = []
+    tot_he50_min = 0
+    tot_he100_min = 0
+    tot_intra_min = 0
+    tot_night_ficta_min = 0
+    incomplete_days = 0
+
+    for _, row in df.iterrows():
+        dt_str = str(row.get("Data", "")).strip()
+        dia_sem = str(row.get("Dia", row.get("DiaSemana", ""))).strip().upper()
+        feriado = str(row.get("Feriado", "N")).strip().upper() in ("S", "SIM", "1", "TRUE") or dia_sem == "DOM"
+
+        e1 = parse_hhmm(row.get("Entrada1"))
+        s1 = parse_hhmm(row.get("Saida1"))
+        e2 = parse_hhmm(row.get("Entrada2"))
+        s2 = parse_hhmm(row.get("Saida2"))
+
+        if e1 is None or s1 is None:
+            incomplete_days += 1
+            rows_out.append({
+                "Data": dt_str, "Dia": dia_sem, "HE 50% (h)": 0.0,
+                "HE 100% (h)": 0.0, "Intrajornada (h)": 0.0, "Noturna Ficta (h)": 0.0,
+                "Status": "Batida incompleta (revisar)",
+            })
+            continue
+
+        p1_end = s1 + 1440 if s1 < e1 else s1
+        w1 = max(0, p1_end - e1)
+        n1 = calc_night_minutes(e1, p1_end)
+
+        w2, n2, break_min = 0, 0, 0
+        if e2 is not None and s2 is not None:
+            p2_start = e2 + 1440 if e2 < p1_end else e2
+            p2_end = s2 + 1440 if s2 < p2_start else s2
+            break_min = max(0, p2_start - p1_end)
+            w2 = max(0, p2_end - p2_start)
+            n2 = calc_night_minutes(p2_start, p2_end)
+
+        worked = w1 + w2
+        night_clock = n1 + n2
+        night_ficta = round(night_clock * (60.0 / 52.5))
+
+        intra_sup = 0
+        if worked > 360 and break_min < 60:
+            intra_sup = 60 - break_min
+        elif 240 < worked <= 360 and break_min < 15:
+            intra_sup = 15 - break_min
+
+        he50 = 0
+        he100 = 0
+        if feriado:
+            he100 = worked
+        else:
+            diff = worked - daily_limit_min
+            if diff > 10:
+                he50 = diff
+
+        tot_he50_min += he50
+        tot_he100_min += he100
+        tot_intra_min += intra_sup
+        tot_night_ficta_min += night_ficta
+
+        rows_out.append({
+            "Data": dt_str,
+            "Dia": dia_sem,
+            "HE 50% (h)": round(he50 / 60.0, 2),
+            "HE 100% (h)": round(he100 / 60.0, 2),
+            "Intrajornada (h)": round(intra_sup / 60.0, 2),
+            "Noturna Ficta (h)": round(night_ficta / 60.0, 2),
+            "Status": "Intrajornada suprimida" if intra_sup > 0 else "Apurado",
+        })
+
+    return {
+        "table": pd.DataFrame(rows_out),
+        "he50_hours": round(tot_he50_min / 60.0, 2),
+        "he100_hours": round(tot_he100_min / 60.0, 2),
+        "intrajornada_hours": round(tot_intra_min / 60.0, 2),
+        "night_ficta_hours": round(tot_night_ficta_min / 60.0, 2),
+        "incomplete_days": incomplete_days,
+    }
+
+
+# ==============================================================================
+# 5. ANÁLISE CRUZADA POR GEMINI (DOCUMENTOS + RELATO LIVRE DO ADVOGADO)
 # ==============================================================================
 class PaidItem(BaseModel):
     verba: str
@@ -33,10 +224,10 @@ class PaidItem(BaseModel):
 
 class IrregularityFinding(BaseModel):
     categoria: str
-    documento_origem: str
+    origem_evidencia: str
     descricao: str
     fundamento_juridico: str
-    impacto_financeiro: str
+    tese_ou_pedido_sugerido: str
 
 
 class ExtractedCaseData(BaseModel):
@@ -54,16 +245,21 @@ class ExtractedCaseData(BaseModel):
     suppressed_break_minutes: Optional[int] = None
     weekly_night_hours: Optional[float] = None
     adicional_sugerido: Optional[str] = None
+    restituicao_atestados_ou_descontos: Optional[float] = None
+    sugerir_saldo_salario: bool = True
+    sugerir_aviso_previo: bool = True
+    sugerir_13_e_ferias: bool = True
+    sugerir_fgts_e_multa: bool = True
     trct_paid_items: List[PaidItem] = []
     irregularities_found: List[IrregularityFinding] = []
     medical_leave_summary: Optional[str] = None
     stability_alert: Optional[str] = None
-    general_legal_opinion: Optional[str] = None
+    viability_conclusion: Optional[str] = None
+    recommended_claims_checklist: List[str] = []
     ambiguities: List[str] = []
 
 
 def get_gemini_api_key() -> Optional[str]:
-    """Obtém a chave via st.secrets ou variável de ambiente sem nunca expor no código."""
     try:
         if "GEMINI_API_KEY" in st.secrets:
             return st.secrets["GEMINI_API_KEY"]
@@ -72,34 +268,38 @@ def get_gemini_api_key() -> Optional[str]:
     return os.environ.get("GEMINI_API_KEY")
 
 
-def analyze_full_dossier_with_gemini(files_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
+def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Envia TODOS os arquivos enviados pelo advogado (TRCT, contracheques, atestados médicos,
-    laudos de afastamento/INSS, ASO, ponto, FGTS, CCT) em uma única análise cruzada do Gemini.
-    Identifica brechas, estabilidade, descontos indevidos e extrai dados objetivos.
-    NUNCA calcula valores financeiros finais sem o motor Decimal e exige revisão humana.
+    Cruza o RELATO DO ADVOGADO com TODOS OS DOCUMENTOS ANEXADOS para emitir
+    parecer pré-processual, identificar irregularidades e pré-configurar os pedidos.
     """
     api_key = get_gemini_api_key()
     if not api_key or not GENAI_AVAILABLE:
-        raise RuntimeError("GEMINI_API_KEY não configurada ou pacote google-genai ausente.")
+        raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
 
     client = genai.Client(api_key=api_key)
     contents: List[Any] = [
         (
-            "Você é um auditor jurídico trabalhista sênior. Analise TODOS os documentos anexados em conjunto "
-            "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos de afastamento/INSS, "
-            "ASO admissional/demissional, CAT, advertências ou CCT). "
-            "1) Extraia os dados objetivos do contrato (partes, datas, modalidade de rescisão, salário-base, comissões, "
-            "divisor e valores já pagos no TRCT). "
-            "2) Identifique TODAS as irregularidades, nulidades e brechas para pedido de restituição ou indenização "
-            "(ex.: dispensa durante estabilidade acidentária B91 ou gestante, atestado médico válido descontado como falta "
-            "no contracheque/TRCT, demissão com ASO inapto, diferenças de verbas rescisórias, ausência de FGTS, horas extras/intervalo). "
-            "3) Não invente datas ou valores ausentes. Aponte qualquer dúvida em 'ambiguities'."
+            "Você é um advogado trabalhista sênior e auditor de cálculos judiciais. "
+            "Analise em conjunto o RELATO DO ADVOGADO (entrevista com o cliente) e TODOS OS DOCUMENTOS ANEXADOS "
+            "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos de afastamento/INSS, ASO, CCT). "
+            "Sua missão:\n"
+            "1) Extrair datas, salário-base, comissões/'por fora', jornada habitual, valores já pagos no TRCT e descontos indevidos.\n"
+            "2) Identificar todas as irregularidades, nulidades e brechas jurídicas (estabilidade acidentária B91, gestante, CIPA, "
+            "atestados médicos descontados indevidamente, demissão com ASO inapto, rescisão indireta por falta de FGTS ou atraso salarial, "
+            "horas extras não pagas, intervalo intrajornada suprimido, vínculo sem registro).\n"
+            "3) Emitir 'viability_conclusion' (parecer objetivo se há viabilidade para ajuizar ação e quais os pontos fortes) e "
+            "'recommended_claims_checklist' (lista objetiva dos pedidos prontos para a Petição Inicial).\n"
+            "4) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias e sugerir_fgts_e_multa conforme o caso.\n"
+            "5) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
         )
     ]
 
+    if lawyer_narrative.strip():
+        contents.append(f"=== RELATO DO ADVOGADO / FATOS NARRADOS PELO CLIENTE ===\n{lawyer_narrative.strip()}")
+
     for item in files_payload:
-        contents.append(f"--- ARQUIVO ANEXADO: {item['name']} ---")
+        contents.append(f"=== DOCUMENTO ANEXADO: {item['name']} ===")
         contents.append(types.Part.from_bytes(data=item["bytes"], mime_type=item["mime"]))
 
     response = client.models.generate_content(
@@ -114,44 +314,58 @@ def analyze_full_dossier_with_gemini(files_payload: List[Dict[str, Any]]) -> Dic
     return json.loads(response.text)
 
 
-def merge_extracted_documents(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Consolida dados lidos de múltiplos documentos (TRCT + Contracheques + Ponto + CTPS + FGTS + CCT)."""
-    merged: Dict[str, Any] = {
-        "paid_items_breakdown": [],
-        "ambiguities": [],
-        "sources_count": len(results),
-    }
-    scalar_fields = [
-        "process_number", "worker_name", "employer_name", "admission_date",
-        "dismissal_date", "termination_type", "base_salary", "commissions",
-        "insalubrity_or_danger_pct", "monthly_divisor", "weekly_overtime_hours_detected",
-        "suppressed_break_minutes_daily", "weekly_night_hours_detected",
-        "total_paid_trct", "fgts_balance_detected", "cct_rules_summary",
-    ]
-    for item in results:
-        for f in scalar_fields:
-            val = item.get(f)
-            if val is not None and val != "" and val != 0:
-                merged[f] = val
-        if item.get("paid_items_breakdown"):
-            merged["paid_items_breakdown"].extend(item["paid_items_breakdown"])
-        if item.get("ambiguities"):
-            merged["ambiguities"].extend(item["ambiguities"])
+# ==============================================================================
+# 6. MOTOR DE CÁLCULO DECIMAL EXATO (AUDITORIA & VALOR DA CAUSA)
+# ==============================================================================
+def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
+    base_salary = d_money(params["base_salary"])
+    commissions = d_money(params.get("commissions", 0))
+    insalubrity = d_money(params.get("insalubrity", 0))
+    remuneration = base_salary + commissions + insalubrity
 
-    if not merged.get("total_paid_trct") and merged["paid_items_breakdown"]:
-        merged["total_paid_trct"] = round(
-            sum(float(x.get("valor_pago") or 0) for x in merged["paid_items_breakdown"]), 2
-        )
-    return merged
+    divisor = Decimal(str(params["monthly_divisor"]))
+    hourly_rate = (remuneration / divisor).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
+    adm_date: date = params["admission_date"]
+    dism_date: date = params["dismissal_date"]
+    term_type: str = params["termination_type"]
+    years_worked = max(0, (dism_date - adm_date).days // 365)
 
-def parse_safe_date(date_str: Optional[str], fallback: date) -> date:
-    if not date_str:
-        return fallback
-    try:
-        return datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
-    except Exception:
-        return fallback
+    verbas: List[Dict[str, Any]] = []
+
+    def add_verba(
+        code: str,
+        name: str,
+        period: str,
+        base: Decimal,
+        formula: str,
+        qty: str,
+        pct_str: str,
+        original: Decimal,
+        reflexos: Decimal = Decimal("0.00"),
+        tributavel_inss: bool = True,
+    ):
+        orig_q = original.quantize(CENT, rounding=ROUND_HALF_UP)
+        refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
+        total_item = orig_q + refl_q
+        verbas.append({
+            "Código": code,
+            "Verba": name,
+            "Período": period,
+            "Base de Cálculo": base.quantize(CENT),
+            "Fórmula": formula,
+            "Quantidade": qty,
+            "Percentual": pct_str,
+            "Valor Original": orig_q,
+            "Reflexos": refl_q,
+            "Total Apurado": total_item,
+            "Tributável INSS": tributavel_inss,
+        })
+
+    periodo_geral = f"{adm_date.strftime('%d/%m/%Y')} a {dism_date.strftime('%d/%m/%Y')}"
+
+    if params.get("inc_saldo_salario"):
+        dias = Decimal(str(params.get("saldo_dias", dism_date.day)))
         val = (remuneration / Decimal("30")) * dias
         add_verba(
             "VER-01", "Saldo de Salário", dism_date.strftime("%m/%Y"),
@@ -188,7 +402,6 @@ def parse_safe_date(date_str: Optional[str], fallback: date) -> date:
             f"{avos_ferias}/12 avos", "133,33%", ferias_base + terco, tributavel_inss=False
         )
 
-    # B. Jornada de Trabalho (Apurada automaticamente do ponto ou informada)
     dsr_factor = Decimal("1") / Decimal("6")
     if params.get("inc_he50") and d_money(params.get("he50_hours", 0)) > 0:
         h50 = Decimal(str(params["he50_hours"]))
@@ -233,7 +446,6 @@ def parse_safe_date(date_str: Optional[str], fallback: date) -> date:
             f"{h_not}h", f"+{params.get('night_pct', 20)}%", orig_not, tributavel_inss=True
         )
 
-    # C. FGTS + Indenização Rescisória
     if params.get("inc_fgts"):
         base_fgts = sum((v["Valor Original"] + v["Reflexos"]) for v in verbas)
         fgts_8 = (base_fgts * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
@@ -247,33 +459,9 @@ def parse_safe_date(date_str: Optional[str], fallback: date) -> date:
             "Verbas incidentes", f"8% + {int(multa_pct * 100)}%", fgts_8 + multa_val, tributavel_inss=False
         )
 
-    # D. Totais, Tributos e Deduções
     bruto_atualizado = sum((v["Total Apurado"] for v in verbas), Decimal("0.00"))
-    base_tributavel = sum(
-        (v["Valor Original"] + v["Reflexos"] for v in verbas if v["Tributável INSS"]),
-        Decimal("0.00"),
-    )
-
-    inss_val = Decimal("0.00")
-    if params.get("apply_inss") and base_tributavel > 0:
-        aliquota_inss = Decimal("0.14")
-        for teto, aliq in INSS_BRACKETS:
-            if base_tributavel <= teto:
-                aliquota_inss = aliq
-                break
-        inss_val = (base_tributavel * aliquota_inss).quantize(CENT, rounding=ROUND_HALF_UP)
-
-    irrf_val = Decimal("0.00")
-    base_ir = max(Decimal("0.00"), base_tributavel - inss_val)
-    if params.get("apply_irrf") and base_ir > 0:
-        for teto, aliq, ded in IRRF_BRACKETS:
-            if base_ir <= teto:
-                irrf_val = max(Decimal("0.00"), (base_ir * aliq - ded).quantize(CENT, rounding=ROUND_HALF_UP))
-                break
-
     abatimentos = d_money(params.get("offsets", 0))
-    total_descontos = inss_val + irrf_val + abatimentos
-    liquido_devido = max(Decimal("0.00"), bruto_atualizado - total_descontos)
+    liquido_devido = max(Decimal("0.00"), bruto_atualizado - abatimentos)
 
     audit_payload = json.dumps(
         {"process": params["process_number"], "bruto": str(bruto_atualizado), "liquido": str(liquido_devido), "tables": TABLES_VERSION},
@@ -288,20 +476,17 @@ def parse_safe_date(date_str: Optional[str], fallback: date) -> date:
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "verbas": verbas,
         "bruto_atualizado": bruto_atualizado,
-        "inss": inss_val,
-        "irrf": irrf_val,
         "abatimentos": abatimentos,
-        "total_descontos": total_descontos,
         "liquido_devido": liquido_devido,
     }
 
 
 # ==============================================================================
-# 8. MENU LATERAL PROFISSIONAL
+# 7. MENU LATERAL
 # ==============================================================================
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
-    st.caption("SaaS Jurídico • Auditoria Rescisória & Avaliação Preliminar")
+    st.caption("SaaS Jurídico • Parecer Pré-Processual & Auditoria")
     st.divider()
     menu = st.radio(
         "Navegação",
@@ -309,7 +494,6 @@ with st.sidebar:
             "Avaliação Preliminar & Auditoria",
             "Meus Cálculos e Relatórios",
             "Central de Atualizações Legais",
-            "Testes de Confiabilidade",
             "Assinaturas e LGPD",
         ],
     )
@@ -319,36 +503,46 @@ with st.sidebar:
 
 
 # ==============================================================================
-# 9. TELAS DO SISTEMA
+# 8. TELAS DO SISTEMA
 # ==============================================================================
 if menu == "Avaliação Preliminar & Auditoria":
-    st.title("Avaliação Preliminar & Auditoria Completa do Dossiê")
+    st.title("Avaliação Preliminar, Parecer IA & Cálculo para Ajuizamento")
     st.markdown(
-        "Envie **quaisquer documentos do caso** (TRCT, contracheques, cartões de ponto, extrato FGTS, **atestados médicos, "
-        "laudos de afastamento/INSS, ASO**, contrato ou CCT). A IA faz a **leitura cruzada para encontrar brechas e irregularidades** "
-        "e o **motor decimal exato** apura cada centavo a restituir."
+        "Relate os fatos narrados pelo cliente e/ou anexe os documentos disponíveis (TRCT, contracheques, ponto, atestados, laudos INSS, FGTS, CCT). "
+        "A IA cruza tudo para emitir o **parecer de viabilidade e brechas**, enquanto o **motor decimal** entrega os pedidos liquidados prontos para a Petição Inicial."
     )
 
     with st.container(border=True):
-        st.subheader("1. Central Universal de Upload (Envie Todos os Arquivos do Cliente)")
-        st.caption(
-            "Aceita múltiplos arquivos simultâneos em PDF, Imagem (JPG/PNG), Excel (.xlsx) e CSV: "
-            "TRCT, Contracheques, Cartão de Ponto, Atestados Médicos, Laudos/Benefícios INSS, ASO, Extrato FGTS e CCT."
+        st.subheader("1. Relato do Caso (Entrevista) + Upload Universal de Documentos")
+        lawyer_narrative = st.text_area(
+            "Relato livre do advogado / fatos narrados pelo cliente (opcional se enviar arquivos, ou use ambos em conjunto):",
+            placeholder=(
+                "Ex.: Cliente admitido em 01/02/2024 como vendedor com salário registrado de R$ 2.400,00 + R$ 600,00 por fora. "
+                "Fazia em média 6 horas extras semanais sem receber e tinha apenas 30 min de almoço. "
+                "Sofreu afastamento previdenciário B91 e foi dispensado sem justa causa 3 meses após a alta, "
+                "tendo ainda 2 atestados médicos descontados no TRCT..."
+            ),
+            height=135,
+            key="lawyer_narrative_box",
         )
 
         uploaded_all = st.file_uploader(
-            "Arraste e solte aqui todos os arquivos do cliente (sem limite de categoria)",
+            "Anexe aqui todos os documentos do cliente (PDF, Imagem JPG/PNG, Excel .xlsx, CSV ou TXT — opcional)",
             type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx", "txt"],
             accept_multiple_files=True,
             key="universal_dossier_uploader",
         )
 
         if uploaded_all:
-            st.write(f"**{len(uploaded_all)} arquivo(s) pronto(s) para análise:** " + ", ".join(f"`{f.name}`" for f in uploaded_all))
-            if st.button("Ler Todos os Arquivos e Auditar Irregularidades (IA + Motor Decimal)", type="primary"):
+            st.caption(f"**{len(uploaded_all)} arquivo(s) anexado(s):** " + ", ".join(f"`{f.name}`" for f in uploaded_all))
+
+        if st.button("Analisar Relato + Documentos e Preparar Ação (IA + Motor Decimal)", type="primary"):
+            if not lawyer_narrative.strip() and not uploaded_all:
+                st.warning("Escreva um breve relato do caso ou anexe pelo menos um documento para analisar.")
+            else:
                 gemini_files = []
                 timecard_dfs = []
-                for f in uploaded_all:
+                for f in (uploaded_all or []):
                     fname_low = f.name.lower()
                     if fname_low.endswith(".csv"):
                         raw_txt = f.getvalue().decode("utf-8", errors="ignore")
@@ -385,39 +579,47 @@ if menu == "Avaliação Preliminar & Auditoria":
                     st.session_state.timecard_result = process_timecard_dataframe(df_concat)
                     st.success("Cartão(ões) de ponto apurado(s) matematicamente em minutos!")
 
-                if gemini_files:
+                if lawyer_narrative.strip() or gemini_files:
                     try:
-                        with st.spinner("Auditando documentos, atestados, laudos, contracheques e TRCT..."):
-                            st.session_state.extracted_ai_data = analyze_full_dossier_with_gemini(gemini_files)
+                        with st.spinner("Cruzando relato jurídico e documentos para gerar parecer e teses..."):
+                            st.session_state.extracted_ai_data = analyze_case_with_gemini(lawyer_narrative, gemini_files)
                             st.session_state.extraction_confirmed = False
-                        st.success("Leitura completa concluída! Confira o diagnóstico de irregularidades e revise os dados abaixo.")
+                        st.success("Parecer e extração concluídos! Revise as teses e parâmetros abaixo.")
                     except Exception as exc:
                         st.warning(f"Análise via Gemini indisponível ({exc}). Verifique `GEMINI_API_KEY` em Secrets.")
 
     tc_pre = st.session_state.timecard_result
     ext_pre = st.session_state.extracted_ai_data or {}
 
-    # Painel de Diagnóstico Jurídico e Irregularidades Encontradas pela IA
+    # Painel de Parecer Jurídico, Irregularidades e Checklist Pronto para Ajuizar
     if ext_pre:
         with st.container(border=True):
-            st.subheader("Diagnóstico da Auditoria Documental (Brechas e Irregularidades Detectadas)")
+            st.subheader("Parecer Jurídico Preliminar & Estratégia para Ajuizamento")
             if ext_pre.get("stability_alert"):
-                st.error(f"**ALERTA DE ESTABILIDADE / NULIDADE DA DISPENSA:** {ext_pre['stability_alert']}")
+                st.error(f"**ALERTA DE ESTABILIDADE / REINTEGRAÇÃO OU INDENIZAÇÃO:** {ext_pre['stability_alert']}")
             if ext_pre.get("medical_leave_summary"):
                 st.warning(f"**Atestados Médicos / Afastamentos / ASO:** {ext_pre['medical_leave_summary']}")
-            if ext_pre.get("general_legal_opinion"):
-                st.info(f"**Síntese Jurídica do Dossiê:** {ext_pre['general_legal_opinion']}")
+            if ext_pre.get("viability_conclusion"):
+                st.info(f"**Conclusão de Viabilidade da Ação:** {ext_pre['viability_conclusion']}")
 
-            irregs = ext_pre.get("irregularities_found") or []
-            if irregs:
-                st.markdown("#### Irregularidades e Pontos de Restituição Identificados")
-                st.dataframe(pd.DataFrame(irregs), use_container_width=True, hide_index=True)
+            c_left, c_right = st.columns([3, 2])
+            with c_left:
+                irregs = ext_pre.get("irregularities_found") or []
+                if irregs:
+                    st.markdown("#### Irregularidades e Brechas Identificadas")
+                    st.dataframe(pd.DataFrame(irregs), use_container_width=True, hide_index=True)
+            with c_right:
+                checklist = ext_pre.get("recommended_claims_checklist") or []
+                if checklist:
+                    st.markdown("#### Pedidos Recomendados para a Inicial")
+                    for item in checklist:
+                        st.markdown(f"- ✅ {item}")
 
             if ext_pre.get("ambiguities"):
-                st.caption("**Pontos ambíguos ou ilegíveis que exigem atenção do advogado:** " + " | ".join(ext_pre["ambiguities"]))
+                st.caption("**Pontos pendentes de confirmação pelo advogado:** " + " | ".join(ext_pre["ambiguities"]))
 
             st.session_state.extraction_confirmed = st.checkbox(
-                "Confirmo que revisei os dados extraídos e o diagnóstico antes de gerar o cálculo final",
+                "Confirmo que revisei o parecer e os parâmetros extraídos antes de fechar os valores",
                 value=st.session_state.extraction_confirmed,
             )
 
@@ -425,7 +627,6 @@ if menu == "Avaliação Preliminar & Auditoria":
         with st.expander("Ver Espelho de Ponto Apurado Dia a Dia (Tolerância CLT + Redução Ficta)"):
             st.dataframe(tc_pre["table"], use_container_width=True, hide_index=True)
 
-    # Soma automática de itens pagos no TRCT extraídos pela IA
     trct_paid_list = ext_pre.get("trct_paid_items") or []
     trct_auto_sum = round(sum(float(i.get("valor", 0)) for i in trct_paid_list), 2)
 
@@ -438,11 +639,11 @@ if menu == "Avaliação Preliminar & Auditoria":
             return fallback
 
     with st.form("preliminary_eval_form"):
-        st.subheader("2. Conferência das Condições do Contrato (Preenchidas pelos Arquivos ou Manualmente)")
+        st.subheader("2. Conferência das Condições do Contrato e Pedidos")
         p1, p2, p3 = st.columns(3)
-        cliente_nome = p1.text_input("Nome do Cliente (Trabalhador) *", value=ext_pre.get("worker_name") or "João da Silva")
-        empresa_nome = p2.text_input("Empresa (Futura Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
-        cargo_funcao = p3.text_input("Cargo / Função Exercida", value=ext_pre.get("role_title") or "Auxiliar Operacional / Vendedor")
+        cliente_nome = p1.text_input("Nome do Cliente (Reclamante) *", value=ext_pre.get("worker_name") or "João da Silva")
+        empresa_nome = p2.text_input("Empresa (Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
+        cargo_funcao = p3.text_input("Cargo / Função", value=ext_pre.get("role_title") or "Auxiliar Operacional / Vendedor")
 
         motivos_opts = ["sem_justa_causa", "rescisao_indireta", "pedido_demissao", "acordo", "justa_causa"]
         motivo_ext = ext_pre.get("termination_type") if ext_pre.get("termination_type") in motivos_opts else "sem_justa_causa"
@@ -451,20 +652,19 @@ if menu == "Avaliação Preliminar & Auditoria":
         adm_pre = d1.date_input("Data de Admissão *", value=parse_iso_date(ext_pre.get("admission_date"), date(2024, 2, 1)), key="adm_pre")
         dism_pre = d2.date_input("Data de Saída (ou Hoje) *", value=parse_iso_date(ext_pre.get("dismissal_date"), date(2026, 11, 20)), key="dism_pre")
         motivo_saida = d3.selectbox(
-            "Situação da Saída *",
+            "Modalidade / Tese da Saída *",
             motivos_opts,
             index=motivos_opts.index(motivo_ext),
             format_func=lambda x: {
                 "sem_justa_causa": "Dispensa sem justa causa",
-                "rescisao_indireta": "Pedido de Rescisão Indireta (falta grave do empregador)",
-                "pedido_demissao": "Pedido de demissão (reversão / verbas pendentes)",
+                "rescisao_indireta": "Rescisão Indireta (falta grave do empregador)",
+                "pedido_demissao": "Pedido de demissão (verbas pendentes)",
                 "acordo": "Rescisão por acordo (art. 484-A CLT)",
-                "justa_causa": "Dispensa por justa causa (contestação)",
+                "justa_causa": "Reversão de Justa Causa",
             }[x],
         )
-        divisor_pre = d4.number_input("Jornada / Divisor Mensal *", min_value=1, max_value=300, value=int(ext_pre.get("monthly_divisor") or 220))
+        divisor_pre = d4.number_input("Divisor Mensal *", min_value=1, max_value=300, value=int(ext_pre.get("monthly_divisor") or 220))
 
-        st.subheader("3. Remuneração Real vs. O que Foi Pago no TRCT")
         adicionais_opts = [
             "Nenhum",
             "Insalubridade Grau Mínimo (10%)",
@@ -477,39 +677,35 @@ if menu == "Avaliação Preliminar & Auditoria":
         r1, r2, r3, r4 = st.columns(4)
         sal_registrado = r1.number_input("Salário-Base Registrado (R$) *", min_value=0.0, value=float(ext_pre.get("base_salary") or 2400.00), step=50.0)
         sal_por_fora = r2.number_input("Comissões / Salário 'Por Fora' (R$/mês)", min_value=0.0, value=float(ext_pre.get("commissions") or 0.0), step=50.0)
-        adicional_cond = r3.selectbox("Adicional Devido e Não Pago", adicionais_opts, index=adicionais_opts.index(adic_ext))
-        valor_ja_pago_trct = r4.number_input(
-            "Total Já Pago na Rescisão/TRCT (R$)",
+        adicional_cond = r3.selectbox("Adicional Devido", adicionais_opts, index=adicionais_opts.index(adic_ext))
+        valor_ja_pago_trct = r4.number_input("Total Já Pago no TRCT (R$)", min_value=0.0, value=trct_auto_sum, step=100.0)
+
+        meses_contrato = max(1, ((dism_pre.year - adm_pre.year) * 12 + (dism_pre.month - adm_pre.month)))
+        j1, j2, j3, j4 = st.columns(4)
+        he_semanal_relatada = j1.number_input("Horas Extras / Semana (50%)", min_value=0.0, value=float(ext_pre.get("weekly_he50_hours") or 0.0), step=0.5)
+        domingos_mes = j2.number_input("Domingos/Feriados sem Folga / Mês", min_value=0, max_value=10, value=int(ext_pre.get("monthly_sundays_worked") or 0))
+        min_intervalo_suprimido = j3.number_input("Intervalo Suprimido (min/dia)", min_value=0, max_value=60, value=int(ext_pre.get("suppressed_break_minutes") or 0))
+        horas_noturnas_semana = j4.number_input("Horas Noturnas / Semana", min_value=0.0, value=float(ext_pre.get("weekly_night_hours") or 0.0), step=0.5)
+
+        st.subheader("3. Seleção de Pedidos para Liquidar na Inicial")
+        v1, v2, v3 = st.columns(3)
+        ped_saldo = v1.checkbox("Saldo de Salário", value=bool(ext_pre.get("sugerir_saldo_salario", True)))
+        dias_saldo_pre = v1.number_input("Dias trabalhados no último mês", min_value=0, max_value=31, value=dism_pre.day)
+        ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=bool(ext_pre.get("sugerir_aviso_previo", True)))
+        ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=bool(ext_pre.get("sugerir_13_e_ferias", True)))
+        ped_fgts = v3.checkbox("Diferenças de FGTS (8%) + Multa Rescisória", value=bool(ext_pre.get("sugerir_fgts_e_multa", True)))
+        restituicao_atestados = v3.number_input(
+            "Restituição de Atestados / Descontos Indevidos (R$)",
             min_value=0.0,
-            value=trct_auto_sum,
-            step=100.0,
-            help="Preenchido automaticamente se o TRCT foi enviado acima.",
+            value=float(ext_pre.get("restituicao_atestados_ou_descontos") or 0.0),
+            step=50.0,
         )
 
-        st.subheader("4. Jornada Habitual e Descontos Indevidos (Atestados / Faltas)")
-        meses_contrato = max(1, ((dism_pre.year - adm_pre.year) * 12 + (dism_pre.month - adm_pre.month)))
-        st.caption(f"Tempo de contrato apurado: **{meses_contrato} meses** (limitado aos últimos 60 meses pela prescrição quinquenal).")
-
-        j1, j2, j3, j4 = st.columns(4)
-        he_semanal_relatada = j1.number_input("Horas Extras Habituais / Semana (50%)", min_value=0.0, value=float(ext_pre.get("weekly_he50_hours") or 0.0), step=0.5)
-        domingos_mes = j2.number_input("Domingos/Feriados sem Folga / Mês", min_value=0, max_value=10, value=int(ext_pre.get("monthly_sundays_worked") or 0))
-        min_intervalo_suprimido = j3.number_input("Intervalo Almoço Suprimido (min/dia)", min_value=0, max_value=60, value=int(ext_pre.get("suppressed_break_minutes") or 0))
-        horas_noturnas_semana = j4.number_input("Horas Noturnas (22h-05h) / Semana", min_value=0.0, value=float(ext_pre.get("weekly_night_hours") or 0.0), step=0.5)
-
-        st.subheader("5. Verbas e Restituições a Incluir no Confronto")
-        v1, v2, v3 = st.columns(3)
-        ped_saldo = v1.checkbox("Saldo de Salário do Mês da Saída", value=True)
-        dias_saldo_pre = v1.number_input("Dias trabalhados no último mês", min_value=0, max_value=31, value=dism_pre.day)
-        ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=True)
-        ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=True)
-        ped_fgts = v3.checkbox("Diferenças de FGTS (8%) + Multa Rescisória", value=True)
-        restituicao_atestados = v3.number_input("Restituição de Descontos Indevidos / Atestados (R$)", min_value=0.0, value=0.0, step=50.0)
-
-        avaliar_btn = st.form_submit_button("Conferir Divergências e Calcular Restituição", type="primary")
+        avaliar_btn = st.form_submit_button("Gerar Cálculos e Quadro de Pedidos para Ajuizamento", type="primary")
 
     if avaliar_btn:
         if ext_pre and not st.session_state.extraction_confirmed:
-            st.error("Marque a caixa de confirmação da revisão documental antes de gerar o cálculo final.")
+            st.error("Marque a caixa de confirmação da revisão antes de fechar os valores.")
         elif sal_registrado <= 0 or not cliente_nome.strip():
             st.error("Preencha o nome do cliente e o salário-base registrado.")
         elif dism_pre < adm_pre:
@@ -541,7 +737,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                 insal_mensal = round(sal_registrado * 0.30, 2)
 
             res_pre = run_labor_calculation({
-                "process_number": f"AUDITORIA-{cliente_nome.upper().replace(' ', '_')[:18]}",
+                "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
                 "worker_name": cliente_nome,
                 "employer_name": empresa_nome,
                 "admission_date": adm_pre,
@@ -568,19 +764,13 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "inc_noturno": total_not > 0,
                 "night_hours": total_not,
                 "night_pct": 20,
-                "apply_inss": False,
-                "apply_irrf": False,
-                "apply_interest": False,
-                "interest_pct": 0.0,
-                "correction_pct": 0.0,
             })
 
-            # Soma restituição de descontos indevidos / atestados médicos
             if restituicao_atestados > 0:
                 rest_dec = d_money(restituicao_atestados)
                 res_pre["verbas"].append({
                     "Código": "VER-08",
-                    "Verba": "Restituição de Descontos Indevidos (Atestados Médicos / Faltas)",
+                    "Verba": "Restituição de Descontos Indevidos / Atestados Médicos",
                     "Período": f"{adm_pre.strftime('%d/%m/%Y')} a {dism_pre.strftime('%d/%m/%Y')}",
                     "Base de Cálculo": rest_dec,
                     "Fórmula": "Devolução integral de descontos indevidos (Art. 462 CLT)",
@@ -588,8 +778,6 @@ if menu == "Avaliação Preliminar & Auditoria":
                     "Percentual": "100%",
                     "Valor Original": rest_dec,
                     "Reflexos": Decimal("0.00"),
-                    "Correção": Decimal("0.00"),
-                    "Juros": Decimal("0.00"),
                     "Total Apurado": rest_dec,
                     "Tributável INSS": False,
                 })
@@ -597,23 +785,15 @@ if menu == "Avaliação Preliminar & Auditoria":
                 res_pre["liquido_devido"] += rest_dec
 
             st.session_state.calculations_history.insert(0, res_pre)
-            st.success(f"Auditoria concluída! Código: **{res_pre['audit_id']}**")
+            st.success(f"Cálculo preliminar pronto para ajuizamento! Código: **{res_pre['audit_id']}**")
 
             k1, k2, k3 = st.columns(3)
-            k1.metric("Total Realmente Devido", fmt_brl(res_pre["bruto_atualizado"]))
+            k1.metric("Total Apurado das Verbas", fmt_brl(res_pre["bruto_atualizado"]))
             k2.metric("(-) Já Pago no TRCT", fmt_brl(res_pre["abatimentos"]))
-            k3.metric("Diferença / Restituição a Pedir", fmt_brl(res_pre["liquido_devido"]))
-
-            if res_pre["liquido_devido"] > Decimal("0.00"):
-                st.warning(
-                    f"**DIVERGÊNCIA ENCONTRADA:** Há uma diferença a menor de **{fmt_brl(res_pre['liquido_devido'])}** "
-                    "passível de cobrança / restituição na Justiça do Trabalho."
-                )
-            else:
-                st.success("**CONFERÊNCIA OK:** Os valores pagos no TRCT cobrem o total apurado para os parâmetros informados.")
+            k3.metric("Valor da Causa / Restituição a Pedir", fmt_brl(res_pre["liquido_devido"]))
 
             df_pre = pd.DataFrame(res_pre["verbas"])
-            for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
+            for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"]:
                 df_pre[col] = df_pre[col].apply(fmt_brl)
             st.dataframe(
                 df_pre[["Código", "Verba", "Quantidade", "Percentual", "Base de Cálculo", "Fórmula", "Valor Original", "Reflexos", "Total Apurado"]],
@@ -621,39 +801,41 @@ if menu == "Avaliação Preliminar & Auditoria":
                 hide_index=True,
             )
 
+            # Texto pronto dos pedidos liquidados para colar na Petição Inicial (Art. 840, § 1º CLT)
+            linhas_pedidos = [
+                f"DOS PEDIDOS LIQUIDADOS (Art. 840, § 1º da CLT) — {cliente_nome} x {empresa_nome}:",
+                "",
+            ]
+            for v in res_pre["verbas"]:
+                linhas_pedidos.append(f"• {v['Verba']}: {fmt_brl(v['Total Apurado'])}")
+            if res_pre["abatimentos"] > Decimal("0.00"):
+                linhas_pedidos.append(f"• (-) Abatimento dos valores comprovadamente pagos no TRCT: -{fmt_brl(res_pre['abatimentos'])}")
+            linhas_pedidos.append(f"\nVALOR TOTAL ATRIBUÍDO À CAUSA: {fmt_brl(res_pre['liquido_devido'])}")
+
+            with st.expander("Copiar Texto dos Pedidos Liquidados para a Petição Inicial (Art. 840, § 1º CLT)", expanded=True):
+                st.text_area("Minuta pronta para colar na inicial:", value="\n".join(linhas_pedidos), height=220)
+
             excel_pre = io.BytesIO()
             with pd.ExcelWriter(excel_pre, engine="openpyxl") as writer:
-                df_pre.to_excel(writer, index=False, sheet_name="Auditoria_Rescisoria")
+                df_pre.to_excel(writer, index=False, sheet_name="Pedidos_Liquidados")
             st.download_button(
-                "Baixar Relatório de Divergências e Valor da Causa (.XLSX)",
+                "Baixar Planilha de Pedidos Liquidados para Anexar na Inicial (.XLSX)",
                 data=excel_pre.getvalue(),
-                file_name=f"Auditoria_Rescisoria_{res_pre['audit_id']}.xlsx",
+                file_name=f"Inicial_Trabalhista_{res_pre['audit_id']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
 elif menu == "Meus Cálculos e Relatórios":
     st.title("Meus Cálculos e Relatórios Auditáveis")
     if not st.session_state.calculations_history:
-        st.info("Nenhuma auditoria realizada nesta sessão ainda. Use 'Avaliação Preliminar & Auditoria'.")
+        st.info("Nenhuma avaliação realizada nesta sessão ainda.")
     else:
         for calc in st.session_state.calculations_history:
-            with st.expander(f"{calc['audit_id']} • Gerado em {calc['generated_at']} • Diferença a Pedir: {fmt_brl(calc['liquido_devido'])}", expanded=True):
-                st.caption(f"Origem: {calc['origin']} | Tabelas: {calc['tables_version']}")
+            with st.expander(f"{calc['audit_id']} • {calc['generated_at']} • Valor da Causa: {fmt_brl(calc['liquido_devido'])}", expanded=True):
                 df_rep = pd.DataFrame(calc["verbas"])
-                for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
+                for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"]:
                     df_rep[col] = df_rep[col].apply(fmt_brl)
                 st.dataframe(df_rep, use_container_width=True, hide_index=True)
-
-                buf = io.BytesIO()
-                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    df_rep.to_excel(writer, index=False, sheet_name="Memoria_Calculo")
-                st.download_button(
-                    f"Baixar Planilha Auditável ({calc['audit_id']}.xlsx)",
-                    data=buf.getvalue(),
-                    file_name=f"{calc['audit_id']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{calc['audit_id']}",
-                )
 
 elif menu == "Central de Atualizações Legais":
     st.title("Central de Atualizações Legais e Tabelas")
@@ -674,7 +856,3 @@ elif menu == "Assinaturas e LGPD":
     p1.metric("Plano Individual", "R$ 99/mês", "1 usuário")
     p2.metric("Plano Profissional", "R$ 199/mês", "Até 5 usuários")
     p3.metric("Plano Escritório", "R$ 399/mês", "Multiusuário + Auditoria")
-    st.markdown(
-        "- **Isolamento multiempresa:** RLS obrigatório no Supabase/PostgreSQL por `office_id`.\n"
-        "- **Segurança de chaves:** `GEMINI_API_KEY`, `SUPABASE_KEY` e `MP_ACCESS_TOKEN` armazenadas apenas em `st.secrets`."
-    )
