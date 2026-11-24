@@ -301,7 +301,9 @@ class ExtractedCaseData(BaseModel):
     suppressed_break_minutes: Optional[int] = None
     weekly_night_hours: Optional[float] = None
     adicional_sugerido: Optional[str] = None
+    adicional_percentual_sugerido: Optional[float] = None
     nr_technical_assessment: Optional[str] = None
+    multa_fgts_percentual_sugerido: Optional[float] = None
     meses_sem_registro_ctps: Optional[int] = None
     plus_salarial_acumulo_pct: Optional[float] = None
     diferenca_equiparacao_mensal: Optional[float] = None
@@ -360,14 +362,14 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
             "2) AVALIAÇÃO TÉCNICA DE INSALUBRIDADE (NR-15) E PERICULOSIDADE (NR-16): examine fotos do local de trabalho, produtos químicos, "
             "câmara fria, ruído, agentes biológicos, inflamáveis, alta tensão, explosivos ou uso de motocicleta (art. 193 §4º CLT), "
             "bem como PPP/LTCAT/contracheques. Preencha 'adicional_sugerido' com uma das opções exatas: "
-            "'Nenhum', 'Insalubridade Grau Mínimo (10%)', 'Insalubridade Grau Médio (20%)', 'Insalubridade Grau Máximo (40%)' ou "
-            "'Periculosidade (30% sobre salário)', e detalhe em 'nr_technical_assessment' o anexo da NR-15/NR-16 aplicável, "
-            "o que foi observado nas fotos/relato e a necessidade de perícia judicial (Art. 195 CLT).\n"
+            "'Nenhum', 'Insalubridade (sobre Salário Mínimo)' ou 'Periculosidade (sobre Salário-Base)', "
+            "preencha 'adicional_percentual_sugerido' com o número do percentual (ex.: 10, 20, 40 ou 30; 0 se Nenhum), "
+            "e detalhe obrigatoriamente em 'nr_technical_assessment' o diagnóstico explícito (ex.: 'IDENTIFICADA INSALUBRIDADE 20% - NR-15 Anexo ...' "
+            "ou 'NÃO IDENTIFICADO AGENTE INSALUBRE/PERICULOSO'), o que foi observado nas fotos/relato e a necessidade de perícia judicial (Art. 195 CLT).\n"
             "3) Identificar irregularidades, nulidades e brechas jurídicas (estabilidade B91, gestante, CIPA, atestados descontados, "
             "ASO inapto, rescisão indireta, multa art. 477 §8º CLT, multa art. 467 CLT, horas extras, intrajornada, vínculo sem registro, "
-            "acúmulo/desvio de função, equiparação salarial).\n"
-            "4) Emitir 'viability_conclusion', 'petition_draft_topics' e 'recommended_claims_checklist'.\n"
-            "5) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias, sugerir_fgts_e_multa, "
+            "acúmulo/desvio de função, equiparação salarial), além de 'multa_fgts_percentual_sugerido' (ex.: 40.0 na dispensa sem justa causa, "
+            "20.0 no acordo, ou 10.0 se o relato/TRCT mostrar que já pagaram 30% e falta a diferença).\n"
             "sugerir_multa_477 e sugerir_multa_467.\n"
             "6) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
         )
@@ -647,9 +649,12 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     # E. FGTS (8%) sobre Verbas + FGTS Não Depositado no Contrato + Multa Rescisória
-    multa_pct = Decimal("0.40") if term_type in ("sem_justa_causa", "rescisao_indireta") else (
-        Decimal("0.20") if term_type == "acordo" else Decimal("0.00")
-    )
+    if params.get("fgts_multa_pct") is not None:
+        multa_pct = Decimal(str(max(0.0, f_float(params.get("fgts_multa_pct"), 0.0)))) / Decimal("100")
+    else:
+        multa_pct = Decimal("0.40") if term_type in ("sem_justa_causa", "rescisao_indireta") else (
+            Decimal("0.20") if term_type == "acordo" else Decimal("0.00")
+        )
     fgts_nao_dep = d_money(params.get("fgts_nao_depositado", 0))
     if params.get("inc_fgts") or fgts_nao_dep > Decimal("0.00"):
         base_fgts_verbas = sum((v["Total Apurado"] for v in verbas if v["Incide FGTS"]), Decimal("0.00"))
@@ -658,10 +663,11 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         multa_val = (base_multa * multa_pct).quantize(CENT, rounding=ROUND_HALF_UP)
         total_fgts_item = fgts_8_verbas + fgts_nao_dep + multa_val
         if total_fgts_item > Decimal("0.00"):
+            multa_lbl = f"{(multa_pct * Decimal('100')).normalize()}%"
             add_verba(
                 "VER-08", "FGTS (8% Verbas + Depósitos Faltantes) + Multa Rescisória", periodo_geral,
                 base_fgts_verbas + fgts_nao_dep, "(Verbas Incidentes × 8% + FGTS Faltante) + Multa",
-                "Contrato + Rescisão", f"8% + {int(multa_pct * 100)}%", total_fgts_item, incide_fgts=False
+                "Contrato + Rescisão", f"8% + {multa_lbl}", total_fgts_item, incide_fgts=False
             )
 
     # F. Multas dos Arts. 477 § 8º e 467 da CLT
@@ -967,8 +973,13 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.subheader("Parecer Jurídico Preliminar & Estratégia para Ajuizamento")
             if ext_pre.get("stability_alert"):
                 st.error(f"**ALERTA DE ESTABILIDADE / REINTEGRAÇÃO OU INDENIZAÇÃO:** {ext_pre['stability_alert']}")
-            if ext_pre.get("nr_technical_assessment"):
-                st.warning(f"**Enquadramento Técnico NR-15 / NR-16 (Fotos & Relato):** {ext_pre['nr_technical_assessment']}")
+            adic_ia_badge = str(ext_pre.get("adicional_sugerido") or "Nenhum")
+            pct_ia_badge = f_float(ext_pre.get("adicional_percentual_sugerido"), 0.0)
+            nr_txt = str(ext_pre.get("nr_technical_assessment") or "Sem agentes insalubres ou periculosos relatados/anexados.")
+            if adic_ia_badge != "Nenhum" and pct_ia_badge > 0:
+                st.warning(f"**DIAGNÓSTICO IA — {adic_ia_badge.upper()} ({pct_ia_badge:g}%):** {nr_txt}")
+            else:
+                st.info(f"**DIAGNÓSTICO IA — INSALUBRIDADE / PERICULOSIDADE (NR-15 / NR-16):** {nr_txt}")
             if ext_pre.get("medical_leave_summary"):
                 st.warning(f"**Atestados Médicos / Afastamentos / ASO:** {ext_pre['medical_leave_summary']}")
             if ext_pre.get("viability_conclusion"):
@@ -1049,44 +1060,50 @@ if menu == "Avaliação Preliminar & Auditoria":
 
         adicionais_opts = [
             "Nenhum",
-            "Insalubridade Grau Mínimo (10%)",
-            "Insalubridade Grau Médio (20%)",
-            "Insalubridade Grau Máximo (40%)",
-            "Periculosidade (30% sobre salário)",
+            "Insalubridade (sobre Salário Mínimo)",
+            "Periculosidade (sobre Salário-Base)",
         ]
-        adic_ext = ext_pre.get("adicional_sugerido") if ext_pre.get("adicional_sugerido") in adicionais_opts else "Nenhum"
+        raw_adic_ext = str(ext_pre.get("adicional_sugerido") or "Nenhum")
+        if "Insalubridade" in raw_adic_ext:
+            adic_ext = "Insalubridade (sobre Salário Mínimo)"
+        elif "Periculosidade" in raw_adic_ext:
+            adic_ext = "Periculosidade (sobre Salário-Base)"
+        else:
+            adic_ext = "Nenhum"
 
-        r1, r2, r3, r4 = st.columns(4)
+        pct_adic_default = f_float(ext_pre.get("adicional_percentual_sugerido"), 0.0)
+        if pct_adic_default == 0.0:
+            if "10%" in raw_adic_ext:
+                pct_adic_default = 10.0
+            elif "20%" in raw_adic_ext:
+                pct_adic_default = 20.0
+            elif "40%" in raw_adic_ext:
+                pct_adic_default = 40.0
+            elif "30%" in raw_adic_ext:
+                pct_adic_default = 30.0
+
+        r1, r2, r3, r4, r5 = st.columns([2, 2, 2.2, 1.5, 2])
         sal_registrado = r1.number_input("Salário-Base Registrado (R$) *", min_value=0.0, value=max(0.0, f_float(ext_pre.get("base_salary"), 2400.00)), step=50.0)
         sal_por_fora = r2.number_input("Comissões / Salário 'Por Fora' (R$/mês)", min_value=0.0, value=max(0.0, f_float(ext_pre.get("commissions"), 0.0)), step=50.0)
-        adicional_cond = r3.selectbox("Adicional Devido", adicionais_opts, index=adicionais_opts.index(adic_ext))
-        valor_ja_pago_trct = r4.number_input("Total Já Pago no TRCT (R$)", min_value=0.0, value=max(0.0, trct_auto_sum), step=100.0)
+        adicional_cond = r3.selectbox("Tipo Adicional (NR-15 / NR-16)", adicionais_opts, index=adicionais_opts.index(adic_ext))
+        adicional_pct_custom = r4.number_input("Percentual Adicional (%)", min_value=0.0, max_value=100.0, value=max(0.0, min(100.0, pct_adic_default)), step=5.0, help="Ex.: 10%, 20% ou 40% (Insalubridade) ou 30% (Periculosidade) — ou qualquer % que desejar.")
+        valor_ja_pago_trct = r5.number_input("Total Já Pago no TRCT (R$)", min_value=0.0, value=max(0.0, trct_auto_sum), step=100.0)
 
-        meses_contrato = max(1, ((dism_pre.year - adm_pre.year) * 12 + (dism_pre.month - adm_pre.month)))
-        j1, j2, j3, j4 = st.columns(4)
-        he_semanal_relatada = j1.number_input("Horas Extras / Semana (50%)", min_value=0.0, value=max(0.0, f_float(ext_pre.get("weekly_he50_hours"), 0.0)), step=0.5)
-        domingos_mes = j2.number_input("Domingos/Feriados sem Folga / Mês", min_value=0, max_value=10, value=max(0, min(10, f_int(ext_pre.get("monthly_sundays_worked"), 0))))
-        min_intervalo_suprimido = j3.number_input("Intervalo Suprimido (min/dia)", min_value=0, max_value=60, value=max(0, min(60, f_int(ext_pre.get("suppressed_break_minutes"), 0))))
-        horas_noturnas_semana = j4.number_input("Horas Noturnas / Semana", min_value=0.0, value=max(0.0, f_float(ext_pre.get("weekly_night_hours"), 0.0)), step=0.5)
-
-        t1, t2, t3, t4 = st.columns(4)
-        meses_sem_ctps_val = t1.number_input("Meses Sem Registro CTPS", min_value=0, max_value=60, value=max(0, min(60, f_int(ext_pre.get("meses_sem_registro_ctps"), 0))))
-        ferias_vencidas_val = t2.number_input("Períodos Férias Vencidas", min_value=0, max_value=5, value=max(0, min(5, f_int(ext_pre.get("periodos_ferias_vencidas"), 0))))
-        plus_acumulo_val = t3.number_input("Acúmulo/Desvio Função (%)", min_value=0.0, max_value=50.0, value=max(0.0, min(50.0, f_float(ext_pre.get("plus_salarial_acumulo_pct"), 0.0))), step=5.0)
-        dif_equip_val = t4.number_input("Equiparação Salarial (R$/mês)", min_value=0.0, value=max(0.0, f_float(ext_pre.get("diferenca_equiparacao_mensal"), 0.0)), step=50.0)
-
-        st.subheader("3. Seleção de Pedidos, Reflexos e Multas da Inicial")
-        v1, v2, v3 = st.columns(3)
-        ped_saldo = v1.checkbox("Saldo de Salário", value=bool(ext_pre.get("sugerir_saldo_salario", True)))
-        dias_saldo_pre = v1.number_input("Dias trabalhados no último mês", min_value=0, max_value=31, value=max(0, min(31, dism_pre.day)))
-        ped_reflexos_completos = v1.checkbox("Reflexos Habituais em 13º, Férias + 1/3 e Aviso", value=True)
-
-        ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=bool(ext_pre.get("sugerir_aviso_previo", True)))
-        ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=bool(ext_pre.get("sugerir_13_e_ferias", True)))
-        ped_multa_477 = v2.checkbox("Multa Art. 477, § 8º CLT (Atraso TRCT)", value=bool(ext_pre.get("sugerir_multa_477", False)))
-        ped_multa_467 = v2.checkbox("Multa Art. 467 CLT (50% Verbas Incontroversas)", value=bool(ext_pre.get("sugerir_multa_467", False)))
-
+        if ext_pre and ext_pre.get("nr_technical_assessment"):
+            st.caption(f"Parecer técnico da IA sobre Insalubridade/Periculosidade: {ext_pre.get('nr_technical_assessment')}")
+        default_multa_fgts = f_float(
+            ext_pre.get("multa_fgts_percentual_sugerido"),
+            40.0 if motivo_saida in ("sem_justa_causa", "rescisao_indireta") else (20.0 if motivo_saida == "acordo" else 0.0),
+        )
         ped_fgts = v3.checkbox("FGTS (8%) + Multa Rescisória", value=bool(ext_pre.get("sugerir_fgts_e_multa", True)))
+        multa_fgts_pct_val = v3.number_input(
+            "Percentual da Multa FGTS a Cobrar (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=max(0.0, min(100.0, default_multa_fgts)),
+            step=5.0,
+            help="Padrão: 40% (dispensa sem justa causa), 20% (acordo), ou digite qualquer % (ex.: 10% se já pagaram 30%).",
+        )
         fgts_faltante_val = v3.number_input(
             "FGTS Não Depositado no Contrato (R$)",
             min_value=0.0,
@@ -1136,18 +1153,13 @@ if menu == "Avaliação Preliminar & Auditoria":
             sm_vigente = get_historical_min_wage(dism_pre)
             insal_mensal = Decimal("0.00")
             adic_pct_lbl = "0%"
-            if "10%" in adicional_cond:
-                insal_mensal = (sm_vigente * Decimal("0.10")).quantize(CENT, rounding=ROUND_HALF_UP)
-                adic_pct_lbl = "10% SM (NR-15)"
-            elif "20%" in adicional_cond:
-                insal_mensal = (sm_vigente * Decimal("0.20")).quantize(CENT, rounding=ROUND_HALF_UP)
-                adic_pct_lbl = "20% SM (NR-15)"
-            elif "40%" in adicional_cond:
-                insal_mensal = (sm_vigente * Decimal("0.40")).quantize(CENT, rounding=ROUND_HALF_UP)
-                adic_pct_lbl = "40% SM (NR-15)"
-            elif "30%" in adicional_cond:
-                insal_mensal = (d_money(sal_registrado) * Decimal("0.30")).quantize(CENT, rounding=ROUND_HALF_UP)
-                adic_pct_lbl = "30% Sal. (NR-16)"
+            pct_adic_dec = Decimal(str(adicional_pct_custom)) / Decimal("100")
+            if adicional_cond == "Insalubridade (sobre Salário Mínimo)" and adicional_pct_custom > 0:
+                insal_mensal = (sm_vigente * pct_adic_dec).quantize(CENT, rounding=ROUND_HALF_UP)
+                adic_pct_lbl = f"{adicional_pct_custom:g}% SM (NR-15)"
+            elif adicional_cond == "Periculosidade (sobre Salário-Base)" and adicional_pct_custom > 0:
+                insal_mensal = (d_money(sal_registrado) * pct_adic_dec).quantize(CENT, rounding=ROUND_HALF_UP)
+                adic_pct_lbl = f"{adicional_pct_custom:g}% Sal. (NR-16)"
 
             res_pre = run_labor_calculation({
                 "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
@@ -1176,6 +1188,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "plus_acumulo_pct": plus_acumulo_val,
                 "dif_equiparacao_mensal": dif_equip_val,
                 "inc_fgts": ped_fgts,
+                "fgts_multa_pct": multa_fgts_pct_val,
                 "fgts_nao_depositado": fgts_faltante_val,
                 "meses_estabilidade": meses_estab_val,
                 "inc_multa_477": ped_multa_477,
