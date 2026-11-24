@@ -39,6 +39,17 @@ st.markdown(
     .stApp { background-color: #F4F6F9; }
     section[data-testid="stSidebar"] { background-color: #0B1B2B; color: #FFFFFF; }
     section[data-testid="stSidebar"] * { color: #F8FAFC !important; }
+    section[data-testid="stSidebar"] textarea,
+    section[data-testid="stSidebar"] input {
+        background-color: #132A42 !important;
+        color: #FFFFFF !important;
+        border: 1px solid #2C4C6E !important;
+    }
+    section[data-testid="stSidebar"] button[kind="secondary"] {
+        background-color: #16324A !important;
+        color: #FFFFFF !important;
+        border: 1px solid #355C82 !important;
+    }
     .stMetric {
         background-color: #FFFFFF;
         padding: 14px 18px;
@@ -343,8 +354,16 @@ def get_gemini_api_key() -> Optional[str]:
 
 
 def generate_gemini_with_fallback(client: Any, contents: List[Any], config: Any) -> Any:
-    """Chama o modelo Gemini ativo com fallback automático caso algum ID seja descontinuado."""
-    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash"]
+    """Chama o modelo Gemini ativo com descoberta dinâmica via API e fallback automático."""
+    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+    try:
+        for m in client.models.list():
+            m_name = str(getattr(m, "name", "") or "").replace("models/", "")
+            if "gemini" in m_name and "embedding" not in m_name and "imagen" not in m_name and m_name not in models_to_try:
+                models_to_try.append(m_name)
+    except Exception:
+        pass
+
     last_err: Optional[Exception] = None
     for model_name in models_to_try:
         try:
@@ -355,7 +374,8 @@ def generate_gemini_with_fallback(client: Any, contents: List[Any], config: Any)
             )
         except Exception as exc:
             last_err = exc
-            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+            err_s = str(exc)
+            if "404" in err_s or "NOT_FOUND" in err_s or "no longer available" in err_s:
                 continue
             raise
     if last_err:
@@ -435,31 +455,36 @@ def chat_with_case_strategist(
     extracted_data: Dict[str, Any],
     latest_calc: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Chat jurídico contextualizado com o caso, parecer, NRs e cálculo atual."""
+    """Chat jurídico multi-turno real com o Gemini (memória contínua + contexto integral do caso)."""
     api_key = get_gemini_api_key()
     if not api_key or not GENAI_AVAILABLE:
         raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
 
     client = genai.Client(api_key=api_key)
 
-    context_blocks = [
-        "Você é um Advogado Trabalhista Sênior, Estrategista Processual e Perito em Cálculos Trabalhistas (CLT, TST, Súmulas, OJs, NR-15 e NR-16).",
-        "Você está debatendo diretamente com o advogado titular do caso sobre a estratégia pré-processual, teses, provas, riscos e redação de tópicos da Petição Inicial.",
-        "Seja objetivo, técnico, prático e cite artigos da CLT, Súmulas/OJs do TST e NRs sempre que pertinente.",
-        f"\n=== RELATO INICIAL DO CASO ===\n{lawyer_narrative.strip() or '(Não informado)'}",
+    system_blocks = [
+        "Você é um Advogado Trabalhista Sênior, Parecerista Jurídico e Perito em Cálculos Trabalhistas no Brasil (CLT, Reforma Trabalhista, Constituição Federal, Súmulas e OJs do TST, NRs 15 e 16).",
+        "Você está conversando em tempo real com o advogado titular do caso dentro do sistema 'ED Cálculos Trabalhistas'.",
+        "Responda sempre no mais alto nível técnico-jurídico, de forma natural, interativa, clara e resolutiva — exatamente como um sócio sênior debatendo estratégia processual.",
+        "Você pode:\n"
+        "- Discutir teses, ônus da prova (Art. 818 CLT), riscos de sucumbência e jurisprudência atualizada do TST/TRTs;\n"
+        "- Incorporar novos fatos que o advogado trouxer na conversa e explicar o impacto jurídico e financeiro;\n"
+        "- Redigir tópicos completos da Petição Inicial (Dos Fatos, Do Direito e Dos Pedidos), quesitos periciais (insalubridade/periculosidade) ou perguntas para audiência de instrução;\n"
+        "- Responder dúvidas gerais de Direito e Processo do Trabalho mesmo quando nenhum caso estiver preenchido ainda.",
+        f"\n=== RELATO DO CASO ATUAL NA TELA ===\n{lawyer_narrative.strip() or '(Nenhum relato preenchido ainda — responda normalmente à consulta jurídica do advogado)'}",
     ]
 
     if extracted_data:
         safe_ext = {k: v for k, v in extracted_data.items() if v not in (None, "", [], {})}
-        context_blocks.append(f"\n=== DADOS E PARECER JÁ EXTRAÍDOS ===\n{json.dumps(safe_ext, ensure_ascii=False, default=str)}")
+        system_blocks.append(f"\n=== PARECER E DADOS EXTRAÍDOS DO DOSSIÊ ===\n{json.dumps(safe_ext, ensure_ascii=False, default=str)}")
 
     if latest_calc:
         verbas_resumo = [
             f"- {v.get('Verba')}: {fmt_brl(v.get('Total Apurado', Decimal('0.00')))}"
             for v in (latest_calc.get("verbas") or [])
         ]
-        context_blocks.append(
-            "\n=== ÚLTIMA LIQUIDAÇÃO CALCULADA PELO MOTOR ===\n"
+        system_blocks.append(
+            "\n=== ÚLTIMA LIQUIDAÇÃO GERADA PELO MOTOR ===\n"
             f"Cliente: {latest_calc.get('worker_name')} x {latest_calc.get('employer_name')}\n"
             f"Total Bruto: {fmt_brl(latest_calc.get('bruto_atualizado', Decimal('0.00')))} | "
             f"Abatimentos TRCT: {fmt_brl(latest_calc.get('abatimentos', Decimal('0.00')))} | "
@@ -467,57 +492,52 @@ def chat_with_case_strategist(
             + "\n".join(verbas_resumo)
         )
 
-    conversation_text = ["\n=== HISTÓRICO DA CONVERSA COM O ADVOGADO ==="]
-    for msg in chat_history[-10:]:
-        role_lbl = "ADVOGADO" if msg.get("role") == "user" else "CONSULTOR IA"
-        conversation_text.append(f"{role_lbl}: {msg.get('content', '')}")
-    conversation_text.append(f"ADVOGADO: {user_message}")
-    conversation_text.append("CONSULTOR IA:")
+    sdk_history: List[Any] = []
+    for msg in chat_history[-16:]:
+        role_sdk = "user" if msg.get("role") == "user" else "model"
+        txt_sdk = str(msg.get("content") or "").strip()
+        if txt_sdk:
+            sdk_history.append(
+                types.Content(
+                    role=role_sdk,
+                    parts=[types.Part.from_text(text=txt_sdk)],
+                )
+            )
 
-    full_prompt = "\n".join(context_blocks) + "\n" + "\n".join(conversation_text)
+    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+    try:
+        for m in client.models.list():
+            m_name = str(getattr(m, "name", "") or "").replace("models/", "")
+            if "gemini" in m_name and "embedding" not in m_name and "imagen" not in m_name and m_name not in models_to_try:
+                models_to_try.append(m_name)
+    except Exception:
+        pass
 
-    response = generate_gemini_with_fallback(
-        client=client,
-        contents=[full_prompt],
-        config=types.GenerateContentConfig(temperature=0.3),
-    )
-    return (getattr(response, "text", None) or "").strip() or "Não foi possível gerar resposta no momento."
+    last_err: Optional[Exception] = None
+    for model_name in models_to_try:
+        try:
+            chat_session = client.chats.create(
+                model=model_name,
+                history=sdk_history,
+                config=types.GenerateContentConfig(
+                    system_instruction="\n".join(system_blocks),
+                    temperature=0.35,
+                ),
+            )
+            response = chat_session.send_message(user_message)
+            reply_txt = (getattr(response, "text", None) or "").strip()
+            if reply_txt:
+                return reply_txt
+        except Exception as exc:
+            last_err = exc
+            err_s = str(exc)
+            if "404" in err_s or "NOT_FOUND" in err_s or "no longer available" in err_s:
+                continue
+            raise
 
-
-# ==============================================================================
-# 6. MOTOR DE CÁLCULO DECIMAL EXATO (COMPLETO COM REFLEXOS, MULTAS E ESTABILIDADE)
-# ==============================================================================
-def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Executa a liquidação trabalhista determinística em Decimal (0.01)."""
-    base_salary = d_money(params.get("base_salary", 0))
-    commissions = d_money(params.get("commissions", 0))
-    insalubrity = d_money(params.get("insalubrity", 0))
-    remuneration = base_salary + commissions + insalubrity
-
-    divisor = max(1, f_int(params.get("monthly_divisor"), 220))
-    hourly_rate = (remuneration / Decimal(str(divisor))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-
-    adm_date: date = params["admission_date"]
-    dism_date: date = params["dismissal_date"]
-    term_type: str = str(params.get("termination_type", "sem_justa_causa"))
-    years_worked = max(0, (dism_date - adm_date).days // 365)
-    meses_prescricao = max(1, min(60, ((dism_date.year - adm_date.year) * 12 + (dism_date.month - adm_date.month))))
-
-    verbas: List[Dict[str, Any]] = []
-
-    def add_verba(
-        code: str,
-        name: str,
-        period: str,
-        base: Decimal,
-        formula: str,
-        qty: str,
-        pct_str: str,
-        original: Decimal,
-        reflexos: Decimal = Decimal("0.00"),
-        incide_fgts: bool = True,
-    ) -> None:
-        orig_q = original.quantize(CENT, rounding=ROUND_HALF_UP)
+    if last_err:
+        raise last_err
+    return "Não foi possível obter resposta do Gemini no momento."
         refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
         total_item = orig_q + refl_q
         verbas.append({
