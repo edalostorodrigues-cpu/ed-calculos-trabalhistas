@@ -145,6 +145,8 @@ if "extracted_ai_data" not in st.session_state:
     st.session_state.extracted_ai_data = None
 if "extraction_confirmed" not in st.session_state:
     st.session_state.extraction_confirmed = False
+if "case_chat_history" not in st.session_state:
+    st.session_state.case_chat_history = []
 
 
 # ==============================================================================
@@ -403,6 +405,62 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
     if not isinstance(parsed, dict):
         raise RuntimeError("Resposta estruturada do Gemini vazia ou inválida.")
     return parsed
+
+
+def chat_with_case_strategist(
+    user_message: str,
+    chat_history: List[Dict[str, str]],
+    lawyer_narrative: str,
+    extracted_data: Dict[str, Any],
+    latest_calc: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Chat jurídico contextualizado com o caso, parecer, NRs e cálculo atual."""
+    api_key = get_gemini_api_key()
+    if not api_key or not GENAI_AVAILABLE:
+        raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
+
+    client = genai.Client(api_key=api_key)
+
+    context_blocks = [
+        "Você é um Advogado Trabalhista Sênior, Estrategista Processual e Perito em Cálculos Trabalhistas (CLT, TST, Súmulas, OJs, NR-15 e NR-16).",
+        "Você está debatendo diretamente com o advogado titular do caso sobre a estratégia pré-processual, teses, provas, riscos e redação de tópicos da Petição Inicial.",
+        "Seja objetivo, técnico, prático e cite artigos da CLT, Súmulas/OJs do TST e NRs sempre que pertinente.",
+        f"\n=== RELATO INICIAL DO CASO ===\n{lawyer_narrative.strip() or '(Não informado)'}",
+    ]
+
+    if extracted_data:
+        safe_ext = {k: v for k, v in extracted_data.items() if v not in (None, "", [], {})}
+        context_blocks.append(f"\n=== DADOS E PARECER JÁ EXTRAÍDOS ===\n{json.dumps(safe_ext, ensure_ascii=False, default=str)}")
+
+    if latest_calc:
+        verbas_resumo = [
+            f"- {v.get('Verba')}: {fmt_brl(v.get('Total Apurado', Decimal('0.00')))}"
+            for v in (latest_calc.get("verbas") or [])
+        ]
+        context_blocks.append(
+            "\n=== ÚLTIMA LIQUIDAÇÃO CALCULADA PELO MOTOR ===\n"
+            f"Cliente: {latest_calc.get('worker_name')} x {latest_calc.get('employer_name')}\n"
+            f"Total Bruto: {fmt_brl(latest_calc.get('bruto_atualizado', Decimal('0.00')))} | "
+            f"Abatimentos TRCT: {fmt_brl(latest_calc.get('abatimentos', Decimal('0.00')))} | "
+            f"Valor da Causa: {fmt_brl(latest_calc.get('liquido_devido', Decimal('0.00')))}\n"
+            + "\n".join(verbas_resumo)
+        )
+
+    conversation_text = ["\n=== HISTÓRICO DA CONVERSA COM O ADVOGADO ==="]
+    for msg in chat_history[-10:]:
+        role_lbl = "ADVOGADO" if msg.get("role") == "user" else "CONSULTOR IA"
+        conversation_text.append(f"{role_lbl}: {msg.get('content', '')}")
+    conversation_text.append(f"ADVOGADO: {user_message}")
+    conversation_text.append("CONSULTOR IA:")
+
+    full_prompt = "\n".join(context_blocks) + "\n" + "\n".join(conversation_text)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[full_prompt],
+        config=types.GenerateContentConfig(temperature=0.3),
+    )
+    return (getattr(response, "text", None) or "").strip() or "Não foi possível gerar resposta no momento."
 
 
 # ==============================================================================
@@ -961,6 +1019,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                         with st.spinner("Cruzando relato jurídico e documentos para gerar parecer e teses..."):
                             st.session_state.extracted_ai_data = analyze_case_with_gemini(lawyer_narrative, gemini_files)
                             st.session_state.extraction_confirmed = False
+                            st.session_state.case_chat_history = []
                         st.success("Parecer e extração concluídos! Revise as teses e parâmetros abaixo.")
                     except Exception as exc:
                         st.warning(f"Análise via Gemini indisponível ({exc}). Verifique `GEMINI_API_KEY` em Secrets.")
@@ -1005,6 +1064,51 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "Confirmo que revisei o parecer e os parâmetros extraídos antes de fechar os valores",
                 value=st.session_state.extraction_confirmed,
             )
+
+    with st.container(border=True):
+        c_chat_hdr, c_chat_clr = st.columns([4, 1])
+        c_chat_hdr.subheader("Chat Estratégico com a IA sobre o Caso (Teses, Dúvidas e Novos Fatos)")
+        if c_chat_clr.button("Limpar Chat", use_container_width=True):
+            st.session_state.case_chat_history = []
+            st.rerun()
+
+        st.caption(
+            "Converse livremente com a IA para discutir riscos probatórios, incluir fatos novos lembrados pelo cliente, "
+            "pedir perguntas para audiência ou redigir tópicos completos da Petição Inicial."
+        )
+
+        q1, q2, q3 = st.columns(3)
+        prompt_atalho = None
+        if q1.button("Analisar Riscos e Provas Necessárias", use_container_width=True):
+            prompt_atalho = "Analise os riscos probatórios deste caso e liste exatamente quais provas documentais e testemunhais precisamos reunir antes de ajuizar."
+        if q2.button("Redigir Tópicos Completos da Inicial", use_container_width=True):
+            prompt_atalho = "Redija os tópicos jurídicos completos (Dos Fatos e Do Direito, com base na CLT, Súmulas/OJs do TST e NRs aplicáveis) prontos para eu colar na Petição Inicial."
+        if q3.button("Gerar Perguntas para Audiência", use_container_width=True):
+            prompt_atalho = "Elabore um roteiro estratégico de perguntas para o depoimento pessoal do preposto da reclamada e para nossas testemunhas em audiência de instrução."
+
+        for chat_msg in st.session_state.case_chat_history:
+            with st.chat_message(chat_msg["role"]):
+                st.markdown(chat_msg["content"])
+
+        user_chat_input = st.chat_input("Digite sua dúvida, tese ou fato novo do cliente para discutir com a IA...")
+        final_prompt = prompt_atalho or user_chat_input
+
+        if final_prompt:
+            st.session_state.case_chat_history.append({"role": "user", "content": final_prompt})
+            latest_calc_ctx = st.session_state.calculations_history[0] if st.session_state.calculations_history else None
+            try:
+                with st.spinner("Analisando juridicamente sua pergunta com base nos dados do caso..."):
+                    ai_reply = chat_with_case_strategist(
+                        user_message=final_prompt,
+                        chat_history=st.session_state.case_chat_history[:-1],
+                        lawyer_narrative=lawyer_narrative,
+                        extracted_data=ext_pre,
+                        latest_calc=latest_calc_ctx,
+                    )
+                st.session_state.case_chat_history.append({"role": "assistant", "content": ai_reply})
+                st.rerun()
+            except Exception as chat_exc:
+                st.error(f"Erro ao consultar o chat estratégico: {chat_exc}")
 
     if tc_pre is not None:
         with st.expander("Ver Espelho de Ponto Apurado Dia a Dia (Tolerância CLT + Redução Ficta)"):
