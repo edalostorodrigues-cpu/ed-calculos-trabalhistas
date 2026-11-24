@@ -953,44 +953,50 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
         return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
 
     pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    usable_w = pdf.epw
+
+    def _safe_multi(text: str, line_h: float = 5.0) -> None:
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(usable_w, line_h, _latin(text))
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, _latin(calc.get("office_header", "ED Cálculos Trabalhistas")), ln=True)
+    _safe_multi(calc.get("office_header", "ED Cálculos Trabalhistas"), 7)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, _latin(f"Dossiê Pré-Processual e Liquidação (Art. 840, § 1º CLT) | ID: {calc.get('audit_id')} | Emissão: {calc.get('generated_at')}"), ln=True)
+    _safe_multi(f"Dossiê Pré-Processual e Liquidação (Art. 840, § 1º CLT) | ID: {calc.get('audit_id')} | Emissão: {calc.get('generated_at')}", 5)
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 6, _latin(f"Reclamante: {calc.get('worker_name')}  |  Reclamada: {calc.get('employer_name')}"), ln=True)
+    _safe_multi(f"Reclamante: {calc.get('worker_name')}  |  Reclamada: {calc.get('employer_name')}", 6)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, _latin(f"Cargo: {calc.get('role_title')}  |  Contrato: {calc.get('admission_date')} a {calc.get('dismissal_date')}  |  Remuneração Base: {fmt_brl(calc.get('base_remuneracao'))}"), ln=True)
+    _safe_multi(f"Cargo: {calc.get('role_title')}  |  Contrato: {calc.get('admission_date')} a {calc.get('dismissal_date')}  |  Remuneração Base: {fmt_brl(calc.get('base_remuneracao'))}", 5)
     pdf.ln(4)
 
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 6, _latin("QUADRO DE PEDIDOS LIQUIDADOS"), ln=True)
+    _safe_multi("QUADRO DE PEDIDOS LIQUIDADOS", 6)
     pdf.set_font("Helvetica", "", 8.5)
     for v in (calc.get("verbas") or []):
         linha = f"[{v.get('Código')}] {v.get('Verba')} ({v.get('Quantidade')}) — Orig: {fmt_brl(v.get('Valor Original'))} | Refl: {fmt_brl(v.get('Reflexos'))} | Total: {fmt_brl(v.get('Total Apurado'))}"
-        pdf.multi_cell(0, 5, _latin(linha))
+        _safe_multi(linha, 5)
 
     pdf.ln(3)
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 6, _latin(f"Total Bruto: {fmt_brl(calc.get('bruto_atualizado'))}   |   (-) Abatimentos TRCT: {fmt_brl(calc.get('abatimentos'))}"), ln=True)
+    _safe_multi(f"Total Bruto: {fmt_brl(calc.get('bruto_atualizado'))}   |   (-) Abatimentos TRCT: {fmt_brl(calc.get('abatimentos'))}", 6)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, _latin(f"VALOR TOTAL ATRIBUÍDO À CAUSA: {fmt_brl(calc.get('liquido_devido'))}"), ln=True)
+    _safe_multi(f"VALOR TOTAL ATRIBUÍDO À CAUSA: {fmt_brl(calc.get('liquido_devido'))}", 7)
 
     op = calc.get("ai_opinion") or {}
     if op.get("nr_technical_assessment") or op.get("viability_conclusion"):
         pdf.ln(4)
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 6, _latin("PARECER TÉCNICO E ESTRATÉGICO"), ln=True)
+        _safe_multi("PARECER TÉCNICO E ESTRATÉGICO", 6)
         pdf.set_font("Helvetica", "", 8.5)
         if op.get("nr_technical_assessment"):
-            pdf.multi_cell(0, 5, _latin(f"NR-15 / NR-16: {op.get('nr_technical_assessment')}"))
+            _safe_multi(f"NR-15 / NR-16: {op.get('nr_technical_assessment')}", 5)
         if op.get("viability_conclusion"):
-            pdf.multi_cell(0, 5, _latin(f"Viabilidade: {op.get('viability_conclusion')}"))
+            _safe_multi(f"Viabilidade: {op.get('viability_conclusion')}", 5)
 
     raw_pdf = pdf.output()
     if isinstance(raw_pdf, (bytes, bytearray)):
