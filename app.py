@@ -392,7 +392,8 @@ if "selected_chat_case_id" not in st.session_state:
 if "cloud_connected" not in st.session_state:
     st.session_state.cloud_connected = False
 if "cloud_status_detail" not in st.session_state:
-    st.session_state.cloud_status_detail = ""
+        night_ficta = int(round(night_clock * (Decimal("60") / Decimal("52.5"))))
+
         tot_he50_min += he50
         tot_he100_min += he100
         tot_intra_min += intra_sup
