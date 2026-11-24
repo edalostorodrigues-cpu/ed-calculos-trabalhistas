@@ -6,6 +6,8 @@ import os
 import io
 import json
 import hashlib
+import urllib.request
+import urllib.parse
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import List, Optional, Dict, Any
@@ -24,130 +26,138 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. CONFIGURAÇÃO DA PÁGINA E IDENTIDADE VISUAL
+# 3. CONEXÃO NA NUVEM (SUPABASE REST NATIVO) E ESTADO DA SESSÃO
 # ==============================================================================
-st.set_page_config(
-    page_title="ED Cálculos Trabalhistas — Parecer & Auditoria Pré-Processual",
-    page_icon="⚖️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #F4F6F9; }
-    section[data-testid="stSidebar"] { background-color: #0B1B2B; color: #FFFFFF; }
-    section[data-testid="stSidebar"] * { color: #F8FAFC !important; }
-    section[data-testid="stSidebar"] textarea,
-    section[data-testid="stSidebar"] input {
-        background-color: #132A42 !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2C4C6E !important;
-    }
-    section[data-testid="stSidebar"] button[kind="secondary"] {
-        background-color: #16324A !important;
-        color: #FFFFFF !important;
-        border: 1px solid #355C82 !important;
-    }
-    .stMetric {
-        background-color: #FFFFFF;
-        padding: 14px 18px;
-        border-radius: 10px;
-        border: 1px solid #E2E8F0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ==============================================================================
-# 2. TABELAS HISTÓRICAS E CONSTANTES DECIMAIS
-# ==============================================================================
-TABLES_VERSION = "2026.11-estavel"
-CENT = Decimal("0.01")
-
-# Tabela histórica oficial do Salário Mínimo Nacional (base referencial insalubridade)
-MIN_WAGE_BY_YEAR: Dict[int, Decimal] = {
-    2020: Decimal("1045.00"),
-    2021: Decimal("1100.00"),
-    2022: Decimal("1212.00"),
-    2023: Decimal("1320.00"),
-    2024: Decimal("1412.00"),
-    2025: Decimal("1518.00"),
-    2026: Decimal("1621.00"),
-}
-
-
-def get_historical_min_wage(ref_date: date) -> Decimal:
-    """Retorna o salário mínimo nacional vigente no ano de referência com fallback seguro."""
-    if not isinstance(ref_date, date):
-        return MIN_WAGE_BY_YEAR[max(MIN_WAGE_BY_YEAR.keys())]
-    if ref_date.year in MIN_WAGE_BY_YEAR:
-        return MIN_WAGE_BY_YEAR[ref_date.year]
-    if ref_date.year < min(MIN_WAGE_BY_YEAR.keys()):
-        return MIN_WAGE_BY_YEAR[min(MIN_WAGE_BY_YEAR.keys())]
-    return MIN_WAGE_BY_YEAR[max(MIN_WAGE_BY_YEAR.keys())]
-
-
-def d_money(val: Any) -> Decimal:
-    """Converte com segurança valores numéricos ou strings monetárias em Decimal(0.01)."""
-    if val is None or val == "":
-        return Decimal("0.00")
-    if isinstance(val, Decimal):
-        return val.quantize(CENT, rounding=ROUND_HALF_UP)
-    if isinstance(val, (int, float)):
-        if val != val:  # NaN check
-            return Decimal("0.00")
-        return Decimal(str(val)).quantize(CENT, rounding=ROUND_HALF_UP)
-    s = str(val).strip().replace("R$", "").replace(" ", "")
-    if not s:
-        return Decimal("0.00")
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+def get_supabase_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Obtém SUPABASE_URL e SUPABASE_KEY via st.secrets ou variáveis de ambiente."""
+    url_val: Optional[str] = None
+    key_val: Optional[str] = None
     try:
-        return Decimal(s).quantize(CENT, rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError):
-        return Decimal("0.00")
+        if "SUPABASE_URL" in st.secrets:
+            url_val = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
+        if "SUPABASE_KEY" in st.secrets:
+            key_val = str(st.secrets["SUPABASE_KEY"]).strip()
+    except Exception:
+        pass
+    if not url_val:
+        url_val = os.environ.get("SUPABASE_URL", "").strip().rstrip("/") or None
+    if not key_val:
+        key_val = os.environ.get("SUPABASE_KEY", "").strip() or None
+    return url_val, key_val
 
 
-def f_float(val: Any, default: float = 0.0) -> float:
-    """Garante retorno float limpo para widgets numéricos do Streamlit."""
-    if val is None or val == "":
-        return float(default)
+def _serialize_calc_for_cloud(calc: Dict[str, Any]) -> Dict[str, Any]:
+    """Converte Decimals e datas do cálculo para JSON seguro no Supabase."""
+    def _conv(obj: Any) -> Any:
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: _conv(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_conv(i) for i in obj]
+        return obj
+
+    return _conv(calc)
+
+
+def _deserialize_calc_from_cloud(raw_calc: Dict[str, Any]) -> Dict[str, Any]:
+    """Restaura Decimals monetários de um cálculo carregado do Supabase."""
+    calc = dict(raw_calc)
+    for m_key in ("bruto_atualizado", "abatimentos", "liquido_devido", "base_remuneracao"):
+        if m_key in calc:
+            calc[m_key] = d_money(calc[m_key])
+    verbas_restored: List[Dict[str, Any]] = []
+    for v in (calc.get("verbas") or []):
+        v_copy = dict(v)
+        for col in ("Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"):
+            if col in v_copy:
+                v_copy[col] = d_money(v_copy[col])
+        verbas_restored.append(v_copy)
+    calc["verbas"] = verbas_restored
+    return calc
+
+
+def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool]:
+    """Carrega todos os clientes e históricos de chat salvos na nuvem Supabase."""
+    sb_url, sb_key = get_supabase_credentials()
+    if not sb_url or not sb_key:
+        return [], {}, False
     try:
-        num = float(val)
-        return float(default) if num != num else num
-    except (ValueError, TypeError):
-        return float(default)
+        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?select=*&order=updated_at.desc"
+        req = urllib.request.Request(
+            endpoint,
+            headers={
+                "apikey": sb_key,
+                "Authorization": f"Bearer {sb_key}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+        calcs_out: List[Dict[str, Any]] = []
+        chats_out: Dict[str, List[Dict[str, str]]] = {}
+        for row in (rows or []):
+            payload = row.get("payload_json")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if isinstance(payload, dict) and payload.get("audit_id"):
+                restored = _deserialize_calc_from_cloud(payload)
+                calcs_out.append(restored)
+                cid = str(restored["audit_id"])
+                ch = row.get("chat_history_json") or []
+                if isinstance(ch, str):
+                    ch = json.loads(ch)
+                chats_out[cid] = ch if isinstance(ch, list) else []
+        return calcs_out, chats_out, True
+    except Exception:
+        return [], {}, False
 
 
-def f_int(val: Any, default: int = 0) -> int:
-    """Garante retorno int limpo para widgets numéricos do Streamlit."""
-    if val is None or val == "":
-        return int(default)
+def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]]) -> bool:
+    """Salva ou atualiza (upsert) um cliente e seu histórico de chat no Supabase."""
+    sb_url, sb_key = get_supabase_credentials()
+    if not sb_url or not sb_key:
+        return False
     try:
-        return int(float(val))
-    except (ValueError, TypeError):
-        return int(default)
+        client_key = f"{str(calc.get('worker_name', '')).strip().lower()}|{str(calc.get('employer_name', '')).strip().lower()}"
+        body = {
+            "client_key": client_key,
+            "audit_id": str(calc["audit_id"]),
+            "worker_name": str(calc.get("worker_name") or "Cliente"),
+            "employer_name": str(calc.get("employer_name") or "Empresa"),
+            "liquido_devido": float(d_money(calc.get("liquido_devido", Decimal("0.00")))),
+            "payload_json": _serialize_calc_for_cloud(calc),
+            "chat_history_json": chat_history,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?on_conflict=client_key"
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "apikey": sb_key,
+                "Authorization": f"Bearer {sb_key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status in (200, 201, 204)
+    except Exception:
+        return False
 
 
-def fmt_brl(val: Decimal) -> str:
-    """Formata valor Decimal em padrão monetário brasileiro (R$ 1.234,56)."""
-    q = d_money(val)
-    sign = "-" if q < Decimal("0.00") else ""
-    abs_q = abs(q)
-    inteiro, dec = f"{abs_q:.2f}".split(".")
-    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
-    return f"{sign}R$ {inteiro_fmt},{dec}"
+if "cloud_loaded_once" not in st.session_state:
+    cloud_calcs, cloud_chats, cloud_ok = supabase_load_all_cases()
+    st.session_state.cloud_connected = cloud_ok
+    st.session_state.calculations_history = cloud_calcs
+    st.session_state.case_chat_threads = {"caso_atual": [], **cloud_chats}
+    st.session_state.cloud_loaded_once = True
 
-
-# ==============================================================================
-# 3. ESTADO DA SESSÃO
-# ==============================================================================
 if "calculations_history" not in st.session_state:
     st.session_state.calculations_history = []
 if "timecard_result" not in st.session_state:
@@ -160,16 +170,8 @@ if "case_chat_threads" not in st.session_state:
     st.session_state.case_chat_threads = {"caso_atual": []}
 if "selected_chat_case_id" not in st.session_state:
     st.session_state.selected_chat_case_id = "caso_atual"
-
-
-# ==============================================================================
-# 4. APURADOR DETERMINÍSTICO DE CARTÃO DE PONTO (EM MINUTOS INTEIROS, SEM IA)
-# ==============================================================================
-def parse_hhmm(val: Any) -> Optional[int]:
-    """Converte string HH:MM para minutos inteiros a partir de 00:00."""
-    if val is None or pd.isna(val):
-        return None
-    s = str(val).strip()
+if "cloud_connected" not in st.session_state:
+    st.session_state.cloud_connected = False
     if not s or ":" not in s:
         return None
     parts = s.split(":")
@@ -579,6 +581,10 @@ with st.sidebar:
     )
     st.divider()
     st.caption(f"Tabelas ativas: `{TABLES_VERSION}`")
+    if st.session_state.get("cloud_connected"):
+        st.caption("Nuvem Supabase: `Conectada ☁️`")
+    else:
+        st.caption("Nuvem Supabase: `Modo Sessão Local`")
     if st.session_state.calculations_history:
         st.divider()
         # Agrupa por cliente/empresa para nunca duplicar o mesmo cliente na lista lateral
@@ -1006,9 +1012,12 @@ if menu == "Avaliação Preliminar & Auditoria":
 
             st.session_state.calculations_history = [res_pre] + filtered_history
             draft_msgs = list(st.session_state.case_chat_threads.get("caso_atual", []))
-            st.session_state.case_chat_threads[res_pre["audit_id"]] = existing_chat_backup or draft_msgs
+            final_case_msgs = existing_chat_backup or draft_msgs
+            st.session_state.case_chat_threads[res_pre["audit_id"]] = final_case_msgs
             st.session_state.selected_chat_case_id = res_pre["audit_id"]
             st.session_state["chat_case_selector_widget"] = res_pre["audit_id"]
+            if supabase_upsert_case(res_pre, final_case_msgs):
+                st.session_state.cloud_connected = True
             st.success(f"Cálculo preliminar pronto para ajuizamento! Código: **{res_pre['audit_id']}**")
 
             k1, k2, k3 = st.columns(3)
@@ -1098,6 +1107,10 @@ if menu == "Avaliação Preliminar & Auditoria":
 
         if clr_col.button("Limpar Conversa", key="main_clear_chat_btn", use_container_width=True):
             st.session_state.case_chat_threads[active_case_id] = []
+            if active_case_id != "caso_atual":
+                calc_to_sync = next((c for c in st.session_state.calculations_history if c["audit_id"] == active_case_id), None)
+                if calc_to_sync:
+                    supabase_upsert_case(calc_to_sync, [])
             st.rerun()
 
         current_thread = st.session_state.case_chat_threads[active_case_id]
@@ -1151,6 +1164,8 @@ if menu == "Avaliação Preliminar & Auditoria":
                         all_saved_cases=st.session_state.calculations_history,
                     )
                 st.session_state.case_chat_threads[active_case_id].append({"role": "assistant", "content": ai_reply_wide})
+                if active_case_id != "caso_atual" and ctx_calc is not None:
+                    supabase_upsert_case(ctx_calc, st.session_state.case_chat_threads[active_case_id])
                 st.rerun()
             except Exception as wide_chat_exc:
                 st.error(f"Erro no chat: {wide_chat_exc}")
