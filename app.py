@@ -490,22 +490,6 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_printable_dossier_html(calc: Dict[str, Any]) -> str:
-    """Gera relatório completo timbrado (HTML/PDF via navegador) para arquivamento do escritório."""
-    ai_op = calc.get("ai_opinion") or {}
-    irregs = ai_op.get("irregularities_found") or []
-    checklist = ai_op.get("recommended_claims_checklist") or []
-
-    rows_verbas = "".join(
-        f"""
-        <tr>
-          <td>{v['Código']}</td>
-          <td><strong>{v['Verba']}</strong><br><small style="color:#475569;">{v['Fórmula']}</small></td>
-          <td>{v['Quantidade']}</td>
-          <td>{v['Percentual']}</td>
-          <td style="text-align:right;">{fmt_brl(v['Base de Cálculo'])}</td>
-          <td style="text-align:right;">{fmt_brl(v['Valor Original'])}</td>
-          <td style="text-align:right;">{fmt_brl(v['Reflexos'])}</td>
 def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     """Gera arquivo PDF binário real (via fpdf2) pronto para download e arquivamento."""
     def latin(txt: Any) -> str:
