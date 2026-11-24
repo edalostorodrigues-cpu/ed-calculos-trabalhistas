@@ -581,8 +581,15 @@ with st.sidebar:
     st.caption(f"Tabelas ativas: `{TABLES_VERSION}`")
     if st.session_state.calculations_history:
         st.divider()
-        st.caption(f"Clientes analisados ({len(st.session_state.calculations_history)}) — clique para abrir o chat:")
-        for idx_sb, c_sb in enumerate(st.session_state.calculations_history):
+        # Agrupa por cliente/empresa para nunca duplicar o mesmo cliente na lista lateral
+        unique_clients_sb: Dict[str, Dict[str, Any]] = {}
+        for c_sb in st.session_state.calculations_history:
+            c_key = f"{str(c_sb.get('worker_name', '')).strip().lower()}|{str(c_sb.get('employer_name', '')).strip().lower()}"
+            if c_key not in unique_clients_sb:
+                unique_clients_sb[c_key] = c_sb
+
+        st.caption(f"Clientes analisados ({len(unique_clients_sb)}) — clique para abrir o chat:")
+        for idx_sb, c_sb in enumerate(unique_clients_sb.values()):
             cid_sb = str(c_sb["audit_id"])
             msgs_count = len(st.session_state.case_chat_threads.get(cid_sb, []))
             badge_chat = f" 💬{msgs_count}" if msgs_count > 0 else ""
@@ -594,6 +601,7 @@ with st.sidebar:
                 use_container_width=True,
             ):
                 st.session_state.selected_chat_case_id = cid_sb
+                st.session_state["chat_case_selector_widget"] = cid_sb
                 st.rerun()
 
 
@@ -983,11 +991,24 @@ if menu == "Avaliação Preliminar & Auditoria":
                 res_pre["bruto_atualizado"] += rest_dec
                 res_pre["liquido_devido"] += rest_dec
 
-            st.session_state.calculations_history.insert(0, res_pre)
-            st.session_state.case_chat_threads[res_pre["audit_id"]] = list(
-                st.session_state.case_chat_threads.get("caso_atual", [])
-            )
+            # Substitui cálculo anterior do mesmo cliente (preservando todo o histórico de chat já conversado!)
+            new_client_key = f"{cliente_nome.strip().lower()}|{empresa_nome.strip().lower()}"
+            existing_chat_backup: List[Dict[str, str]] = []
+            filtered_history: List[Dict[str, Any]] = []
+            for old_c in st.session_state.calculations_history:
+                old_key = f"{str(old_c.get('worker_name', '')).strip().lower()}|{str(old_c.get('employer_name', '')).strip().lower()}"
+                if old_key == new_client_key:
+                    old_id = str(old_c["audit_id"])
+                    if st.session_state.case_chat_threads.get(old_id):
+                        existing_chat_backup = list(st.session_state.case_chat_threads[old_id])
+                else:
+                    filtered_history.append(old_c)
+
+            st.session_state.calculations_history = [res_pre] + filtered_history
+            draft_msgs = list(st.session_state.case_chat_threads.get("caso_atual", []))
+            st.session_state.case_chat_threads[res_pre["audit_id"]] = existing_chat_backup or draft_msgs
             st.session_state.selected_chat_case_id = res_pre["audit_id"]
+            st.session_state["chat_case_selector_widget"] = res_pre["audit_id"]
             st.success(f"Cálculo preliminar pronto para ajuizamento! Código: **{res_pre['audit_id']}**")
 
             k1, k2, k3 = st.columns(3)
