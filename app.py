@@ -249,6 +249,10 @@ class ExtractedCaseData(BaseModel):
     weekly_night_hours: Optional[float] = None
     adicional_sugerido: Optional[str] = None
     nr_technical_assessment: Optional[str] = None
+    meses_sem_registro_ctps: Optional[int] = None
+    plus_salarial_acumulo_pct: Optional[float] = None
+    diferenca_equiparacao_mensal: Optional[float] = None
+    periodos_ferias_vencidas: Optional[int] = None
     restituicao_atestados_ou_descontos: Optional[float] = None
     fgts_nao_depositado_contrato: Optional[float] = None
     meses_estabilidade_restantes: Optional[int] = None
@@ -263,6 +267,7 @@ class ExtractedCaseData(BaseModel):
     medical_leave_summary: Optional[str] = None
     stability_alert: Optional[str] = None
     viability_conclusion: Optional[str] = None
+    petition_draft_topics: Optional[str] = None
     recommended_claims_checklist: List[str] = []
     ambiguities: List[str] = []
 
@@ -289,9 +294,11 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
             "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos INSS, ASO, PPP, LTCAT, PGR, CCT e "
             "FOTOS DO AMBIENTE DE TRABALHO / EPIs / EQUIPAMENTOS). "
             "Sua missão:\n"
-            "1) Extrair datas, salário-base, comissões/'por fora', jornada habitual, valores já pagos no TRCT, descontos indevidos "
-            "(ex.: atestados médicos descontados), saldo de FGTS não depositado no contrato (fgts_nao_depositado_contrato) e "
-            "meses de estabilidade provisória violados (meses_estabilidade_restantes).\n"
+            "1) Extrair datas (incluindo início real se houve período sem registro), salário-base, comissões/'por fora', jornada habitual, "
+            "valores já pagos no TRCT, descontos indevidos (ex.: atestados médicos descontados), saldo de FGTS não depositado no contrato "
+            "(fgts_nao_depositado_contrato), meses sem registro na CTPS (meses_sem_registro_ctps), percentual de plus salarial por acúmulo/desvio "
+            "de função (plus_salarial_acumulo_pct, ex: 20.0), diferença mensal por equiparação salarial (diferenca_equiparacao_mensal), "
+            "períodos de férias vencidas não gozadas (periodos_ferias_vencidas) e meses de estabilidade provisória violados (meses_estabilidade_restantes).\n"
             "2) AVALIAÇÃO TÉCNICA DE INSALUBRIDADE (NR-15) E PERICULOSIDADE (NR-16): examine fotos do local de trabalho, produtos químicos, "
             "câmara fria, ruído, agentes biológicos, inflamáveis, alta tensão, explosivos ou uso de motocicleta (art. 193 §4º CLT), "
             "bem como PPP/LTCAT/contracheques (se já recebia ou não). Preencha 'adicional_sugerido' com uma das opções exatas: "
@@ -301,9 +308,10 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
             "3) Identificar todas as irregularidades, nulidades e brechas jurídicas (estabilidade acidentária B91, gestante, CIPA, "
             "atestados médicos descontados indevidamente, demissão com ASO inapto, rescisão indireta por falta de FGTS ou atraso salarial, "
             "atraso no pagamento das verbas rescisórias > 10 dias [multa art. 477 §8º CLT], verbas rescisórias incontroversas não pagas [multa art. 467 CLT], "
-            "horas extras não pagas, intervalo intrajornada suprimido, vínculo sem registro).\n"
-            "4) Emitir 'viability_conclusion' (parecer objetivo e fundamentado se há viabilidade para ajuizar ação e quais os pontos fortes) e "
-            "'recommended_claims_checklist' (lista objetiva dos pedidos prontos para a Petição Inicial).\n"
+            "horas extras não pagas, intervalo intrajornada suprimido, vínculo sem registro, acúmulo/desvio de função, equiparação salarial).\n"
+            "4) Emitir 'viability_conclusion' (parecer objetivo e fundamentado se há viabilidade para ajuizar ação e quais os pontos fortes), "
+            "'petition_draft_topics' (esboço estruturado dos tópicos jurídicos da Petição Inicial — Dos Fatos e Do Direito — prontos para o advogado adaptar) "
+            "e 'recommended_claims_checklist' (lista objetiva dos pedidos prontos para a Petição Inicial).\n"
             "5) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias, sugerir_fgts_e_multa, "
             "sugerir_multa_477 e sugerir_multa_467 conforme os fatos e documentos.\n"
             "6) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
@@ -380,7 +388,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 
     periodo_geral = f"{adm_date.strftime('%d/%m/%Y')} a {dism_date.strftime('%d/%m/%Y')}"
 
-    # A. Verbas Rescisórias Básicas
+    # A. Verbas Rescisórias Básicas (Saldo, Aviso Prévio, 13º e Férias + 1/3)
     if params.get("inc_saldo_salario"):
         dias = Decimal(str(params.get("saldo_dias", dism_date.day)))
         val = (remuneration / Decimal("30")) * dias
@@ -391,7 +399,8 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     aviso_dias = min(90, 30 + years_worked * 3)
-    if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"):
+    aplica_aviso = bool(params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"))
+    if aplica_aviso:
         fator = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
         val = ((remuneration / Decimal("30")) * Decimal(str(aviso_dias))) * fator
         add_verba(
@@ -401,7 +410,78 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     if params.get("inc_13") and term_type != "justa_causa":
-        avos_13 = Decimal(str(params.get("avos_13", dism_date.month)))
+        avos_base_13 = dism_date.month if dism_date.day >= 15 else max(0, dism_date.month - 1)
+        avos_proj_13 = (aviso_dias // 30) if aplica_aviso else 0
+        avos_13 = min(12, avos_base_13 + avos_proj_13)
+        if avos_13 > 0:
+            val_13 = (remuneration / Decimal("12")) * Decimal(str(avos_13))
+            add_verba(
+                "VER-03", "13º Salário Proporcional (c/ Projeção do Aviso)", str(dism_date.year),
+                remuneration, "(Remuneração / 12) × Avos (incl. projeção OJ 82)",
+                f"{avos_13}/12 avos", "100%", val_13, incide_fgts=True
+            )
+
+    if params.get("inc_ferias"):
+        periodos_venc = int(params.get("periodos_ferias_vencidas", 0))
+        if periodos_venc > 0:
+            fer_venc = remuneration * Decimal(str(periodos_venc))
+            terco_venc = fer_venc / Decimal("3")
+            add_verba(
+                "VER-04A", "Férias Vencidas + 1/3 Constitucional (Art. 137 CLT)", periodo_geral,
+                remuneration, "(Remuneração × Períodos) + 1/3 Constitucional",
+                f"{periodos_venc} período(s)", "133,33%", fer_venc, reflexos=terco_venc, incide_fgts=False
+            )
+        if term_type != "justa_causa":
+            meses_aquis = ((dism_date.year - adm_date.year) * 12 + (dism_date.month - adm_date.month)) % 12
+            if dism_date.day >= adm_date.day:
+                meses_aquis += 1
+            avos_proj_fer = (aviso_dias // 30) if aplica_aviso else 0
+            avos_fer = min(12, max(1, meses_aquis + avos_proj_fer))
+            fer_prop = (remuneration / Decimal("12")) * Decimal(str(avos_fer))
+            terco_prop = fer_prop / Decimal("3")
+            add_verba(
+                "VER-04", "Férias Proporcionais + 1/3 Constitucional (c/ Projeção)", periodo_geral,
+                remuneration, "((Remuneração / 12) × Avos) + 1/3 Constitucional",
+                f"{avos_fer}/12 avos", "133,33%", fer_prop, reflexos=terco_prop, incide_fgts=False
+            )
+
+    # A2. Período Trabalhado Sem Registro na CTPS ("Período Clandestino")
+    meses_sem_ctps = int(params.get("meses_sem_registro", 0))
+    if meses_sem_ctps > 0:
+        anos_cland = Decimal(str(meses_sem_ctps)) / Decimal("12")
+        dec13_cland = remuneration * anos_cland
+        fer_cland = (remuneration * anos_cland) * (Decimal("4") / Decimal("3"))
+        fgts_cland = (remuneration * Decimal(str(meses_sem_ctps)) + dec13_cland) * Decimal("0.08")
+        multa_cland_pct = Decimal("0.40") if term_type in ("sem_justa_causa", "rescisao_indireta") else (
+            Decimal("0.20") if term_type == "acordo" else Decimal("0.00")
+        )
+        fgts_cland_total = fgts_cland * (Decimal("1") + multa_cland_pct)
+        total_cland = dec13_cland + fer_cland + fgts_cland_total
+        add_verba(
+            "VER-04C", "Verbas do Período Sem Registro CTPS (13º, Férias + 1/3 e FGTS + Multa)", "Período s/ CTPS",
+            remuneration, "13º + Férias 4/3 + FGTS 8% + Multa do Período Clandestino",
+            f"{meses_sem_ctps} meses", "100%", dec13_cland + fer_cland, reflexos=fgts_cland_total, incide_fgts=False
+        )
+
+    # A3. Acúmulo/Desvio de Função ou Equiparação Salarial (Art. 461 CLT)
+    plus_acumulo_pct = Decimal(str(params.get("plus_acumulo_pct", 0))) / Decimal("100")
+    dif_equip_mensal = d_money(params.get("dif_equiparacao_mensal", 0))
+    dif_funcao_mensal = (base_salary * plus_acumulo_pct).quantize(CENT, rounding=ROUND_HALF_UP) + dif_equip_mensal
+    if dif_funcao_mensal > Decimal("0.00"):
+        orig_dif_func = dif_funcao_mensal * Decimal(str(meses_prescricao))
+        anos_fator_fn = Decimal(str(meses_prescricao)) / Decimal("12")
+        refl_13_fn = dif_funcao_mensal * anos_fator_fn
+        refl_fer_fn = (dif_funcao_mensal * anos_fator_fn) * (Decimal("4") / Decimal("3"))
+        refl_av_fn = Decimal("0.00")
+        if aplica_aviso:
+            fator_av_fn = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
+            refl_av_fn = ((dif_funcao_mensal / Decimal("30")) * Decimal(str(aviso_dias))) * fator_av_fn
+        add_verba(
+            "VER-04D", "Diferença Salarial (Acúmulo/Desvio de Função ou Equiparação Art. 461 CLT)", periodo_geral,
+            dif_funcao_mensal, "Diferença Mensal × Meses + Reflexos (13º, Férias + 1/3 e Aviso)",
+            f"{meses_prescricao} meses", "Plus/Equip.", orig_dif_func, reflexos=refl_13_fn + refl_fer_fn + refl_av_fn, incide_fgts=True
+        )
+
     # B. Adicional de Insalubridade ou Periculosidade (todo o período imprescrito)
     if insalubrity > Decimal("0.00") and params.get("inc_adicional_retroativo", True):
         orig_adic = insalubrity * Decimal(str(meses_prescricao))
@@ -409,7 +489,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         refl_13_ad = insalubrity * anos_fator_ad
         refl_fer_ad = (insalubrity * anos_fator_ad) * (Decimal("4") / Decimal("3"))
         refl_av_ad = Decimal("0.00")
-        if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"):
+        if aplica_aviso:
             fator_av_ad = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
             refl_av_ad = ((insalubrity / Decimal("30")) * Decimal(str(aviso_dias))) * fator_av_ad
         refl_tot_ad = refl_13_ad + refl_fer_ad + refl_av_ad
@@ -560,6 +640,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         "origin": "Motor próprio decimal exato (Python Decimal) — Cálculo pré-processual (Art. 840, § 1º CLT)",
         "tables_version": TABLES_VERSION,
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "office_header": params.get("office_header", ""),
         "verbas": verbas,
         "bruto_atualizado": bruto_atualizado,
         "abatimentos": abatimentos,
@@ -570,7 +651,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
-    """Gera arquivo PDF binário real (via fpdf2) com Parecer, Irregularidades, Memória e Pedidos Liquidados."""
+    """Gera arquivo PDF binário real (via fpdf2) com Timbre do Escritório, Parecer, Irregularidades, Memória e Pedidos."""
     def latin(txt: Any) -> str:
         return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
 
@@ -581,7 +662,8 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     pdf.set_fill_color(11, 27, 43)
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 11, latin("ED Calculos Trabalhistas - Parecer e Avaliacao Preliminar"), new_x="LMARGIN", new_y="NEXT", fill=True)
+    header_title = calc.get("office_header", "").strip() or "ED Calculos Trabalhistas - Parecer e Avaliacao Preliminar"
+    pdf.cell(0, 11, latin(header_title[:72]), new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(
         0, 7,
@@ -853,6 +935,11 @@ if menu == "Avaliação Preliminar & Auditoria":
         else:
             st.caption("Preenchimento inicial de exemplo — clique em 'Analisar Relato + Documentos' acima para preencher automaticamente ou edite diretamente abaixo.")
 
+        office_timbre = st.text_input(
+            "Timbre do Escritório / Advogado e OAB (aparece no topo do PDF)",
+            value="Escritório de Advocacia Trabalhista — Parecer Pré-Processual",
+        )
+
         p1, p2, p3 = st.columns(3)
         cliente_nome = p1.text_input("Nome do Cliente (Reclamante) *", value=ext_pre.get("worker_name") or "João da Silva")
         empresa_nome = p2.text_input("Empresa (Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
@@ -899,6 +986,12 @@ if menu == "Avaliação Preliminar & Auditoria":
         domingos_mes = j2.number_input("Domingos/Feriados sem Folga / Mês", min_value=0, max_value=10, value=int(ext_pre.get("monthly_sundays_worked") or 0))
         min_intervalo_suprimido = j3.number_input("Intervalo Suprimido (min/dia)", min_value=0, max_value=60, value=int(ext_pre.get("suppressed_break_minutes") or 0))
         horas_noturnas_semana = j4.number_input("Horas Noturnas / Semana", min_value=0.0, value=float(ext_pre.get("weekly_night_hours") or 0.0), step=0.5)
+
+        t1, t2, t3, t4 = st.columns(4)
+        meses_sem_ctps_val = t1.number_input("Meses Sem Registro CTPS", min_value=0, max_value=60, value=int(ext_pre.get("meses_sem_registro_ctps") or 0))
+        ferias_vencidas_val = t2.number_input("Períodos Férias Vencidas", min_value=0, max_value=5, value=int(ext_pre.get("periodos_ferias_vencidas") or 0))
+        plus_acumulo_val = t3.number_input("Acúmulo/Desvio Função (%)", min_value=0.0, max_value=50.0, value=float(ext_pre.get("plus_salarial_acumulo_pct") or 0.0), step=5.0)
+        dif_equip_val = t4.number_input("Equiparação Salarial (R$/mês)", min_value=0.0, value=float(ext_pre.get("diferenca_equiparacao_mensal") or 0.0), step=50.0)
 
         st.subheader("3. Seleção de Pedidos, Reflexos e Multas da Inicial")
         v1, v2, v3 = st.columns(3)
@@ -976,6 +1069,7 @@ if menu == "Avaliação Preliminar & Auditoria":
 
             res_pre = run_labor_calculation({
                 "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
+                "office_header": office_timbre,
                 "worker_name": cliente_nome,
                 "employer_name": empresa_nome,
                 "role_title": cargo_funcao,
@@ -995,6 +1089,10 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "inc_aviso_previo": ped_aviso,
                 "inc_13": ped_13_ferias,
                 "inc_ferias": ped_13_ferias,
+                "periodos_ferias_vencidas": ferias_vencidas_val,
+                "meses_sem_registro": meses_sem_ctps_val,
+                "plus_acumulo_pct": plus_acumulo_val,
+                "dif_equiparacao_mensal": dif_equip_val,
                 "inc_fgts": ped_fgts,
                 "fgts_nao_depositado": fgts_faltante_val,
                 "meses_estabilidade": meses_estab_val,
@@ -1062,6 +1160,10 @@ if menu == "Avaliação Preliminar & Auditoria":
 
             with st.expander("Copiar Texto dos Pedidos Liquidados para a Petição Inicial (Art. 840, § 1º CLT)", expanded=True):
                 st.text_area("Minuta pronta para colar na inicial:", value="\n".join(linhas_pedidos), height=220)
+
+            if ext_pre.get("petition_draft_topics"):
+                with st.expander("Esboço dos Tópicos Jurídicos (Dos Fatos e Do Direito) para a Petição Inicial", expanded=False):
+                    st.text_area("Fundamentação preliminar sugerida pela IA:", value=ext_pre["petition_draft_topics"], height=260)
 
             dl1, dl2 = st.columns(2)
             dl1.download_button(
