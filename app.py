@@ -1,5 +1,5 @@
 # app.py — ED Cálculos Trabalhistas (Versão Python + Streamlit)
-# Requisitos: streamlit, pandas, openpyxl, pydantic, google-genai
+# Requisitos: streamlit, pandas, openpyxl, pydantic, google-genai, fpdf2
 # Execução: streamlit run app.py
 
 import os
@@ -27,7 +27,7 @@ except ImportError:
 # 1. CONFIGURAÇÃO DA PÁGINA E IDENTIDADE VISUAL
 # ==============================================================================
 st.set_page_config(
-    page_title="ED Cálculos Trabalhistas — Avaliação Preliminar & Auditoria",
+    page_title="ED Cálculos Trabalhistas — Parecer & Auditoria Pré-Processual",
     page_icon="⚖️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -54,23 +54,25 @@ st.markdown(
 # ==============================================================================
 # 2. TABELAS HISTÓRICAS E CONSTANTES DECIMAIS
 # ==============================================================================
-TABLES_VERSION = "2026.11-ref"
+TABLES_VERSION = "2026.11-completa"
 CENT = Decimal("0.01")
 
-INSS_BRACKETS = [
-    (Decimal("1518.00"), Decimal("0.075")),
-    (Decimal("2793.88"), Decimal("0.09")),
-    (Decimal("4190.83"), Decimal("0.12")),
-    (Decimal("8157.41"), Decimal("0.14")),
-]
+# Tabela histórica oficial do Salário Mínimo Nacional (para base de insalubridade)
+MIN_WAGE_BY_YEAR = {
+    2020: Decimal("1045.00"),
+    2021: Decimal("1100.00"),
+    2022: Decimal("1212.00"),
+    2023: Decimal("1320.00"),
+    2024: Decimal("1412.00"),
+    2025: Decimal("1518.00"),
+    2026: Decimal("1621.00"),
+}
 
-IRRF_BRACKETS = [
-    (Decimal("2259.20"), Decimal("0.00"), Decimal("0.00")),
-    (Decimal("2826.65"), Decimal("0.075"), Decimal("169.44")),
-    (Decimal("3751.05"), Decimal("0.15"), Decimal("381.44")),
-    (Decimal("4664.68"), Decimal("0.225"), Decimal("662.77")),
-    (Decimal("999999999.00"), Decimal("0.275"), Decimal("896.00")),
-]
+
+def get_historical_min_wage(ref_date: date) -> Decimal:
+    if ref_date.year in MIN_WAGE_BY_YEAR:
+        return MIN_WAGE_BY_YEAR[ref_date.year]
+    return MIN_WAGE_BY_YEAR[max(MIN_WAGE_BY_YEAR.keys())]
 
 
 def d_money(val: Any) -> Decimal:
@@ -247,10 +249,14 @@ class ExtractedCaseData(BaseModel):
     weekly_night_hours: Optional[float] = None
     adicional_sugerido: Optional[str] = None
     restituicao_atestados_ou_descontos: Optional[float] = None
+    fgts_nao_depositado_contrato: Optional[float] = None
+    meses_estabilidade_restantes: Optional[int] = None
     sugerir_saldo_salario: bool = True
     sugerir_aviso_previo: bool = True
     sugerir_13_e_ferias: bool = True
     sugerir_fgts_e_multa: bool = True
+    sugerir_multa_477: bool = False
+    sugerir_multa_467: bool = False
     trct_paid_items: List[PaidItem] = []
     irregularities_found: List[IrregularityFinding] = []
     medical_leave_summary: Optional[str] = None
@@ -270,10 +276,6 @@ def get_gemini_api_key() -> Optional[str]:
 
 
 def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Cruza o RELATO DO ADVOGADO com TODOS OS DOCUMENTOS ANEXADOS para emitir
-    parecer pré-processual, identificar irregularidades e pré-configurar os pedidos.
-    """
     api_key = get_gemini_api_key()
     if not api_key or not GENAI_AVAILABLE:
         raise RuntimeError("GEMINI_API_KEY não configurada em Secrets ou google-genai ausente.")
@@ -285,13 +287,17 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
             "Analise em conjunto o RELATO DO ADVOGADO (entrevista com o cliente) e TODOS OS DOCUMENTOS ANEXADOS "
             "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos de afastamento/INSS, ASO, CCT). "
             "Sua missão:\n"
-            "1) Extrair datas, salário-base, comissões/'por fora', jornada habitual, valores já pagos no TRCT e descontos indevidos.\n"
+            "1) Extrair datas, salário-base, comissões/'por fora', jornada habitual, valores já pagos no TRCT, descontos indevidos "
+            "(ex.: atestados médicos descontados), saldo de FGTS não depositado no contrato (fgts_nao_depositado_contrato) e "
+            "meses de estabilidade provisória violados (meses_estabilidade_restantes).\n"
             "2) Identificar todas as irregularidades, nulidades e brechas jurídicas (estabilidade acidentária B91, gestante, CIPA, "
             "atestados médicos descontados indevidamente, demissão com ASO inapto, rescisão indireta por falta de FGTS ou atraso salarial, "
+            "atraso no pagamento das verbas rescisórias > 10 dias [multa art. 477 §8º CLT], verbas rescisórias incontroversas não pagas [multa art. 467 CLT], "
             "horas extras não pagas, intervalo intrajornada suprimido, vínculo sem registro).\n"
-            "3) Emitir 'viability_conclusion' (parecer objetivo se há viabilidade para ajuizar ação e quais os pontos fortes) e "
+            "3) Emitir 'viability_conclusion' (parecer objetivo e fundamentado se há viabilidade para ajuizar ação e quais os pontos fortes) e "
             "'recommended_claims_checklist' (lista objetiva dos pedidos prontos para a Petição Inicial).\n"
-            "4) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias e sugerir_fgts_e_multa conforme o caso.\n"
+            "4) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias, sugerir_fgts_e_multa, "
+            "sugerir_multa_477 e sugerir_multa_467 conforme os fatos e documentos.\n"
             "5) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
         )
     ]
@@ -316,7 +322,7 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
 
 
 # ==============================================================================
-# 6. MOTOR DE CÁLCULO DECIMAL EXATO (AUDITORIA & VALOR DA CAUSA)
+# 6. MOTOR DE CÁLCULO DECIMAL EXATO (COMPLETO COM REFLEXOS, MULTAS E ESTABILIDADE)
 # ==============================================================================
 def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
     base_salary = d_money(params["base_salary"])
@@ -331,6 +337,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
     dism_date: date = params["dismissal_date"]
     term_type: str = params["termination_type"]
     years_worked = max(0, (dism_date - adm_date).days // 365)
+    meses_prescricao = max(1, min(60, ((dism_date.year - adm_date.year) * 12 + (dism_date.month - adm_date.month))))
 
     verbas: List[Dict[str, Any]] = []
 
@@ -344,7 +351,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         pct_str: str,
         original: Decimal,
         reflexos: Decimal = Decimal("0.00"),
-        tributavel_inss: bool = True,
+        incide_fgts: bool = True,
     ):
         orig_q = original.quantize(CENT, rounding=ROUND_HALF_UP)
         refl_q = reflexos.quantize(CENT, rounding=ROUND_HALF_UP)
@@ -360,28 +367,29 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
             "Valor Original": orig_q,
             "Reflexos": refl_q,
             "Total Apurado": total_item,
-            "Tributável INSS": tributavel_inss,
+            "Incide FGTS": incide_fgts,
         })
 
     periodo_geral = f"{adm_date.strftime('%d/%m/%Y')} a {dism_date.strftime('%d/%m/%Y')}"
 
+    # A. Verbas Rescisórias Básicas
     if params.get("inc_saldo_salario"):
         dias = Decimal(str(params.get("saldo_dias", dism_date.day)))
         val = (remuneration / Decimal("30")) * dias
         add_verba(
             "VER-01", "Saldo de Salário", dism_date.strftime("%m/%Y"),
             remuneration, "(Remuneração / 30) × Dias Trabalhados",
-            f"{dias} dias", "100%", val, tributavel_inss=True
+            f"{dias} dias", "100%", val, incide_fgts=True
         )
 
+    aviso_dias = min(90, 30 + years_worked * 3)
     if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"):
-        aviso_dias = min(90, 30 + years_worked * 3)
         fator = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
         val = ((remuneration / Decimal("30")) * Decimal(str(aviso_dias))) * fator
         add_verba(
             "VER-02", "Aviso-Prévio Indenizado (Lei 12.506/2011)", periodo_geral,
             remuneration, "(Remuneração / 30) × Dias Aviso × Fator",
-            f"{aviso_dias} dias", f"{int(fator * 100)}%", val, tributavel_inss=False
+            f"{aviso_dias} dias", f"{int(fator * 100)}%", val, incide_fgts=True
         )
 
     if params.get("inc_13") and term_type != "justa_causa":
@@ -390,7 +398,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         add_verba(
             "VER-03", "13º Salário Proporcional", f"Ano {dism_date.year}",
             remuneration, "(Remuneração / 12) × Avos",
-            f"{avos_13}/12 avos", "100%", val, tributavel_inss=True
+            f"{avos_13}/12 avos", "100%", val, incide_fgts=True
         )
 
     if params.get("inc_ferias") and term_type != "justa_causa":
@@ -400,20 +408,24 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         add_verba(
             "VER-04", "Férias Proporcionais/Vencidas + 1/3 Constitucional", periodo_geral,
             remuneration, "((Remuneração / 12) × Avos) + 1/3",
-            f"{avos_ferias}/12 avos", "133,33%", ferias_base + terco, tributavel_inss=False
+            f"{avos_ferias}/12 avos", "133,33%", ferias_base + terco, incide_fgts=False
         )
 
+    # B. Jornada de Trabalho e Adicionais
     dsr_factor = Decimal("1") / Decimal("6")
+    parcelas_habituais_total = Decimal("0.00")
+
     if params.get("inc_he50") and d_money(params.get("he50_hours", 0)) > 0:
         h50 = Decimal(str(params["he50_hours"]))
         pct_he = Decimal(str(params.get("he50_pct", 50))) / Decimal("100")
         unit_he = hourly_rate * (Decimal("1") + pct_he)
         orig_he = unit_he * h50
         refl_dsr = orig_he * dsr_factor
+        parcelas_habituais_total += orig_he
         add_verba(
             "VER-05", f"Horas Extras ({params.get('he50_pct', 50)}%) + Reflexo DSR", periodo_geral,
-            hourly_rate.quantize(CENT), f"(Hora Normal × (1 + {params.get('he50_pct', 50)}%)) × Horas + DSR",
-            f"{h50}h", f"+{params.get('he50_pct', 50)}%", orig_he, reflexos=refl_dsr, tributavel_inss=True
+            hourly_rate.quantize(CENT), f"(Hora Normal × (1 + {params.get('he50_pct', 50)}%)) × Horas + DSR (1/6)",
+            f"{h50}h", f"+{params.get('he50_pct', 50)}%", orig_he, reflexos=refl_dsr, incide_fgts=True
         )
 
     if params.get("inc_he100") and d_money(params.get("he100_hours", 0)) > 0:
@@ -421,10 +433,11 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         unit_100 = hourly_rate * Decimal("2")
         orig_100 = unit_100 * h100
         refl_dsr_100 = orig_100 * dsr_factor
+        parcelas_habituais_total += orig_100
         add_verba(
             "VER-05B", "Horas Extras Domingos/Feriados (100%) + Reflexo DSR", periodo_geral,
-            hourly_rate.quantize(CENT), "(Hora Normal × 2,00) × Horas 100% + DSR",
-            f"{h100}h", "+100%", orig_100, reflexos=refl_dsr_100, tributavel_inss=True
+            hourly_rate.quantize(CENT), "(Hora Normal × 2,00) × Horas 100% + DSR (1/6)",
+            f"{h100}h", "+100%", orig_100, reflexos=refl_dsr_100, incide_fgts=True
         )
 
     if params.get("inc_intrajornada") and d_money(params.get("intrajornada_hours", 0)) > 0:
@@ -432,33 +445,91 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         unit_intra = hourly_rate * Decimal("1.5")
         orig_intra = unit_intra * h_intra
         add_verba(
-            "VER-05C", "Intervalo Intrajornada Suprimido (+50%)", periodo_geral,
+            "VER-05C", "Intervalo Intrajornada Suprimido (+50% — Art. 71 §4º CLT)", periodo_geral,
             hourly_rate.quantize(CENT), "(Hora Normal × 1,50) × Horas Suprimidas",
-            f"{h_intra}h", "+50%", orig_intra, tributavel_inss=False
+            f"{h_intra}h", "+50%", orig_intra, incide_fgts=False
         )
 
     if params.get("inc_noturno") and d_money(params.get("night_hours", 0)) > 0:
         h_not = Decimal(str(params["night_hours"]))
         pct_not = Decimal(str(params.get("night_pct", 20))) / Decimal("100")
         orig_not = (hourly_rate * pct_not) * h_not
+        refl_dsr_not = orig_not * dsr_factor
+        parcelas_habituais_total += orig_not
         add_verba(
-            "VER-06", "Adicional Noturno (com Redução Ficta 52m30s)", periodo_geral,
-            hourly_rate.quantize(CENT), f"(Hora Normal × {params.get('night_pct', 20)}%) × Horas Fictas",
-            f"{h_not}h", f"+{params.get('night_pct', 20)}%", orig_not, tributavel_inss=True
+            "VER-06", "Adicional Noturno (Redução Ficta 52m30s) + Reflexo DSR", periodo_geral,
+            hourly_rate.quantize(CENT), f"(Hora Normal × {params.get('night_pct', 20)}%) × Horas Fictas + DSR",
+            f"{h_not}h", f"+{params.get('night_pct', 20)}%", orig_not, reflexos=refl_dsr_not, incide_fgts=True
         )
 
-    if params.get("inc_fgts"):
-        base_fgts = sum((v["Valor Original"] + v["Reflexos"]) for v in verbas)
-        fgts_8 = (base_fgts * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP)
-        multa_pct = Decimal("0.40") if term_type in ("sem_justa_causa", "rescisao_indireta") else (
-            Decimal("0.20") if term_type == "acordo" else Decimal("0.00")
-        )
-        multa_val = (fgts_8 * multa_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+    # C. Reflexos das Parcelas Habituais (HE + Adic. Noturno) em 13º, Férias + 1/3 e Aviso-Prévio
+    if params.get("inc_reflexos_completos") and parcelas_habituais_total > Decimal("0.00"):
+        media_mensal_habitual = (parcelas_habituais_total / Decimal(str(meses_prescricao))).quantize(CENT, rounding=ROUND_HALF_UP)
+        anos_fator = Decimal(str(meses_prescricao)) / Decimal("12")
+        refl_13 = media_mensal_habitual * anos_fator
+        refl_ferias = (media_mensal_habitual * anos_fator) * (Decimal("4") / Decimal("3"))
+        refl_aviso = Decimal("0.00")
+        if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"):
+            fator_av = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
+            refl_aviso = ((media_mensal_habitual / Decimal("30")) * Decimal(str(aviso_dias))) * fator_av
+        total_refl_cascata = refl_13 + refl_ferias + refl_aviso
         add_verba(
-            "VER-07", "FGTS (8%) + Indenização Rescisória sobre Verbas", periodo_geral,
-            base_fgts, "Base Incidente × 8% + Multa Rescisória",
-            "Verbas incidentes", f"8% + {int(multa_pct * 100)}%", fgts_8 + multa_val, tributavel_inss=False
+            "VER-06B", "Reflexos Habituais (HE/Noturno) em 13º, Férias + 1/3 e Aviso-Prévio", periodo_geral,
+            media_mensal_habitual, "Média Mensal Habitual × (13º + Férias 4/3 + Aviso Prévio)",
+            f"{meses_prescricao} meses", "Súm. 347 TST", total_refl_cascata, incide_fgts=True
         )
+
+    # D. Indenização de Estabilidade Provisória (B91 / Gestante / CIPA)
+    meses_estab = int(params.get("meses_estabilidade", 0))
+    if meses_estab > 0:
+        ind_estab = remuneration * Decimal(str(meses_estab))
+        add_verba(
+            "VER-07", "Indenização Substitutiva do Período de Estabilidade Provisória", "Pós-demissão",
+            remuneration, "Remuneração Mensal × Meses de Estabilidade Restantes",
+            f"{meses_estab} meses", "100%", ind_estab, incide_fgts=True
+        )
+
+    # E. FGTS (8%) sobre Verbas + FGTS Não Depositado no Contrato + Multa Rescisória
+    multa_pct = Decimal("0.40") if term_type in ("sem_justa_causa", "rescisao_indireta") else (
+        Decimal("0.20") if term_type == "acordo" else Decimal("0.00")
+    )
+    fgts_nao_dep = d_money(params.get("fgts_nao_depositado", 0))
+    if params.get("inc_fgts") or fgts_nao_dep > Decimal("0.00"):
+        base_fgts_verbas = sum((v["Total Apurado"] for v in verbas if v["Incide FGTS"]), Decimal("0.00"))
+        fgts_8_verbas = (base_fgts_verbas * Decimal("0.08")).quantize(CENT, rounding=ROUND_HALF_UP) if params.get("inc_fgts") else Decimal("0.00")
+        base_multa = fgts_8_verbas + fgts_nao_dep
+        multa_val = (base_multa * multa_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+        total_fgts_item = fgts_8_verbas + fgts_nao_dep + multa_val
+        if total_fgts_item > Decimal("0.00"):
+            add_verba(
+                "VER-08", "FGTS (8% Verbas + Depósitos Faltantes) + Multa Rescisória", periodo_geral,
+                base_fgts_verbas + fgts_nao_dep, "(Verbas Incidentes × 8% + FGTS Faltante) + Multa",
+                "Contrato + Rescisão", f"8% + {int(multa_pct * 100)}%", total_fgts_item, incide_fgts=False
+            )
+
+    # F. Multas dos Arts. 477 § 8º e 467 da CLT
+    if params.get("inc_multa_477"):
+        add_verba(
+            "VER-09", "Multa por Atraso na Quitação Rescisória (Art. 477, § 8º CLT)", dism_date.strftime("%m/%Y"),
+            remuneration, "1 Remuneração Mensal do Empregado",
+            "1 salário", "100%", remuneration, incide_fgts=False
+        )
+
+    if params.get("inc_multa_467"):
+        # 50% sobre as verbas rescisórias estritas incontroversas (Saldo + Aviso + 13º + Férias)
+        base_467 = sum(
+            (v["Total Apurado"] for v in verbas if v["Código"] in ("VER-01", "VER-02", "VER-03", "VER-04")),
+            Decimal("0.00"),
+        )
+        abat_prev = d_money(params.get("offsets", 0))
+        saldo_incontroverso = max(Decimal("0.00"), base_467 - abat_prev)
+        multa_467_val = (saldo_incontroverso * Decimal("0.50")).quantize(CENT, rounding=ROUND_HALF_UP)
+        if multa_467_val > Decimal("0.00"):
+            add_verba(
+                "VER-10", "Multa sobre Verbas Rescisórias Incontroversas (Art. 467 CLT)", dism_date.strftime("%m/%Y"),
+                saldo_incontroverso, "Verbas Rescisórias Líquidas × 50%",
+                "1 parcela", "50%", multa_467_val, incide_fgts=False
+            )
 
     bruto_atualizado = sum((v["Total Apurado"] for v in verbas), Decimal("0.00"))
     abatimentos = d_money(params.get("offsets", 0))
@@ -478,7 +549,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         "admission_date": adm_date.strftime("%d/%m/%Y"),
         "dismissal_date": dism_date.strftime("%d/%m/%Y"),
         "termination_type": term_type,
-        "origin": "Calculado por motor próprio decimal (Python Decimal) — não homologado como API oficial PJe-Calc",
+        "origin": "Motor próprio decimal exato (Python Decimal) — Cálculo pré-processual (Art. 840, § 1º CLT)",
         "tables_version": TABLES_VERSION,
         "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "verbas": verbas,
@@ -491,7 +562,7 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
-    """Gera arquivo PDF binário real (via fpdf2) pronto para download e arquivamento."""
+    """Gera arquivo PDF binário real (via fpdf2) com Parecer, Irregularidades, Memória e Pedidos Liquidados."""
     def latin(txt: Any) -> str:
         return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
 
@@ -499,11 +570,10 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Cabeçalho azul-marinho ED Cálculos Trabalhistas
     pdf.set_fill_color(11, 27, 43)
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 11, latin("ED Calculos Trabalhistas - Dossie de Avaliacao Preliminar"), new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.cell(0, 11, latin("ED Calculos Trabalhistas - Parecer e Avaliacao Preliminar"), new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(
         0, 7,
@@ -512,7 +582,6 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     )
     pdf.ln(4)
 
-    # Identificação das Partes
     pdf.set_text_color(15, 37, 55)
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 7, latin("1. Identificacao das Partes e Contrato"), new_x="LMARGIN", new_y="NEXT")
@@ -526,7 +595,6 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     )
     pdf.ln(3)
 
-    # Parecer e Irregularidades (se houver)
     ai_op = calc.get("ai_opinion") or {}
     if ai_op.get("viability_conclusion") or ai_op.get("stability_alert") or ai_op.get("medical_leave_summary"):
         pdf.set_font("Helvetica", "B", 11)
@@ -550,7 +618,6 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
             pdf.multi_cell(0, 5, latin(linha_irr))
         pdf.ln(3)
 
-    # Tabela de Verbas Liquidadas
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 7, latin("3. Memoria de Calculo Auditavel - Pedidos Liquidados"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_fill_color(241, 245, 249)
@@ -722,7 +789,6 @@ if menu == "Avaliação Preliminar & Auditoria":
     tc_pre = st.session_state.timecard_result
     ext_pre = st.session_state.extracted_ai_data or {}
 
-    # Painel de Parecer Jurídico, Irregularidades e Checklist Pronto para Ajuizar
     if ext_pre:
         with st.container(border=True):
             st.subheader("Parecer Jurídico Preliminar & Estratégia para Ajuizamento")
@@ -775,6 +841,7 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.success("Campos abaixo preenchidos automaticamente com base no seu relato e nos documentos anexados. Ajuste apenas se desejar alterar algo.")
         else:
             st.caption("Preenchimento inicial de exemplo — clique em 'Analisar Relato + Documentos' acima para preencher automaticamente ou edite diretamente abaixo.")
+
         p1, p2, p3 = st.columns(3)
         cliente_nome = p1.text_input("Nome do Cliente (Reclamante) *", value=ext_pre.get("worker_name") or "João da Silva")
         empresa_nome = p2.text_input("Empresa (Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
@@ -822,13 +889,30 @@ if menu == "Avaliação Preliminar & Auditoria":
         min_intervalo_suprimido = j3.number_input("Intervalo Suprimido (min/dia)", min_value=0, max_value=60, value=int(ext_pre.get("suppressed_break_minutes") or 0))
         horas_noturnas_semana = j4.number_input("Horas Noturnas / Semana", min_value=0.0, value=float(ext_pre.get("weekly_night_hours") or 0.0), step=0.5)
 
-        st.subheader("3. Seleção de Pedidos para Liquidar na Inicial")
+        st.subheader("3. Seleção de Pedidos, Reflexos e Multas da Inicial")
         v1, v2, v3 = st.columns(3)
         ped_saldo = v1.checkbox("Saldo de Salário", value=bool(ext_pre.get("sugerir_saldo_salario", True)))
         dias_saldo_pre = v1.number_input("Dias trabalhados no último mês", min_value=0, max_value=31, value=dism_pre.day)
+        ped_reflexos_completos = v1.checkbox("Reflexos Habituais em 13º, Férias + 1/3 e Aviso", value=True)
+
         ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=bool(ext_pre.get("sugerir_aviso_previo", True)))
         ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=bool(ext_pre.get("sugerir_13_e_ferias", True)))
-        ped_fgts = v3.checkbox("Diferenças de FGTS (8%) + Multa Rescisória", value=bool(ext_pre.get("sugerir_fgts_e_multa", True)))
+        ped_multa_477 = v2.checkbox("Multa Art. 477, § 8º CLT (Atraso TRCT)", value=bool(ext_pre.get("sugerir_multa_477", False)))
+        ped_multa_467 = v2.checkbox("Multa Art. 467 CLT (50% Verbas Incontroversas)", value=bool(ext_pre.get("sugerir_multa_467", False)))
+
+        ped_fgts = v3.checkbox("FGTS (8%) + Multa Rescisória", value=bool(ext_pre.get("sugerir_fgts_e_multa", True)))
+        fgts_faltante_val = v3.number_input(
+            "FGTS Não Depositado no Contrato (R$)",
+            min_value=0.0,
+            value=float(ext_pre.get("fgts_nao_depositado_contrato") or 0.0),
+            step=100.0,
+        )
+        meses_estab_val = v3.number_input(
+            "Meses de Estabilidade Violada (B91/Gestante/CIPA)",
+            min_value=0,
+            max_value=24,
+            value=int(ext_pre.get("meses_estabilidade_restantes") or 0),
+        )
         rest_auto = float(ext_pre.get("restituicao_atestados_ou_descontos") or 0.0)
         restituicao_atestados = v3.number_input(
             "Restituição de Atestados / Descontos Indevidos (R$)",
@@ -863,15 +947,16 @@ if menu == "Avaliação Preliminar & Auditoria":
                 total_intra = float(((Decimal(str(min_intervalo_suprimido)) / Decimal("60")) * dias_uteis_periodo).quantize(Decimal("0.01")))
                 total_not = float((Decimal(str(horas_noturnas_semana)) * semanas_periodo * Decimal("1.142857")).quantize(Decimal("0.01")))
 
-            insal_mensal = 0.0
+            sm_vigente = get_historical_min_wage(dism_pre)
+            insal_mensal = Decimal("0.00")
             if "10%" in adicional_cond:
-                insal_mensal = 151.80
+                insal_mensal = (sm_vigente * Decimal("0.10")).quantize(CENT)
             elif "20%" in adicional_cond:
-                insal_mensal = 303.60
+                insal_mensal = (sm_vigente * Decimal("0.20")).quantize(CENT)
             elif "40%" in adicional_cond:
-                insal_mensal = 607.20
+                insal_mensal = (sm_vigente * Decimal("0.40")).quantize(CENT)
             elif "30%" in adicional_cond:
-                insal_mensal = round(sal_registrado * 0.30, 2)
+                insal_mensal = (d_money(sal_registrado) * Decimal("0.30")).quantize(CENT)
 
             res_pre = run_labor_calculation({
                 "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
@@ -884,7 +969,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "monthly_divisor": divisor_pre,
                 "base_salary": sal_registrado,
                 "commissions": sal_por_fora,
-                "insalubrity": insal_mensal,
+                "insalubrity": float(insal_mensal),
                 "offsets": valor_ja_pago_trct,
                 "inc_saldo_salario": ped_saldo,
                 "saldo_dias": dias_saldo_pre,
@@ -892,6 +977,11 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "inc_13": ped_13_ferias,
                 "inc_ferias": ped_13_ferias,
                 "inc_fgts": ped_fgts,
+                "fgts_nao_depositado": fgts_faltante_val,
+                "meses_estabilidade": meses_estab_val,
+                "inc_multa_477": ped_multa_477,
+                "inc_multa_467": ped_multa_467,
+                "inc_reflexos_completos": ped_reflexos_completos,
                 "inc_he50": total_he50 > 0,
                 "he50_hours": total_he50,
                 "he50_pct": 50,
@@ -909,7 +999,7 @@ if menu == "Avaliação Preliminar & Auditoria":
             if restituicao_atestados > 0:
                 rest_dec = d_money(restituicao_atestados)
                 res_pre["verbas"].append({
-                    "Código": "VER-08",
+                    "Código": "VER-11",
                     "Verba": "Restituição de Descontos Indevidos / Atestados Médicos",
                     "Período": f"{adm_pre.strftime('%d/%m/%Y')} a {dism_pre.strftime('%d/%m/%Y')}",
                     "Base de Cálculo": rest_dec,
@@ -919,7 +1009,7 @@ if menu == "Avaliação Preliminar & Auditoria":
                     "Valor Original": rest_dec,
                     "Reflexos": Decimal("0.00"),
                     "Total Apurado": rest_dec,
-                    "Tributável INSS": False,
+                    "Incide FGTS": False,
                 })
                 res_pre["bruto_atualizado"] += rest_dec
                 res_pre["liquido_devido"] += rest_dec
@@ -941,7 +1031,6 @@ if menu == "Avaliação Preliminar & Auditoria":
                 hide_index=True,
             )
 
-            # Texto pronto dos pedidos liquidados para colar na Petição Inicial (Art. 840, § 1º CLT)
             linhas_pedidos = [
                 f"DOS PEDIDOS LIQUIDADOS (Art. 840, § 1º da CLT) — {cliente_nome} x {empresa_nome}:",
                 "",
