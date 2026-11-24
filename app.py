@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any
 import pandas as pd
 import streamlit as st
 from pydantic import BaseModel
+from fpdf import FPDF
 
 try:
     from google import genai
@@ -505,99 +506,99 @@ def build_printable_dossier_html(calc: Dict[str, Any]) -> str:
           <td style="text-align:right;">{fmt_brl(v['Base de Cálculo'])}</td>
           <td style="text-align:right;">{fmt_brl(v['Valor Original'])}</td>
           <td style="text-align:right;">{fmt_brl(v['Reflexos'])}</td>
-          <td style="text-align:right;"><strong>{fmt_brl(v['Total Apurado'])}</strong></td>
-        </tr>
-        """
-        for v in calc["verbas"]
+def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
+    """Gera arquivo PDF binário real (via fpdf2) pronto para download e arquivamento."""
+    def latin(txt: Any) -> str:
+        return str(txt or "").encode("latin-1", errors="replace").decode("latin-1")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Cabeçalho azul-marinho ED Cálculos Trabalhistas
+    pdf.set_fill_color(11, 27, 43)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 11, latin("ED Calculos Trabalhistas - Dossie de Avaliacao Preliminar"), new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(
+        0, 7,
+        latin(f"Auditoria: {calc['audit_id']} | Gerado em: {calc['generated_at']} | Tabelas: {calc['tables_version']}"),
+        new_x="LMARGIN", new_y="NEXT", fill=True,
     )
+    pdf.ln(4)
 
-    irregs_html = ""
-    if irregs:
-        irregs_rows = "".join(
-            f"<tr><td><strong>{i.get('categoria','')}</strong></td><td>{i.get('origem_evidencia','')}</td>"
-            f"<td>{i.get('descricao','')}</td><td>{i.get('fundamento_juridico','')}</td></tr>"
-            for i in irregs
-        )
-        irregs_html = f"""
-        <h3>Irregularidades e Brechas Identificadas</h3>
-        <table>
-          <thead><tr><th>Categoria</th><th>Evidência</th><th>Descrição</th><th>Fundamento</th></tr></thead>
-          <tbody>{irregs_rows}</tbody>
-        </table>
-        """
+    # Identificação das Partes
+    pdf.set_text_color(15, 37, 55)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, latin("1. Identificacao das Partes e Contrato"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, latin(f"Reclamante (Cliente): {calc.get('worker_name', '')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, latin(f"Reclamada (Empresa): {calc.get('employer_name', '')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 6,
+        latin(f"Cargo: {calc.get('role_title', '')} | Periodo: {calc.get('admission_date', '')} a {calc.get('dismissal_date', '')}"),
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(3)
 
-    checklist_html = ""
-    if checklist:
-        items_li = "".join(f"<li>{c}</li>" for c in checklist)
-        checklist_html = f"<h3>Pedidos Recomendados para a Petição Inicial</h3><ul>{items_li}</ul>"
-
-    parecer_html = ""
+    # Parecer e Irregularidades (se houver)
+    ai_op = calc.get("ai_opinion") or {}
     if ai_op.get("viability_conclusion") or ai_op.get("stability_alert") or ai_op.get("medical_leave_summary"):
-        parecer_html = f"""
-        <div class="box">
-          <h3>Parecer Preliminar de Viabilidade</h3>
-          {f'<p style="color:#991B1B;"><strong>Alerta de Estabilidade:</strong> {ai_op["stability_alert"]}</p>' if ai_op.get("stability_alert") else ""}
-          {f'<p><strong>Atestados / Afastamentos / ASO:</strong> {ai_op["medical_leave_summary"]}</p>' if ai_op.get("medical_leave_summary") else ""}
-          {f'<p>{ai_op["viability_conclusion"]}</p>' if ai_op.get("viability_conclusion") else ""}
-        </div>
-        """
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 7, latin("2. Parecer Preliminar de Viabilidade e Brechas"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9.5)
+        if ai_op.get("stability_alert"):
+            pdf.multi_cell(0, 5.5, latin(f"ALERTA DE ESTABILIDADE: {ai_op['stability_alert']}"))
+        if ai_op.get("medical_leave_summary"):
+            pdf.multi_cell(0, 5.5, latin(f"ATESTADOS / AFASTAMENTOS / ASO: {ai_op['medical_leave_summary']}"))
+        if ai_op.get("viability_conclusion"):
+            pdf.multi_cell(0, 5.5, latin(f"CONCLUSAO: {ai_op['viability_conclusion']}"))
+        pdf.ln(3)
 
-    return f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8" />
-  <title>Dossiê Preliminar — {calc['audit_id']}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; color: #0F2537; margin: 32px; line-height: 1.45; }}
-    .header {{ background: #0B1B2B; color: #FFFFFF; padding: 20px 24px; border-radius: 8px; }}
-    .header h1 {{ margin: 0 0 4px 0; font-size: 20px; }}
-    .header p {{ margin: 0; font-size: 12px; color: #CBD5E1; }}
-    .meta {{ display: flex; flex-wrap: wrap; gap: 18px; margin: 16px 0; font-size: 13px; background: #F8FAFC; padding: 12px 16px; border: 1px solid #E2E8F0; border-radius: 6px; }}
-    .box {{ background: #F8FAFC; border-left: 4px solid #0B1B2B; padding: 12px 16px; margin: 16px 0; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }}
-    th, td {{ border: 1px solid #CBD5E1; padding: 8px; text-align: left; vertical-align: top; }}
-    th {{ background: #F1F5F9; font-weight: bold; }}
-    .totals {{ margin-top: 18px; text-align: right; font-size: 14px; }}
-    .totals .final {{ font-size: 18px; font-weight: bold; color: #15803D; }}
-    .footer {{ margin-top: 28px; font-size: 11px; color: #64748B; border-top: 1px solid #E2E8F0; padding-top: 10px; }}
-    @media print {{ body {{ margin: 12mm; }} }}
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>ED Cálculos Trabalhistas — Dossiê de Avaliação Preliminar & Auditoria</h1>
-    <p>Identificador de Auditoria: {calc['audit_id']} • Gerado em {calc['generated_at']} • Tabelas {calc['tables_version']}</p>
-  </div>
-  <div class="meta">
-    <div><strong>Reclamante:</strong> {calc.get('worker_name','')}</div>
-    <div><strong>Reclamada:</strong> {calc.get('employer_name','')}</div>
-    <div><strong>Cargo:</strong> {calc.get('role_title','')}</div>
-    <div><strong>Período:</strong> {calc.get('admission_date','')} a {calc.get('dismissal_date','')}</div>
-  </div>
-  {parecer_html}
-  {irregs_html}
-  {checklist_html}
-  <h3>Memória de Cálculo Auditável — Pedidos Liquidados</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Cód.</th><th>Verba / Fórmula</th><th>Qtd.</th><th>Perc.</th>
-        <th style="text-align:right;">Base</th><th style="text-align:right;">Original</th>
-        <th style="text-align:right;">Reflexos</th><th style="text-align:right;">Total</th>
-      </tr>
-    </thead>
-    <tbody>{rows_verbas}</tbody>
-  </table>
-  <div class="totals">
-    <div>Total Apurado das Verbas: <strong>{fmt_brl(calc['bruto_atualizado'])}</strong></div>
-    <div>(-) Valores Já Pagos no TRCT: <strong>-{fmt_brl(calc['abatimentos'])}</strong></div>
-    <div class="final">Valor da Causa / Restituição a Pedir: {fmt_brl(calc['liquido_devido'])}</div>
-  </div>
-  <div class="footer">
-    Origem do cálculo: {calc['origin']}. Para salvar em PDF, pressione Ctrl+P (ou Cmd+P) e escolha "Salvar como PDF".
-  </div>
-</body>
-</html>"""
+    irregs = ai_op.get("irregularities_found") or []
+    if irregs:
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.cell(0, 7, latin("Irregularidades Identificadas nos Documentos / Relato:"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        for idx_i, irr in enumerate(irregs, 1):
+            linha_irr = f"{idx_i}. [{irr.get('categoria', '')}] {irr.get('descricao', '')} ({irr.get('fundamento_juridico', '')})"
+            pdf.multi_cell(0, 5, latin(linha_irr))
+        pdf.ln(3)
+
+    # Tabela de Verbas Liquidadas
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, latin("3. Memoria de Calculo Auditavel - Pedidos Liquidados"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_fill_color(241, 245, 249)
+    pdf.set_font("Helvetica", "B", 8.5)
+    pdf.cell(18, 7, "Cod.", border=1, fill=True)
+    pdf.cell(82, 7, "Verba / Parcela", border=1, fill=True)
+    pdf.cell(28, 7, "Qtd / Perc", border=1, fill=True)
+    pdf.cell(31, 7, "Base", border=1, fill=True, align="R")
+    pdf.cell(31, 7, "Total", border=1, fill=True, align="R", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 8.5)
+    for v in calc["verbas"]:
+        pdf.cell(18, 6.5, latin(v["Código"]), border=1)
+        pdf.cell(82, 6.5, latin(v["Verba"][:44]), border=1)
+        pdf.cell(28, 6.5, latin(f"{v['Quantidade']} ({v['Percentual']})"), border=1)
+        pdf.cell(31, 6.5, latin(fmt_brl(v["Base de Cálculo"])), border=1, align="R")
+        pdf.cell(31, 6.5, latin(fmt_brl(v["Total Apurado"])), border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, latin(f"Total Apurado das Verbas: {fmt_brl(calc['bruto_atualizado'])}"), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, latin(f"(-) Valores Ja Pagos no TRCT: -{fmt_brl(calc['abatimentos'])}"), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(21, 128, 61)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, latin(f"VALOR DA CAUSA / RESTITUICAO A PEDIR: {fmt_brl(calc['liquido_devido'])}"), align="R", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(4)
+    pdf.set_text_color(100, 116, 139)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.multi_cell(0, 4.5, latin(f"Origem: {calc['origin']}"))
+
+    return bytes(pdf.output())
 
 
 def build_complete_excel_bytes(calc: Dict[str, Any]) -> bytes:
@@ -979,16 +980,16 @@ if menu == "Avaliação Preliminar & Auditoria":
                 use_container_width=True,
             )
             dl2.download_button(
-                "Baixar Relatório Timbrado para Imprimir / Salvar em PDF (.HTML)",
-                data=build_printable_dossier_html(res_pre).encode("utf-8"),
-                file_name=f"Relatorio_Dossie_{res_pre['audit_id']}.html",
-                mime="text/html",
+                "Baixar Relatório Oficial em PDF (.PDF)",
+                data=build_printable_dossier_pdf_bytes(res_pre),
+                file_name=f"Relatorio_Dossie_{res_pre['audit_id']}.pdf",
+                mime="application/pdf",
                 use_container_width=True,
             )
 
 elif menu == "Meus Cálculos e Relatórios":
     st.title("Meus Cálculos e Relatórios Salvos")
-    st.caption("Baixe o dossiê completo em Excel (.XLSX) ou o relatório timbrado (.HTML — abra no navegador e pressione Ctrl+P para salvar em PDF).")
+    st.caption("Baixe o dossiê completo em Excel (.XLSX) ou diretamente em PDF (.PDF) para arquivar no processo.")
     if not st.session_state.calculations_history:
         st.info("Nenhuma avaliação realizada nesta sessão ainda.")
     else:
@@ -1013,10 +1014,10 @@ elif menu == "Meus Cálculos e Relatórios":
                     use_container_width=True,
                 )
                 b2.download_button(
-                    "Exportar Relatório Timbrado / PDF (.HTML)",
-                    data=build_printable_dossier_html(calc).encode("utf-8"),
-                    file_name=f"Relatorio_Dossie_{calc['audit_id']}.html",
-                    mime="text/html",
-                    key=f"dl_html_{calc['audit_id']}_{idx}",
+                    "Exportar Relatório em PDF (.PDF)",
+                    data=build_printable_dossier_pdf_bytes(calc),
+                    file_name=f"Relatorio_Dossie_{calc['audit_id']}.pdf",
+                    mime="application/pdf",
+                    key=f"dl_pdf_{calc['audit_id']}_{idx}",
                     use_container_width=True,
                 )
