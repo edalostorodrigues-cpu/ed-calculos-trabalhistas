@@ -201,6 +201,15 @@ def _deserialize_calc_from_cloud(raw_calc: Dict[str, Any]) -> Dict[str, Any]:
             calc[m_key] = d_money(calc[m_key])
     verbas_restored: List[Dict[str, Any]] = []
     for v in (calc.get("verbas") or []):
+        v_item = dict(v)
+        for v_key in ("Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"):
+            if v_key in v_item:
+                v_item[v_key] = d_money(v_item[v_key])
+        verbas_restored.append(v_item)
+    calc["verbas"] = verbas_restored
+    return calc
+
+
 def _build_supabase_headers(sb_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Monta headers compatíveis tanto com chaves legacy JWT (eyJ...) quanto novas (sb_publishable_...)."""
     headers: Dict[str, str] = {"apikey": sb_key}
