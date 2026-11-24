@@ -248,6 +248,7 @@ class ExtractedCaseData(BaseModel):
     suppressed_break_minutes: Optional[int] = None
     weekly_night_hours: Optional[float] = None
     adicional_sugerido: Optional[str] = None
+    nr_technical_assessment: Optional[str] = None
     restituicao_atestados_ou_descontos: Optional[float] = None
     fgts_nao_depositado_contrato: Optional[float] = None
     meses_estabilidade_restantes: Optional[int] = None
@@ -283,22 +284,29 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
     client = genai.Client(api_key=api_key)
     contents: List[Any] = [
         (
-            "Você é um advogado trabalhista sênior e auditor de cálculos judiciais. "
-            "Analise em conjunto o RELATO DO ADVOGADO (entrevista com o cliente) e TODOS OS DOCUMENTOS ANEXADOS "
-            "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos de afastamento/INSS, ASO, CCT). "
+            "Você é um advogado trabalhista sênior, perito técnico em NRs e auditor de cálculos judiciais. "
+            "Analise em conjunto o RELATO DO ADVOGADO (entrevista com o cliente) e TODOS OS DOCUMENTOS E FOTOS ANEXADOS "
+            "(TRCT, contracheques, cartões de ponto, extratos FGTS, atestados médicos, laudos INSS, ASO, PPP, LTCAT, PGR, CCT e "
+            "FOTOS DO AMBIENTE DE TRABALHO / EPIs / EQUIPAMENTOS). "
             "Sua missão:\n"
             "1) Extrair datas, salário-base, comissões/'por fora', jornada habitual, valores já pagos no TRCT, descontos indevidos "
             "(ex.: atestados médicos descontados), saldo de FGTS não depositado no contrato (fgts_nao_depositado_contrato) e "
             "meses de estabilidade provisória violados (meses_estabilidade_restantes).\n"
-            "2) Identificar todas as irregularidades, nulidades e brechas jurídicas (estabilidade acidentária B91, gestante, CIPA, "
+            "2) AVALIAÇÃO TÉCNICA DE INSALUBRIDADE (NR-15) E PERICULOSIDADE (NR-16): examine fotos do local de trabalho, produtos químicos, "
+            "câmara fria, ruído, agentes biológicos, inflamáveis, alta tensão, explosivos ou uso de motocicleta (art. 193 §4º CLT), "
+            "bem como PPP/LTCAT/contracheques (se já recebia ou não). Preencha 'adicional_sugerido' com uma das opções exatas: "
+            "'Nenhum', 'Insalubridade Grau Mínimo (10%)', 'Insalubridade Grau Médio (20%)', 'Insalubridade Grau Máximo (40%)' ou "
+            "'Periculosidade (30% sobre salário)', e detalhe em 'nr_technical_assessment' o anexo da NR-15/NR-16 aplicável, "
+            "o que foi observado nas fotos/relato e a necessidade de perícia judicial (Art. 195 CLT).\n"
+            "3) Identificar todas as irregularidades, nulidades e brechas jurídicas (estabilidade acidentária B91, gestante, CIPA, "
             "atestados médicos descontados indevidamente, demissão com ASO inapto, rescisão indireta por falta de FGTS ou atraso salarial, "
             "atraso no pagamento das verbas rescisórias > 10 dias [multa art. 477 §8º CLT], verbas rescisórias incontroversas não pagas [multa art. 467 CLT], "
             "horas extras não pagas, intervalo intrajornada suprimido, vínculo sem registro).\n"
-            "3) Emitir 'viability_conclusion' (parecer objetivo e fundamentado se há viabilidade para ajuizar ação e quais os pontos fortes) e "
+            "4) Emitir 'viability_conclusion' (parecer objetivo e fundamentado se há viabilidade para ajuizar ação e quais os pontos fortes) e "
             "'recommended_claims_checklist' (lista objetiva dos pedidos prontos para a Petição Inicial).\n"
-            "4) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias, sugerir_fgts_e_multa, "
+            "5) Marcar os booleans sugerir_saldo_salario, sugerir_aviso_previo, sugerir_13_e_ferias, sugerir_fgts_e_multa, "
             "sugerir_multa_477 e sugerir_multa_467 conforme os fatos e documentos.\n"
-            "5) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
+            "6) Nunca inventar valores ou datas ausentes; sinalize dúvidas em 'ambiguities'."
         )
     ]
 
@@ -394,24 +402,24 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
 
     if params.get("inc_13") and term_type != "justa_causa":
         avos_13 = Decimal(str(params.get("avos_13", dism_date.month)))
-        val = (remuneration / Decimal("12")) * avos_13
+    # B. Adicional de Insalubridade ou Periculosidade (todo o período imprescrito)
+    if insalubrity > Decimal("0.00") and params.get("inc_adicional_retroativo", True):
+        orig_adic = insalubrity * Decimal(str(meses_prescricao))
+        anos_fator_ad = Decimal(str(meses_prescricao)) / Decimal("12")
+        refl_13_ad = insalubrity * anos_fator_ad
+        refl_fer_ad = (insalubrity * anos_fator_ad) * (Decimal("4") / Decimal("3"))
+        refl_av_ad = Decimal("0.00")
+        if params.get("inc_aviso_previo") and term_type in ("sem_justa_causa", "rescisao_indireta", "acordo"):
+            fator_av_ad = Decimal("0.5") if term_type == "acordo" else Decimal("1.0")
+            refl_av_ad = ((insalubrity / Decimal("30")) * Decimal(str(aviso_dias))) * fator_av_ad
+        refl_tot_ad = refl_13_ad + refl_fer_ad + refl_av_ad
         add_verba(
-            "VER-03", "13º Salário Proporcional", f"Ano {dism_date.year}",
-            remuneration, "(Remuneração / 12) × Avos",
-            f"{avos_13}/12 avos", "100%", val, incide_fgts=True
+            "VER-04B", f"Adicional de {params.get('adicional_label', 'Insalubridade/Periculosidade')} + Reflexos", periodo_geral,
+            insalubrity, "Adicional Mensal × Meses + Reflexos (13º, Férias + 1/3 e Aviso)",
+            f"{meses_prescricao} meses", params.get("adicional_pct_label", "NR-15/16"), orig_adic, reflexos=refl_tot_ad, incide_fgts=True
         )
 
-    if params.get("inc_ferias") and term_type != "justa_causa":
-        avos_ferias = Decimal(str(params.get("avos_ferias", 12)))
-        ferias_base = (remuneration / Decimal("12")) * avos_ferias
-        terco = ferias_base / Decimal("3")
-        add_verba(
-            "VER-04", "Férias Proporcionais/Vencidas + 1/3 Constitucional", periodo_geral,
-            remuneration, "((Remuneração / 12) × Avos) + 1/3",
-            f"{avos_ferias}/12 avos", "133,33%", ferias_base + terco, incide_fgts=False
-        )
-
-    # B. Jornada de Trabalho e Adicionais
+    # C. Jornada de Trabalho e Adicionais
     dsr_factor = Decimal("1") / Decimal("6")
     parcelas_habituais_total = Decimal("0.00")
 
@@ -596,12 +604,14 @@ def build_printable_dossier_pdf_bytes(calc: Dict[str, Any]) -> bytes:
     pdf.ln(3)
 
     ai_op = calc.get("ai_opinion") or {}
-    if ai_op.get("viability_conclusion") or ai_op.get("stability_alert") or ai_op.get("medical_leave_summary"):
+    if ai_op.get("viability_conclusion") or ai_op.get("stability_alert") or ai_op.get("medical_leave_summary") or ai_op.get("nr_technical_assessment"):
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 7, latin("2. Parecer Preliminar de Viabilidade e Brechas"), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, latin("2. Parecer Preliminar de Viabilidade, NRs e Brechas"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9.5)
         if ai_op.get("stability_alert"):
             pdf.multi_cell(0, 5.5, latin(f"ALERTA DE ESTABILIDADE: {ai_op['stability_alert']}"))
+        if ai_op.get("nr_technical_assessment"):
+            pdf.multi_cell(0, 5.5, latin(f"INSALUBRIDADE / PERICULOSIDADE (NR-15 / NR-16): {ai_op['nr_technical_assessment']}"))
         if ai_op.get("medical_leave_summary"):
             pdf.multi_cell(0, 5.5, latin(f"ATESTADOS / AFASTAMENTOS / ASO: {ai_op['medical_leave_summary']}"))
         if ai_op.get("viability_conclusion"):
@@ -711,21 +721,20 @@ if menu == "Avaliação Preliminar & Auditoria":
     )
 
     with st.container(border=True):
-        st.subheader("1. Relato do Caso (Entrevista) + Upload Universal de Documentos")
+        st.subheader("1. Relato do Caso (Entrevista) + Fotos do Ambiente + Upload Universal")
         lawyer_narrative = st.text_area(
-            "Relato livre do advogado / fatos narrados pelo cliente (opcional se enviar arquivos, ou use ambos em conjunto):",
+            "Relato livre do advogado / condições do ambiente de trabalho e fatos narrados pelo cliente:",
             placeholder=(
-                "Ex.: Cliente admitido em 01/02/2024 como vendedor com salário registrado de R$ 2.400,00 + R$ 600,00 por fora. "
-                "Fazia em média 6 horas extras semanais sem receber e tinha apenas 30 min de almoço. "
-                "Sofreu afastamento previdenciário B91 e foi dispensado sem justa causa 3 meses após a alta, "
-                "tendo ainda 2 atestados médicos descontados no TRCT..."
+                "Ex.: Cliente admitido em 01/02/2024 como operador/motoboy com salário registrado de R$ 2.400,00 + R$ 600,00 por fora. "
+                "Trabalhava em contato diário com produtos químicos/graxa sem EPI adequado ou em câmara fria/motocicleta (ver fotos anexas), "
+                "sem receber insalubridade ou periculosidade. Fazia 6h extras semanais, tinha só 30 min de almoço e teve 2 atestados descontados..."
             ),
             height=135,
             key="lawyer_narrative_box",
         )
 
         uploaded_all = st.file_uploader(
-            "Anexe aqui todos os documentos do cliente (PDF, Imagem JPG/PNG, Excel .xlsx, CSV ou TXT — opcional)",
+            "Anexe documentos E FOTOS do ambiente de trabalho / EPIs / produtos (PDF, Fotos JPG/PNG, Excel .xlsx, CSV ou TXT)",
             type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx", "txt"],
             accept_multiple_files=True,
             key="universal_dossier_uploader",
@@ -794,6 +803,8 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.subheader("Parecer Jurídico Preliminar & Estratégia para Ajuizamento")
             if ext_pre.get("stability_alert"):
                 st.error(f"**ALERTA DE ESTABILIDADE / REINTEGRAÇÃO OU INDENIZAÇÃO:** {ext_pre['stability_alert']}")
+            if ext_pre.get("nr_technical_assessment"):
+                st.warning(f"**Enquadramento Técnico NR-15 / NR-16 (Fotos & Relato):** {ext_pre['nr_technical_assessment']}")
             if ext_pre.get("medical_leave_summary"):
                 st.warning(f"**Atestados Médicos / Afastamentos / ASO:** {ext_pre['medical_leave_summary']}")
             if ext_pre.get("viability_conclusion"):
@@ -949,14 +960,19 @@ if menu == "Avaliação Preliminar & Auditoria":
 
             sm_vigente = get_historical_min_wage(dism_pre)
             insal_mensal = Decimal("0.00")
+            adic_pct_lbl = "0%"
             if "10%" in adicional_cond:
                 insal_mensal = (sm_vigente * Decimal("0.10")).quantize(CENT)
+                adic_pct_lbl = "10% SM (NR-15)"
             elif "20%" in adicional_cond:
                 insal_mensal = (sm_vigente * Decimal("0.20")).quantize(CENT)
+                adic_pct_lbl = "20% SM (NR-15)"
             elif "40%" in adicional_cond:
                 insal_mensal = (sm_vigente * Decimal("0.40")).quantize(CENT)
+                adic_pct_lbl = "40% SM (NR-15)"
             elif "30%" in adicional_cond:
                 insal_mensal = (d_money(sal_registrado) * Decimal("0.30")).quantize(CENT)
+                adic_pct_lbl = "30% Sal. (NR-16)"
 
             res_pre = run_labor_calculation({
                 "process_number": f"INICIAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
@@ -970,6 +986,9 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "base_salary": sal_registrado,
                 "commissions": sal_por_fora,
                 "insalubrity": float(insal_mensal),
+                "adicional_label": adicional_cond,
+                "adicional_pct_label": adic_pct_lbl,
+                "inc_adicional_retroativo": insal_mensal > Decimal("0.00"),
                 "offsets": valor_ja_pago_trct,
                 "inc_saldo_salario": ped_saldo,
                 "saldo_dias": dias_saldo_pre,
