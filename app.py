@@ -392,6 +392,86 @@ if "selected_chat_case_id" not in st.session_state:
 if "cloud_connected" not in st.session_state:
     st.session_state.cloud_connected = False
 if "cloud_status_detail" not in st.session_state:
+    st.session_state.cloud_status_detail = ""
+
+
+def process_timecard_dataframe(df: pd.DataFrame, daily_standard_minutes: int = 480) -> Dict[str, Any]:
+    """Apura horas extras 50%/100%, intrajornada e hora noturna ficta dia a dia."""
+    rows_out: List[Dict[str, Any]] = []
+    tot_he50_min = 0
+    tot_he100_min = 0
+    tot_intra_min = 0
+    tot_night_ficta_min = 0
+    incomplete_days = 0
+
+    def _night_mins(start_m: Optional[int], end_m: Optional[int]) -> int:
+        if start_m is None or end_m is None or end_m <= start_m:
+            return 0
+        total_n = 0
+        for n_start, n_end in ((0, 300), (1320, 1740)):
+            ov_start = max(start_m, n_start)
+            ov_end = min(end_m, n_end)
+            if ov_end > ov_start:
+                total_n += ov_end - ov_start
+        return total_n
+
+    for _, row in df.iterrows():
+        dt_str = str(row.get("Data") or row.get("data") or "").strip()
+        dia_sem = str(row.get("Dia") or row.get("dia") or "").strip().upper()
+        feriado_flag = str(row.get("Feriado") or row.get("feriado") or "N").strip().upper()
+        is_holiday = feriado_flag == "S" or dia_sem in ("DOM", "DOMINGO", "FERIADO")
+
+        e1 = parse_hhmm(row.get("Entrada1") if "Entrada1" in row else row.get("entrada1"))
+        s1 = parse_hhmm(row.get("Saida1") if "Saida1" in row else row.get("saida1"))
+        e2 = parse_hhmm(row.get("Entrada2") if "Entrada2" in row else row.get("entrada2"))
+        s2 = parse_hhmm(row.get("Saida2") if "Saida2" in row else row.get("saida2"))
+
+        if e1 is None or s1 is None:
+            incomplete_days += 1
+            rows_out.append({
+                "Data": dt_str,
+                "Dia": dia_sem or "-",
+                "HE 50% (h)": 0.0,
+                "HE 100% (h)": 0.0,
+                "Intrajornada (h)": 0.0,
+                "Noturna Ficta (h)": 0.0,
+                "Status": "Batida incompleta (revisar)",
+            })
+            continue
+
+        p1_end = s1 + 1440 if s1 < e1 else s1
+        worked_1 = max(0, p1_end - e1)
+        night_1 = _night_mins(e1, p1_end)
+
+        worked_2 = 0
+        night_2 = 0
+        break_min = 0
+
+        if e2 is not None and s2 is not None:
+            p2_start = e2 + 1440 if e2 < p1_end else e2
+            p2_end = s2 + 1440 if s2 < p2_start else s2
+            break_min = max(0, p2_start - p1_end)
+            worked_2 = max(0, p2_end - p2_start)
+            night_2 = _night_mins(p2_start, p2_end)
+
+        day_worked = worked_1 + worked_2
+        night_clock = night_1 + night_2
+
+        intra_sup = 0
+        if day_worked > 360 and break_min < 60:
+            intra_sup = 60 - break_min
+        elif 240 < day_worked <= 360 and break_min < 15:
+            intra_sup = 15 - break_min
+
+        he50 = 0
+        he100 = 0
+        if is_holiday:
+            he100 = day_worked
+        else:
+            diff = day_worked - daily_standard_minutes
+            if diff > 10:
+                he50 = diff
+
         night_ficta = int(round(night_clock * (Decimal("60") / Decimal("52.5"))))
 
         tot_he50_min += he50
