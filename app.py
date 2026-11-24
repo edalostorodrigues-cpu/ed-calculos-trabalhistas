@@ -201,13 +201,16 @@ def _deserialize_calc_from_cloud(raw_calc: Dict[str, Any]) -> Dict[str, Any]:
             calc[m_key] = d_money(calc[m_key])
     verbas_restored: List[Dict[str, Any]] = []
     for v in (calc.get("verbas") or []):
-        v_copy = dict(v)
-        for col in ("Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"):
-            if col in v_copy:
-                v_copy[col] = d_money(v_copy[col])
-        verbas_restored.append(v_copy)
-    calc["verbas"] = verbas_restored
-    return calc
+def _build_supabase_headers(sb_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Monta headers compatíveis tanto com chaves legacy JWT (eyJ...) quanto novas (sb_publishable_...)."""
+    headers: Dict[str, str] = {"apikey": sb_key}
+    if not sb_key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {sb_key}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool, str]:
     """Carrega todos os clientes e históricos de chat salvos na nuvem Supabase."""
     sb_url, sb_key = get_supabase_credentials()
@@ -217,11 +220,7 @@ def supabase_load_all_cases() -> tuple[List[Dict[str, Any]], Dict[str, List[Dict
         endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?select=*&order=updated_at.desc"
         req = urllib.request.Request(
             endpoint,
-            headers={
-                "apikey": sb_key,
-                "Authorization": f"Bearer {sb_key}",
-                "Accept": "application/json",
-            },
+            headers=_build_supabase_headers(sb_key, {"Accept": "application/json"}),
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -266,12 +265,13 @@ def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]
         req = urllib.request.Request(
             endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "apikey": sb_key,
-                "Authorization": f"Bearer {sb_key}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            },
+            headers=_build_supabase_headers(
+                sb_key,
+                {
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+            ),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -1026,30 +1026,14 @@ with st.sidebar:
         st.markdown("**Nuvem Supabase:** <span style='background:#7F1D1D;color:#FCA5A5;padding:2px 8px;border-radius:6px;font-size:12px;'>Desconectada</span>", unsafe_allow_html=True)
         if st.session_state.get("cloud_status_detail"):
             st.caption(f"Detalhe: {st.session_state['cloud_status_detail']}")
-    if st.session_state.calculations_history:
-        st.divider()
-        # Agrupa por cliente/empresa para nunca duplicar o mesmo cliente na lista lateral
-        unique_clients_sb: Dict[str, Dict[str, Any]] = {}
-        for c_sb in st.session_state.calculations_history:
-            c_key = f"{str(c_sb.get('worker_name', '')).strip().lower()}|{str(c_sb.get('employer_name', '')).strip().lower()}"
-            if c_key not in unique_clients_sb:
-                unique_clients_sb[c_key] = c_sb
-
-        st.caption(f"Clientes analisados ({len(unique_clients_sb)}) — clique para abrir o chat:")
-        for idx_sb, c_sb in enumerate(unique_clients_sb.values()):
-            cid_sb = str(c_sb["audit_id"])
-            msgs_count = len(st.session_state.case_chat_threads.get(cid_sb, []))
-            badge_chat = f" 💬{msgs_count}" if msgs_count > 0 else ""
-            is_selected_sb = st.session_state.selected_chat_case_id == cid_sb
-            btn_prefix = "▶ " if is_selected_sb else ""
-            if st.button(
-                f"{btn_prefix}{c_sb.get('worker_name', 'Cliente')} ({fmt_brl(c_sb['liquido_devido'])}){badge_chat}",
-                key=f"sb_select_case_{cid_sb}_{idx_sb}",
-                use_container_width=True,
-            ):
-                st.session_state.selected_chat_case_id = cid_sb
-                st.session_state["chat_case_selector_widget"] = cid_sb
-                st.rerun()
+        if st.button("Reconectar Nuvem", key="sb_reconnect_cloud_btn", use_container_width=True):
+            c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases()
+            st.session_state.cloud_connected = c_ok
+            st.session_state.cloud_status_detail = c_msg
+            if c_ok:
+                st.session_state.calculations_history = c_calcs
+                st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
+            st.rerun()
 
 
 # ==============================================================================
