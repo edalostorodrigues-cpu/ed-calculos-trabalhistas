@@ -555,13 +555,14 @@ if "extraction_confirmed" not in st.session_state:
 # ==============================================================================
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
-    st.caption("SaaS Jurídico • Motor Decimal Auditável")
+    st.caption("SaaS Jurídico • Avaliação Preliminar & Liquidação")
     st.divider()
     menu = st.radio(
         "Navegação",
         [
-            "Dashboard",
-            "Novo Cálculo (Upload Automático)",
+            "Avaliação Preliminar (Pré-Processo)",
+            "Liquidação de Sentença (Upload)",
+            "Dashboard Executivo",
             "Meus Cálculos e Relatórios",
             "Central de Atualizações Legais",
             "Testes de Confiabilidade",
@@ -576,7 +577,207 @@ with st.sidebar:
 # ==============================================================================
 # 9. TELAS DO SISTEMA
 # ==============================================================================
-if menu == "Dashboard":
+if menu == "Avaliação Preliminar (Pré-Processo)":
+    st.title("Avaliação Preliminar do Caso (Antes do Processo Judicial)")
+    st.markdown(
+        "Informe as **condições reais do contrato de trabalho** (ou suba os documentos iniciais do cliente) para apurar "
+        "o **valor estimado dos pedidos**, conferir **diferenças não pagas no TRCT** e gerar o **Demonstrativo do Valor da Causa** para a Petição Inicial."
+    )
+
+    with st.expander("Opcional: Importar Cartão de Ponto (CSV/Excel) ou TRCT/Contracheque do Cliente"):
+        col_pre1, col_pre2 = st.columns(2)
+        with col_pre1:
+            ponto_pre = st.file_uploader("Cartão de Ponto (.csv ou .xlsx)", type=["csv", "xlsx"], key="pre_ponto")
+            if ponto_pre is not None:
+                if ponto_pre.name.endswith(".csv"):
+                    raw_txt = ponto_pre.getvalue().decode("utf-8", errors="ignore")
+                    sep = ";" if ";" in raw_txt.splitlines()[0] else ","
+                    df_ponto = pd.read_csv(io.StringIO(raw_txt), sep=sep)
+                else:
+                    df_ponto = pd.read_excel(ponto_pre)
+                st.session_state.timecard_result = process_timecard_dataframe(df_ponto)
+                st.success("Cartão de ponto apurado e transferido para os campos abaixo!")
+        with col_pre2:
+            doc_pre = st.file_uploader("TRCT / Contracheque / Contrato (.pdf ou .txt)", type=["pdf", "txt"], key="pre_doc")
+            if doc_pre is not None and st.button("Ler Dados do Documento (Gemini)", key="btn_pre_gemini"):
+                try:
+                    mime = "application/pdf" if doc_pre.name.endswith(".pdf") else "text/plain"
+                    st.session_state.extracted_ai_data = extract_document_with_gemini(doc_pre.getvalue(), mime)
+                    st.success("Dados lidos! Confira nos campos abaixo.")
+                except Exception as exc:
+                    st.warning(f"Leitura via Gemini indisponível ({exc}). Preencha diretamente abaixo.")
+
+    tc_pre = st.session_state.timecard_result
+    ext_pre = st.session_state.extracted_ai_data or {}
+
+    with st.form("preliminary_eval_form"):
+        st.subheader("1. Identificação do Cliente e Condições do Emprego")
+        p1, p2, p3 = st.columns(3)
+        cliente_nome = p1.text_input("Nome do Cliente (Trabalhador) *", value=ext_pre.get("worker_name") or "João da Silva")
+        empresa_nome = p2.text_input("Empresa (Futura Reclamada) *", value=ext_pre.get("employer_name") or "Comércio e Serviços Alfa Ltda.")
+        cargo_funcao = p3.text_input("Cargo / Função Exercida", value="Auxiliar Operacional / Vendedor")
+
+        d1, d2, d3, d4 = st.columns(4)
+        adm_pre = d1.date_input("Data de Admissão *", value=date(2024, 2, 1), key="adm_pre")
+        dism_pre = d2.date_input("Data de Saída (ou Hoje) *", value=date(2026, 11, 20), key="dism_pre")
+        motivo_saida = d3.selectbox(
+            "Situação da Saída *",
+            [
+                "sem_justa_causa",
+                "rescisao_indireta",
+                "pedido_demissao",
+                "acordo",
+                "justa_causa",
+            ],
+            format_func=lambda x: {
+                "sem_justa_causa": "Dispensa sem justa causa",
+                "rescisao_indireta": "Pedido de Rescisão Indireta (falta grave do empregador)",
+                "pedido_demissao": "Pedido de demissão (reversão / verbas pendentes)",
+                "acordo": "Rescisão por acordo (art. 484-A CLT)",
+                "justa_causa": "Dispensa por justa causa (contestação)",
+            }[x],
+        )
+        divisor_pre = d4.number_input("Jornada / Divisor Mensal *", min_value=1, max_value=300, value=int(ext_pre.get("monthly_divisor") or 220))
+
+        st.subheader("2. Remuneração Real vs. Registrada")
+        r1, r2, r3, r4 = st.columns(4)
+        sal_registrado = r1.number_input("Salário-Base Registrado (R$) *", min_value=0.0, value=float(ext_pre.get("base_salary") or 2400.00), step=50.0)
+        sal_por_fora = r2.number_input("Comissões / Salário 'Por Fora' (R$/mês)", min_value=0.0, value=float(ext_pre.get("commissions") or 400.00), step=50.0)
+        adicional_cond = r3.selectbox(
+            "Adicional Devido e Não Pago",
+            ["Nenhum", "Insalubridade Grau Mínimo (10%)", "Insalubridade Grau Médio (20%)", "Insalubridade Grau Máximo (40%)", "Periculosidade (30% sobre salário)"],
+        )
+        valor_ja_pago_trct = r4.number_input("Valor Líquido Já Recebido na Rescisão/TRCT (R$)", min_value=0.0, value=0.0, step=100.0)
+
+        st.subheader("3. Jornada Habitual Relatada pelo Cliente (ou Apurada no Ponto)")
+        meses_contrato = max(1, ((dism_pre.year - adm_pre.year) * 12 + (dism_pre.month - adm_pre.month)))
+        st.caption(f"Tempo de contrato apurado: **{meses_contrato} meses** (limitado aos últimos 60 meses pela prescrição quinquenal, se aplicável).")
+
+        j1, j2, j3, j4 = st.columns(4)
+        he_semanal_relatada = j1.number_input("Horas Extras Habituais por Semana (50%)", min_value=0.0, value=6.0, step=0.5, help="Ex: fazia 1h12 extra por dia de seg a sex = 6h/semana")
+        domingos_mes = j2.number_input("Domingos/Feriados Trabalhados sem Folga (por mês)", min_value=0, max_value=10, value=1)
+        suprimia_intervalo = j3.checkbox("Supressão de Intervalo de Almoço (1h)", value=True)
+        min_intervalo_suprimido = j3.number_input("Minutos suprimidos por dia", min_value=0, max_value=60, value=30)
+        horas_noturnas_semana = j4.number_input("Horas Noturnas (22h às 05h) por Semana", min_value=0.0, value=0.0, step=0.5)
+
+        st.subheader("4. Verbas a Incluir na Avaliação Preliminar")
+        v1, v2, v3 = st.columns(3)
+        ped_saldo = v1.checkbox("Saldo de Salário do Mês da Saída", value=True)
+        dias_saldo_pre = v1.number_input("Dias trabalhados no último mês", min_value=0, max_value=31, value=dism_pre.day)
+        ped_aviso = v2.checkbox("Aviso-Prévio Indenizado + Projeção", value=True)
+        ped_13_ferias = v2.checkbox("13º Proporcional e Férias + 1/3", value=True)
+        ped_fgts = v3.checkbox("Diferenças de FGTS (8%) + Multa Rescisória", value=True)
+        aplicar_inss_ir = v3.checkbox("Simular Descontos de INSS/IRRF", value=False)
+
+        avaliar_btn = st.form_submit_button("Calcular Avaliação Preliminar e Valor da Causa", type="primary")
+
+    if avaliar_btn:
+        if sal_registrado <= 0 or not cliente_nome.strip():
+            st.error("Preencha o nome do cliente e o salário-base registrado.")
+        elif dism_pre < adm_pre:
+            st.error("A data de saída não pode ser anterior à admissão.")
+        else:
+            # Converte condições semanais/mensais relatadas para o total do período (máx. 60 meses - prescrição quinquenal)
+            meses_prescricao = min(60, meses_contrato)
+            semanas_periodo = Decimal(str(meses_prescricao)) * Decimal("4.3333")
+
+            if tc_pre is not None:
+                total_he50 = float(tc_pre["he50_hours"])
+                total_he100 = float(tc_pre["he100_hours"])
+                total_intra = float(tc_pre["intrajornada_hours"])
+                total_not = float(tc_pre["night_ficta_hours"])
+            else:
+                total_he50 = float((Decimal(str(he_semanal_relatada)) * semanas_periodo).quantize(Decimal("0.01")))
+                total_he100 = float((Decimal(str(domingos_mes * 8)) * Decimal(str(meses_prescricao))).quantize(Decimal("0.01")))
+                dias_uteis_periodo = Decimal(str(meses_prescricao)) * Decimal("22")
+                total_intra = float(((Decimal(str(min_intervalo_suprimido)) / Decimal("60")) * dias_uteis_periodo).quantize(Decimal("0.01"))) if suprimia_intervalo else 0.0
+                total_not = float((Decimal(str(horas_noturnas_semana)) * semanas_periodo * Decimal("1.142857")).quantize(Decimal("0.01")))
+
+            # Cálculo do adicional de insalubridade / periculosidade
+            insal_mensal = 0.0
+            if "10%" in adicional_cond:
+                insal_mensal = 151.80
+            elif "20%" in adicional_cond:
+                insal_mensal = 303.60
+            elif "40%" in adicional_cond:
+                insal_mensal = 607.20
+            elif "30%" in adicional_cond:
+                insal_mensal = round(sal_registrado * 0.30, 2)
+
+            res_pre = run_labor_calculation({
+                "process_number": f"PRE-PROCESSUAL-{cliente_nome.upper().replace(' ', '_')[:18]}",
+                "worker_name": cliente_nome,
+                "employer_name": empresa_nome,
+                "admission_date": adm_pre,
+                "dismissal_date": dism_pre,
+                "termination_type": motivo_saida,
+                "monthly_divisor": divisor_pre,
+                "base_salary": sal_registrado,
+                "commissions": sal_por_fora,
+                "insalubrity": insal_mensal,
+                "offsets": valor_ja_pago_trct,
+                "inc_saldo_salario": ped_saldo,
+                "saldo_dias": dias_saldo_pre,
+                "inc_aviso_previo": ped_aviso,
+                "inc_13": ped_13_ferias,
+                "inc_ferias": ped_13_ferias,
+                "inc_fgts": ped_fgts,
+                "inc_he50": total_he50 > 0,
+                "he50_hours": total_he50,
+                "he50_pct": 50,
+                "inc_he100": total_he100 > 0,
+                "he100_hours": total_he100,
+                "inc_intrajornada": total_intra > 0,
+                "intrajornada_hours": total_intra,
+                "inc_noturno": total_not > 0,
+                "night_hours": total_not,
+                "night_pct": 20,
+                "apply_inss": aplicar_inss_ir,
+                "apply_irrf": aplicar_inss_ir,
+                "apply_interest": False,
+                "interest_pct": 0.0,
+                "correction_pct": 0.0,
+            })
+            st.session_state.calculations_history.insert(0, res_pre)
+
+            st.success(f"Avaliação Preliminar concluída! Código de auditoria: **{res_pre['audit_id']}**")
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total Apurado dos Pedidos", fmt_brl(res_pre["bruto_atualizado"]))
+            k2.metric("(-) Já Pago no TRCT", fmt_brl(res_pre["abatimentos"]))
+            k3.metric("Diferença a Pedir (Valor da Causa)", fmt_brl(res_pre["liquido_devido"]))
+            k4.metric("Período Considerado", f"{meses_prescricao} meses")
+
+            st.markdown("### Quadro de Pedidos para a Petição Inicial (Art. 840, § 1º da CLT)")
+            df_pre = pd.DataFrame(res_pre["verbas"])
+            for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
+                df_pre[col] = df_pre[col].apply(fmt_brl)
+            st.dataframe(
+                df_pre[["Código", "Verba", "Quantidade", "Percentual", "Base de Cálculo", "Fórmula", "Valor Original", "Reflexos", "Total Apurado"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Checklist automático de validação jurídica antes de protocolar
+            st.markdown("### Checklist de Validação Antes de Protocolar a Ação")
+            st.info(
+                f"- **Prescrição Quinquenal:** Aplicado limite automático de **{meses_prescricao} meses** anteriores ao ajuizamento.\n"
+                f"- **Base Remuneratória:** Salário registrado ({fmt_brl(d_money(sal_registrado))}) + Integrações ({fmt_brl(d_money(sal_por_fora + insal_mensal))}) = **{fmt_brl(d_money(sal_registrado + sal_por_fora + insal_mensal))}**.\n"
+                f"- **Abatimento de valores pagos:** Deduzidos **{fmt_brl(res_pre['abatimentos'])}** já quitados no TRCT para evitar pedido em duplicidade.\n"
+                f"- **Transparência:** Valores apurados pelo motor próprio em Python Decimal exato (estimativa pré-processual auditável)."
+            )
+
+            excel_pre = io.BytesIO()
+            with pd.ExcelWriter(excel_pre, engine="openpyxl") as writer:
+                df_pre.to_excel(writer, index=False, sheet_name="Valor_da_Causa_Inicial")
+            st.download_button(
+                "Baixar Planilha de Pedidos para Petição Inicial (.XLSX)",
+                data=excel_pre.getvalue(),
+                file_name=f"Avaliacao_Preliminar_{res_pre['audit_id']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+elif menu == "Dashboard Executivo":
     st.title("Dashboard Executivo — ED Cálculos Trabalhistas")
     st.info(
         "Transparência técnica: Os cálculos são executados pelo motor matemático próprio em Python Decimal exato. "
@@ -589,208 +790,7 @@ if menu == "Dashboard":
     c3.metric("Versão das Tabelas", TABLES_VERSION)
     c4.metric("Plano Ativo", "Escritório • R$ 399/mês")
 
-elif menu == "Novo Cálculo (Upload Automático)":
-    st.title("Novo Cálculo — Upload Automático e Revisão Humana")
-    st.markdown(
-        "**Fluxo em 3 passos:** `1. Envie os documentos` → `2. Confira e confirme os dados extraídos` → `3. Processe o cálculo`."
-    )
-
-    col_up1, col_up2 = st.columns(2)
-
-    with col_up1:
-        st.subheader("1A. Cartão de Ponto (CSV ou Excel)")
-        st.caption("Colunas esperadas: `Data`, `Dia`, `Entrada1`, `Saida1`, `Entrada2`, `Saida2`, `Feriado` (S/N).")
-        ponto_file = st.file_uploader("Enviar espelho de ponto (.csv ou .xlsx)", type=["csv", "xlsx"])
-
-        if st.button("Carregar Exemplo de Cartão de Ponto (6 dias)"):
-            sample_csv = (
-                "Data;Dia;Entrada1;Saida1;Entrada2;Saida2;Feriado\n"
-                "2026-10-01;QUI;07:56;12:00;13:00;18:18;N\n"
-                "2026-10-02;SEX;08:00;12:00;13:00;18:45;N\n"
-                "2026-10-04;DOM;08:00;12:00;13:00;17:00;S\n"
-                "2026-10-05;SEG;08:00;12:00;12:35;17:35;N\n"
-                "2026-10-06;TER;14:00;18:00;19:00;23:30;N\n"
-                "2026-10-07;QUA;08:02;12:00;13:00;17:04;N\n"
-            )
-            df_sample = pd.read_csv(io.StringIO(sample_csv), sep=";")
-            st.session_state.timecard_result = process_timecard_dataframe(df_sample)
-            st.success("Cartão de ponto de exemplo apurado automaticamente!")
-
-        if ponto_file is not None:
-            if ponto_file.name.endswith(".csv"):
-                raw_txt = ponto_file.getvalue().decode("utf-8", errors="ignore")
-                sep = ";" if ";" in raw_txt.splitlines()[0] else ","
-                df_ponto = pd.read_csv(io.StringIO(raw_txt), sep=sep)
-            else:
-                df_ponto = pd.read_excel(ponto_file)
-            st.session_state.timecard_result = process_timecard_dataframe(df_ponto)
-            st.success(f"Arquivo '{ponto_file.name}' apurado automaticamente!")
-
-    with col_up2:
-        st.subheader("1B. Sentença / Contracheques / TRCT (PDF ou TXT)")
-        st.caption("Usa Gemini exclusivamente para extrair dados estruturados (exige confirmação humana).")
-        doc_file = st.file_uploader("Enviar sentença ou contracheque (.pdf, .txt)", type=["pdf", "txt"])
-
-        if doc_file is not None:
-            if st.button("Extrair Parâmetros do Documento"):
-                try:
-                    mime = "application/pdf" if doc_file.name.endswith(".pdf") else "text/plain"
-                    extracted = extract_document_with_gemini(doc_file.getvalue(), mime)
-                    st.session_state.extracted_ai_data = extracted
-                    st.session_state.extraction_confirmed = False
-                    st.success("Extração concluída! Revise e confirme os campos abaixo.")
-                except Exception as exc:
-                    st.warning(f"Extração via Gemini indisponível neste ambiente ({exc}). Preencha ou revise manualmente abaixo.")
-
-    # Exibição da apuração automática de ponto
-    tc = st.session_state.timecard_result
-    if tc is not None:
-        st.markdown("### Apuração Automática do Cartão de Ponto (Art. 58 §1º CLT + Hora Ficta 52m30s)")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("HE 50% Apuradas", f"{tc['he50_hours']} h")
-        m2.metric("HE 100% (Dom/Fer)", f"{tc['he100_hours']} h")
-        m3.metric("Intrajornada Suprimida", f"{tc['intrajornada_hours']} h")
-        m4.metric("Noturna (Redução Ficta)", f"{tc['night_ficta_hours']} h")
-        st.dataframe(tc["table"], use_container_width=True, hide_index=True)
-
-    # Revisão obrigatória de extração IA
-    ext = st.session_state.extracted_ai_data or {}
-    if ext:
-        st.warning("Confirmação Humana Obrigatória: revise os dados extraídos do documento antes de calcular.")
-        st.json(ext)
-        st.session_state.extraction_confirmed = st.checkbox(
-            "Confirmo que revisei os dados extraídos do documento e assumo responsabilidade técnica.",
-            value=st.session_state.extraction_confirmed,
-        )
-
-    st.divider()
-    st.subheader("2. Conferência dos Parâmetros Jurídicos e Contratuais")
-
-    with st.form("calc_form"):
-        f1, f2, f3 = st.columns(3)
-        process_number = f1.text_input("Número do Processo *", value=ext.get("process_number") or "0001245-88.2025.5.04.0012")
-        worker_name = f2.text_input("Reclamante / Trabalhador *", value=ext.get("worker_name") or "Carlos Eduardo Pereira")
-        employer_name = f3.text_input("Reclamada / Empregador *", value=ext.get("employer_name") or "Metalúrgica Sul Horizonte Ltda.")
-
-        c1, c2, c3, c4 = st.columns(4)
-        adm_date = c1.date_input("Data de Admissão *", value=date(2023, 3, 10))
-        dism_date = c2.date_input("Data de Desligamento *", value=date(2026, 10, 31))
-        termination_type = c3.selectbox(
-            "Modalidade Rescisória *",
-            ["sem_justa_causa", "pedido_demissao", "acordo", "rescisao_indireta", "justa_causa"],
-        )
-        monthly_divisor = c4.number_input("Divisor Mensal *", min_value=1, max_value=300, value=int(ext.get("monthly_divisor") or 220))
-
-        s1, s2, s3, s4 = st.columns(4)
-        base_salary = s1.number_input("Salário-Base (R$) *", min_value=0.0, value=float(ext.get("base_salary") or 3450.00), step=50.0)
-        commissions = s2.number_input("Comissões / Médias (R$)", min_value=0.0, value=float(ext.get("commissions") or 250.00), step=50.0)
-        insalubrity = s3.number_input("Insalubridade / Periculosidade (R$)", min_value=0.0, value=0.0, step=50.0)
-        offsets = s4.number_input("Abatimentos / Valores Pagos (R$)", min_value=0.0, value=0.0, step=50.0)
-
-        j1, j2, j3, j4 = st.columns(4)
-        he50_hours = j1.number_input("Horas Extras 50% (h)", min_value=0.0, value=float(tc["he50_hours"]) if tc else 0.0, step=0.5)
-        he100_hours = j2.number_input("Horas Extras 100% (h)", min_value=0.0, value=float(tc["he100_hours"]) if tc else 0.0, step=0.5)
-        intrajornada_hours = j3.number_input("Intrajornada Suprimida (h)", min_value=0.0, value=float(tc["intrajornada_hours"]) if tc else 0.0, step=0.5)
-        night_hours = j4.number_input("Horas Noturnas Fictas (h)", min_value=0.0, value=float(tc["night_ficta_hours"]) if tc else 0.0, step=0.5)
-
-        v1, v2, v3, v4 = st.columns(4)
-        inc_saldo_salario = v1.checkbox("Saldo de Salário", value=True)
-        saldo_dias = v1.number_input("Dias Saldo Salário", min_value=0, max_value=31, value=31)
-        inc_aviso_previo = v2.checkbox("Aviso-Prévio Indenizado", value=True)
-        inc_13 = v2.checkbox("13º Salário Proporcional", value=True)
-        inc_ferias = v3.checkbox("Férias + 1/3 Constitucional", value=True)
-        inc_fgts = v3.checkbox("FGTS (8%) + Multa", value=True)
-        apply_inss = v4.checkbox("Apurar INSS", value=True)
-        apply_irrf = v4.checkbox("Apurar IRRF", value=True)
-        apply_interest = v4.checkbox("Aplicar Juros e Correção", value=True)
-
-        t1, t2 = st.columns(2)
-        interest_pct = t1.number_input("Juros Acumulados no Período (%)", min_value=0.0, value=3.0, step=0.1)
-        correction_pct = t2.number_input("Correção Monetária no Período (%)", min_value=0.0, value=4.2, step=0.1)
-
-        submitted = st.form_submit_button("3. Processar Cálculo Decimal Auditável", type="primary")
-
-    if submitted:
-        if ext and not st.session_state.extraction_confirmed:
-            st.error("Cálculo bloqueado: marque a caixa de confirmação humana dos dados extraídos do documento.")
-        elif base_salary <= 0 or not process_number.strip() or not worker_name.strip():
-            st.error("Cálculo bloqueado: preencha todos os campos obrigatórios marcados com *.")
-        elif dism_date < adm_date:
-            st.error("Cálculo bloqueado: a data de desligamento não pode ser anterior à data de admissão.")
-        else:
-            calc_res = run_labor_calculation({
-                "process_number": process_number,
-                "worker_name": worker_name,
-                "employer_name": employer_name,
-                "admission_date": adm_date,
-                "dismissal_date": dism_date,
-                "termination_type": termination_type,
-                "monthly_divisor": monthly_divisor,
-                "base_salary": base_salary,
-                "commissions": commissions,
-                "insalubrity": insalubrity,
-                "offsets": offsets,
-                "inc_saldo_salario": inc_saldo_salario,
-                "saldo_dias": saldo_dias,
-                "inc_aviso_previo": inc_aviso_previo,
-                "inc_13": inc_13,
-                "inc_ferias": inc_ferias,
-                "inc_fgts": inc_fgts,
-                "inc_he50": he50_hours > 0,
-                "he50_hours": he50_hours,
-                "he50_pct": 50,
-                "inc_he100": he100_hours > 0,
-                "he100_hours": he100_hours,
-                "inc_intrajornada": intrajornada_hours > 0,
-                "intrajornada_hours": intrajornada_hours,
-                "inc_noturno": night_hours > 0,
-                "night_hours": night_hours,
-                "night_pct": 20,
-                "apply_inss": apply_inss,
-                "apply_irrf": apply_irrf,
-                "apply_interest": apply_interest,
-                "interest_pct": interest_pct,
-                "correction_pct": correction_pct,
-            })
-            st.session_state.calculations_history.insert(0, calc_res)
-            st.success(f"Cálculo processado com sucesso! Identificador de auditoria: {calc_res['audit_id']}")
-
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("Bruto Atualizado", fmt_brl(calc_res["bruto_atualizado"]))
-            r2.metric("INSS + IRRF", fmt_brl(calc_res["inss"] + calc_res["irrf"]))
-            r3.metric("Abatimentos", fmt_brl(calc_res["abatimentos"]))
-            r4.metric("Líquido Apurado", fmt_brl(calc_res["liquido_devido"]))
-
-            st.caption(f"Origem: {calc_res['origin']} | Tabelas: {calc_res['tables_version']}")
-            df_mem = pd.DataFrame(calc_res["verbas"])
-            for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
-                df_mem[col] = df_mem[col].apply(fmt_brl)
-            st.dataframe(df_mem.drop(columns=["Tributável INSS"]), use_container_width=True, hide_index=True)
-
-            # Exportação Excel e JSON auditável
-            excel_buf = io.BytesIO()
-            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                df_mem.to_excel(writer, index=False, sheet_name="Memoria_Calculo")
-            st.download_button(
-                "Baixar Memória de Cálculo (.XLSX)",
-                data=excel_buf.getvalue(),
-                file_name=f"Memoria_{calc_res['audit_id']}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-elif menu == "Meus Cálculos e Relatórios":
-    st.title("Histórico de Cálculos Auditáveis")
-    if not st.session_state.calculations_history:
-        st.info("Nenhum cálculo processado nesta sessão ainda.")
-    else:
-        for item in st.session_state.calculations_history:
-            with st.expander(f"{item['audit_id']} — {item['generated_at']} — Líquido: {fmt_brl(item['liquido_devido'])}"):
-                st.write(f"**Origem:** {item['origin']}")
-                df_v = pd.DataFrame(item["verbas"])
-                for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Correção", "Juros", "Total Apurado"]:
-                    df_v[col] = df_v[col].apply(fmt_brl)
-                st.dataframe(df_v, use_container_width=True, hide_index=True)
-
+elif menu == "Liquidação de Sentença (Upload)":
 elif menu == "Central de Atualizações Legais":
     st.title("Central de Atualizações Legais e Tabelas")
     st.write(f"Versão vigente das tabelas: **{TABLES_VERSION}**")
