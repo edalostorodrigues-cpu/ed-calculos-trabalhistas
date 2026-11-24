@@ -774,7 +774,7 @@ if menu == "Avaliação Preliminar & Auditoria":
             st.dataframe(tc_pre["table"], use_container_width=True, hide_index=True)
 
     trct_paid_list = ext_pre.get("trct_paid_items") or []
-    trct_auto_sum = round(sum(float(i.get("valor", 0)) for i in trct_paid_list), 2)
+    trct_auto_sum = float(round(sum(float(i.get("valor", 0.0)) for i in trct_paid_list), 2))
 
     def parse_iso_date(val: Optional[str], fallback: date) -> date:
         if not val:
@@ -824,7 +824,7 @@ if menu == "Avaliação Preliminar & Auditoria":
         sal_registrado = r1.number_input("Salário-Base Registrado (R$) *", min_value=0.0, value=float(ext_pre.get("base_salary") or 2400.00), step=50.0)
         sal_por_fora = r2.number_input("Comissões / Salário 'Por Fora' (R$/mês)", min_value=0.0, value=float(ext_pre.get("commissions") or 0.0), step=50.0)
         adicional_cond = r3.selectbox("Adicional Devido", adicionais_opts, index=adicionais_opts.index(adic_ext))
-        valor_ja_pago_trct = r4.number_input("Total Já Pago no TRCT (R$)", min_value=0.0, value=trct_auto_sum, step=100.0)
+        valor_ja_pago_trct = r4.number_input("Total Já Pago no TRCT (R$)", min_value=0.0, value=float(trct_auto_sum), step=100.0)
 
         meses_contrato = max(1, ((dism_pre.year - adm_pre.year) * 12 + (dism_pre.month - adm_pre.month)))
         j1, j2, j3, j4 = st.columns(4)
