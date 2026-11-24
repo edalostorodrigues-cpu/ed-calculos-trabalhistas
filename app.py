@@ -254,58 +254,58 @@ def supabase_check_authorization(email: str) -> tuple[bool, str, Dict[str, Any]]
 
 
 def _serialize_calc_for_cloud(calc: Dict[str, Any]) -> Dict[str, Any]:
-# ... existing code ... -->
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
-if "auth_blocked_info" not in st.session_state:
-    st.session_state.auth_blocked_info = None
-if "calculations_history" not in st.session_state:
-    st.session_state.calculations_history = []
-# ... existing code ... -->
-# ==============================================================================
-# 7. PORTAL DE AUTENTICAÇÃO (LOGIN / CADASTRO) E MENU LATERAL
-# ==============================================================================
-if st.session_state.get("auth_blocked_info"):
-    blk = st.session_state["auth_blocked_info"]
-    _, blk_col, _ = st.columns([1, 1.4, 1])
-    with blk_col:
-        st.markdown("## 🔒 Autorização Pendente")
-        with st.container(border=True):
-            st.error(blk.get("reason") or "Acesso não autorizado.")
-            st.markdown(f"**E-mail consultado:** `{blk.get('email', '')}`")
-            if blk.get("plano"):
-                st.caption(f"Plano registrado: {blk.get('plano')} | Validade: {blk.get('validade_ate') or 'Não definida'}")
-            st.info("Após a liberação da sua licença no painel administrativo, clique abaixo para verificar novamente.")
-            b_retry, b_back = st.columns(2)
-            if b_retry.button("Verificar Autorização Novamente", type="primary", use_container_width=True):
-                allowed, reason, lic_data = supabase_check_authorization(blk.get("email", ""))
-                if allowed:
-                    user_prof = blk.get("profile")
-                    st.session_state.auth_blocked_info = None
-                    if user_prof:
-                        st.session_state.auth_user = user_prof
-                        c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(user_prof["email"])
-                        st.session_state.cloud_connected = c_ok
-                        st.session_state.cloud_status_detail = c_msg
-                        st.session_state.calculations_history = c_calcs
-                        st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
-                    st.rerun()
-                else:
-                    st.session_state.auth_blocked_info = {**blk, "reason": reason, **lic_data}
-                    st.rerun()
-            if b_back.button("Voltar para Login", use_container_width=True):
-                st.session_state.auth_blocked_info = None
-                st.rerun()
-    st.stop()
+    return {
+        "audit_id": calc.get("audit_id"),
+        "process_number": calc.get("process_number"),
+        "office_header": calc.get("office_header"),
+        "worker_name": calc.get("worker_name"),
+        "employer_name": calc.get("employer_name"),
+        "role_title": calc.get("role_title"),
+        "admission_date": str(calc.get("admission_date") or ""),
+        "dismissal_date": str(calc.get("dismissal_date") or ""),
+        "termination_type": calc.get("termination_type"),
+        "monthly_divisor": calc.get("monthly_divisor"),
+        "adicional_label": calc.get("adicional_label"),
+        "adicional_pct_label": calc.get("adicional_pct_label"),
+        "bruto_atualizado": str(d_money(calc.get("bruto_atualizado"))),
+        "abatimentos": str(d_money(calc.get("abatimentos"))),
+        "liquido_devido": str(d_money(calc.get("liquido_devido"))),
+        "lawyer_narrative": calc.get("lawyer_narrative") or "",
+        "ai_opinion": calc.get("ai_opinion") or {},
+        "verbas": [
+            {
+                **{k: (str(v_item) if isinstance(v_item, Decimal) else v_item) for k, v_item in v.items()}
+            }
+            for v in (calc.get("verbas") or [])
+        ],
+    }
 
-if not st.session_state.get("auth_user"):
-    _, auth_col, _ = st.columns([1, 1.4, 1])
-    with auth_col:
-        st.markdown("## ⚖️ ED Cálculos Trabalhistas")
-        st.caption("Parecer Pré-Processual, Visão Técnica (NR-15/16) & Liquidação Art. 840 CLT")
-        with st.container(border=True):
-            tab_login, tab_signup = st.tabs(["Entrar na Conta", "Cadastrar Novo Usuário / Escritório"])
 
+def _ensure_session_state() -> None:
+    """Garante a presença de todas as chaves necessárias no st.session_state."""
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+    if "auth_blocked_info" not in st.session_state:
+        st.session_state.auth_blocked_info = None
+    if "calculations_history" not in st.session_state:
+        st.session_state.calculations_history = []
+    if "case_chat_threads" not in st.session_state:
+        st.session_state.case_chat_threads = {"caso_atual": []}
+    if "selected_chat_case_id" not in st.session_state:
+        st.session_state.selected_chat_case_id = "caso_atual"
+    if "extracted_ai_data" not in st.session_state:
+        st.session_state.extracted_ai_data = None
+    if "extraction_confirmed" not in st.session_state:
+        st.session_state.extraction_confirmed = False
+    if "timecard_result" not in st.session_state:
+        st.session_state.timecard_result = None
+    if "cloud_connected" not in st.session_state:
+        st.session_state.cloud_connected = False
+    if "cloud_status_detail" not in st.session_state:
+        st.session_state.cloud_status_detail = ""
+
+
+_ensure_session_state()
             with tab_login:
                 with st.form("login_auth_form"):
                     login_email = st.text_input("E-mail profissional *", placeholder="advogado@escritorio.com.br")
