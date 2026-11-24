@@ -177,137 +177,34 @@ def get_supabase_credentials() -> tuple[Optional[str], Optional[str]]:
     return url_val, key_val
 
 
-def _serialize_calc_for_cloud(calc: Dict[str, Any]) -> Dict[str, Any]:
-    """Converte Decimals e datas do cálculo para JSON seguro no Supabase."""
-    def _conv(obj: Any) -> Any:
-        if isinstance(obj, Decimal):
-            return str(obj)
-        if isinstance(obj, (date, datetime)):
-            return obj.isoformat()
-        if isinstance(obj, dict):
-            return {k: _conv(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_conv(i) for i in obj]
-        return obj
-
-    return _conv(calc)
+def get_admin_email() -> str:
+    """Retorna o e-mail administrador configurado em st.secrets ou ambiente."""
+    try:
+        if "ADMIN_EMAIL" in st.secrets:
+            return str(st.secrets["ADMIN_EMAIL"]).strip().lower()
+    except Exception:
+        pass
+    return os.environ.get("ADMIN_EMAIL", "").strip().lower()
 
 
-def _deserialize_calc_from_cloud(raw_calc: Dict[str, Any]) -> Dict[str, Any]:
-    """Restaura Decimals monetários de um cálculo carregado do Supabase."""
-    calc = dict(raw_calc)
-    for m_key in ("bruto_atualizado", "abatimentos", "liquido_devido", "base_remuneracao"):
-        if m_key in calc:
-            calc[m_key] = d_money(calc[m_key])
-    verbas_restored: List[Dict[str, Any]] = []
-    for v in (calc.get("verbas") or []):
-        v_item = dict(v)
-        for v_key in ("Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"):
-            if v_key in v_item:
-                v_item[v_key] = d_money(v_item[v_key])
-        verbas_restored.append(v_item)
-    calc["verbas"] = verbas_restored
-    return calc
+def supabase_check_authorization(email: str) -> tuple[bool, str, Dict[str, Any]]:
+    """Verifica se o e-mail possui licença ativa e válida na tabela ed_licencas_usuarios."""
+    email_clean = (email or "").strip().lower()
+    if not email_clean:
+        return False, "E-mail não informado para verificação de licença.", {}
 
+    admin_mail = get_admin_email()
+    if admin_mail and email_clean == admin_mail:
+        return True, "Acesso administrador autorizado.", {"status": "ativo", "plano": "admin"}
 
-def _build_supabase_headers(sb_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Monta headers compatíveis tanto com chaves legacy JWT (eyJ...) quanto novas (sb_publishable_...)."""
-    headers: Dict[str, str] = {"apikey": sb_key}
-    if not sb_key.startswith("sb_"):
-        headers["Authorization"] = f"Bearer {sb_key}"
-    if extra:
-        headers.update(extra)
-    return headers
-
-
-def supabase_auth_sign_in(email: str, password: str) -> tuple[bool, Dict[str, Any], str]:
-    """Autentica advogado/usuário via Supabase Auth (E-mail e Senha)."""
     sb_url, sb_key = get_supabase_credentials()
     if not sb_url or not sb_key:
-        return False, {}, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes."
+        # Mantém compatibilidade caso os secrets ainda não tenham sido configurados
+        return True, "Sem bloqueio de licença (Secrets Supabase não configurados).", {"status": "ativo"}
+
     try:
-        endpoint = f"{sb_url}/auth/v1/token?grant_type=password"
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps({"email": email.strip().lower(), "password": password}).encode("utf-8"),
-            headers=_build_supabase_headers(sb_key, {"Content-Type": "application/json"}),
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        user_obj = data.get("user") or {}
-        meta = user_obj.get("user_metadata") or {}
-        profile = {
-            "email": str(user_obj.get("email") or email.strip().lower()),
-            "full_name": str(meta.get("full_name") or email.split("@")[0]),
-            "office_header": str(meta.get("office_header") or "Escritório de Advocacia Trabalhista — Parecer Pré-Processual"),
-            "access_token": str(data.get("access_token") or ""),
-        }
-        return True, profile, "OK"
-    except urllib.error.HTTPError as http_err:
-        err_body = http_err.read().decode("utf-8", errors="ignore")
-        if "Invalid login credentials" in err_body:
-            return False, {}, "E-mail ou senha incorretos."
-        if "Email not confirmed" in err_body:
-            return False, {}, "Confirme seu e-mail antes de entrar (ou desative 'Confirm email' no Supabase Auth)."
-        return False, {}, f"Erro ao entrar ({http_err.code}): {err_body}"
-    except Exception as exc:
-        return False, {}, str(exc)
-
-
-def supabase_auth_sign_up(email: str, password: str, full_name: str, office_header: str) -> tuple[bool, Optional[Dict[str, Any]], str]:
-    """Cadastra novo advogado/escritório via Supabase Auth."""
-    sb_url, sb_key = get_supabase_credentials()
-    if not sb_url or not sb_key:
-        return False, None, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes."
-    try:
-        endpoint = f"{sb_url}/auth/v1/signup"
-        payload = {
-            "email": email.strip().lower(),
-            "password": password,
-            "data": {
-                "full_name": full_name.strip(),
-                "office_header": office_header.strip() or f"{full_name.strip()} — Advocacia Trabalhista",
-            },
-        }
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=_build_supabase_headers(sb_key, {"Content-Type": "application/json"}),
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        user_obj = data.get("user") or data
-        access_tok = str(data.get("access_token") or "")
-        if access_tok:
-            profile = {
-                "email": str(user_obj.get("email") or email.strip().lower()),
-                "full_name": full_name.strip(),
-                "office_header": office_header.strip() or f"{full_name.strip()} — Advocacia Trabalhista",
-                "access_token": access_tok,
-            }
-            return True, profile, "Conta criada e conectada com sucesso!"
-        return True, None, "Conta criada! Verifique seu e-mail para confirmar o cadastro ou faça login na aba 'Entrar'."
-    except urllib.error.HTTPError as http_err:
-        err_body = http_err.read().decode("utf-8", errors="ignore")
-        if "User already registered" in err_body:
-            return False, None, "Este e-mail já está cadastrado. Acesse a aba 'Entrar'."
-        return False, None, f"Erro no cadastro ({http_err.code}): {err_body}"
-    except Exception as exc:
-        return False, None, str(exc)
-
-
-def supabase_load_all_cases(office_email: str) -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, str]]], bool, str]:
-    """Carrega apenas os clientes e históricos de chat pertencentes ao usuário/escritório autenticado."""
-    sb_url, sb_key = get_supabase_credentials()
-    if not sb_url or not sb_key:
-        return [], {}, False, "Secrets SUPABASE_URL/SUPABASE_KEY ausentes"
-    if not office_email:
-        return [], {}, False, "Usuário não autenticado"
-    try:
-        email_q = urllib.parse.quote(office_email.strip().lower(), safe="")
-        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?office_email=eq.{email_q}&select=*&order=updated_at.desc"
+        email_q = urllib.parse.quote(email_clean, safe="")
+        endpoint = f"{sb_url}/rest/v1/ed_licencas_usuarios?email=eq.{email_q}&select=*"
         req = urllib.request.Request(
             endpoint,
             headers=_build_supabase_headers(sb_key, {"Accept": "application/json"}),
@@ -315,193 +212,92 @@ def supabase_load_all_cases(office_email: str) -> tuple[List[Dict[str, Any]], Di
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
             rows = json.loads(resp.read().decode("utf-8"))
-        calcs_out: List[Dict[str, Any]] = []
-        chats_out: Dict[str, List[Dict[str, str]]] = {}
-        for row in (rows or []):
-            payload = row.get("payload_json")
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            if isinstance(payload, dict) and payload.get("audit_id"):
-                restored = _deserialize_calc_from_cloud(payload)
-                calcs_out.append(restored)
-                cid = str(restored["audit_id"])
-                ch = row.get("chat_history_json") or []
-                if isinstance(ch, str):
-                    ch = json.loads(ch)
-                chats_out[cid] = ch if isinstance(ch, list) else []
-        return calcs_out, chats_out, True, "Conectada"
+
+        if not rows:
+            return (
+                False,
+                "Seu e-mail ainda não possui licença ativa. Solicite a liberação ao administrador do sistema.",
+                {"status": "nao_autorizado"},
+            )
+
+        lic = rows[0] or {}
+        status = str(lic.get("status") or "").strip().lower()
+        validade_raw = lic.get("validade_ate")
+
+        if status != "ativo":
+            return (
+                False,
+                f"Sua licença encontra-se com status '{status or 'inativo'}'. Entre em contato para regularizar o acesso.",
+                lic,
+            )
+
+        if validade_raw:
+            try:
+                val_date = datetime.strptime(str(validade_raw)[:10], "%Y-%m-%d").date()
+                if date.today() > val_date:
+                    return (
+                        False,
+                        f"Sua licença expirou em {val_date.strftime('%d/%m/%Y')}. Renove para continuar utilizando.",
+                        lic,
+                    )
+            except ValueError:
+                pass
+
+        return True, "Licença ativa e verificada.", lic
+    except urllib.error.HTTPError as http_err:
+        # Se a tabela ainda não foi criada no banco, não trava o usuário indevidamente
+        if http_err.code in (400, 404):
+            return True, "Tabela de licenças ainda não criada; acesso liberado por padrão.", {}
+        return False, f"Falha ao validar licença na nuvem (HTTP {http_err.code}).", {}
     except Exception as exc:
-        return [], {}, False, str(exc)
+        return False, f"Erro ao consultar autorização: {exc}", {}
 
 
-def supabase_upsert_case(calc: Dict[str, Any], chat_history: List[Dict[str, str]], office_email: str) -> tuple[bool, str]:
-    """Salva ou atualiza (upsert) um cliente e seu histórico de chat isolado por escritório."""
-    sb_url, sb_key = get_supabase_credentials()
-    if not sb_url or not sb_key:
-        return False, "Secrets ausentes"
-    if not office_email:
-        return False, "Usuário não autenticado"
-    try:
-        owner_clean = office_email.strip().lower()
-        client_key = f"{owner_clean}|{str(calc.get('worker_name', '')).strip().lower()}|{str(calc.get('employer_name', '')).strip().lower()}"
-        body = {
-            "client_key": client_key,
-            "office_email": owner_clean,
-            "audit_id": str(calc["audit_id"]),
-            "worker_name": str(calc.get("worker_name") or "Cliente"),
-            "employer_name": str(calc.get("employer_name") or "Empresa"),
-            "liquido_devido": float(d_money(calc.get("liquido_devido", Decimal("0.00")))),
-            "payload_json": _serialize_calc_for_cloud(calc),
-            "chat_history_json": chat_history,
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-        }
-        endpoint = f"{sb_url}/rest/v1/ed_calculos_clientes?on_conflict=client_key"
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers=_build_supabase_headers(
-                sb_key,
-                {
-                    "Content-Type": "application/json",
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
-            ),
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            ok = resp.status in (200, 201, 204)
-            return ok, "OK" if ok else f"HTTP {resp.status}"
-    except Exception as exc:
-        return False, str(exc)
-
-
+def _serialize_calc_for_cloud(calc: Dict[str, Any]) -> Dict[str, Any]:
+# ... existing code ... -->
 if "auth_user" not in st.session_state:
     st.session_state.auth_user = None
+if "auth_blocked_info" not in st.session_state:
+    st.session_state.auth_blocked_info = None
 if "calculations_history" not in st.session_state:
     st.session_state.calculations_history = []
-if "timecard_result" not in st.session_state:
-    st.session_state.timecard_result = None
-if "extracted_ai_data" not in st.session_state:
-    st.session_state.extracted_ai_data = None
-if "extraction_confirmed" not in st.session_state:
-    st.session_state.extraction_confirmed = False
-if "case_chat_threads" not in st.session_state:
-    st.session_state.case_chat_threads = {"caso_atual": []}
-if "selected_chat_case_id" not in st.session_state:
-    st.session_state.selected_chat_case_id = "caso_atual"
-if "cloud_connected" not in st.session_state:
-    st.session_state.cloud_connected = False
-if "cloud_status_detail" not in st.session_state:
-    st.session_state.cloud_status_detail = ""
-
-
-def process_timecard_dataframe(df: pd.DataFrame, daily_standard_minutes: int = 480) -> Dict[str, Any]:
-    """Apura horas extras 50%/100%, intrajornada e hora noturna ficta dia a dia."""
-    rows_out: List[Dict[str, Any]] = []
-    tot_he50_min = 0
-    tot_he100_min = 0
-    tot_intra_min = 0
-    tot_night_ficta_min = 0
-    incomplete_days = 0
-
-    def _night_mins(start_m: Optional[int], end_m: Optional[int]) -> int:
-        if start_m is None or end_m is None or end_m <= start_m:
-            return 0
-        total_n = 0
-        for n_start, n_end in ((0, 300), (1320, 1740)):
-            ov_start = max(start_m, n_start)
-            ov_end = min(end_m, n_end)
-            if ov_end > ov_start:
-                total_n += ov_end - ov_start
-        return total_n
-
-    for _, row in df.iterrows():
-        dt_str = str(row.get("Data") or row.get("data") or "").strip()
-        dia_sem = str(row.get("Dia") or row.get("dia") or "").strip().upper()
-        feriado_flag = str(row.get("Feriado") or row.get("feriado") or "N").strip().upper()
-        is_holiday = feriado_flag == "S" or dia_sem in ("DOM", "DOMINGO", "FERIADO")
-
-        e1 = parse_hhmm(row.get("Entrada1") if "Entrada1" in row else row.get("entrada1"))
-        s1 = parse_hhmm(row.get("Saida1") if "Saida1" in row else row.get("saida1"))
-        e2 = parse_hhmm(row.get("Entrada2") if "Entrada2" in row else row.get("entrada2"))
-        s2 = parse_hhmm(row.get("Saida2") if "Saida2" in row else row.get("saida2"))
-
-        if e1 is None or s1 is None:
-            incomplete_days += 1
-            rows_out.append({
-                "Data": dt_str,
-                "Dia": dia_sem or "-",
-                "HE 50% (h)": 0.0,
-                "HE 100% (h)": 0.0,
-                "Intrajornada (h)": 0.0,
-                "Noturna Ficta (h)": 0.0,
-                "Status": "Batida incompleta (revisar)",
-            })
-            continue
-
-        p1_end = s1 + 1440 if s1 < e1 else s1
-        worked_1 = max(0, p1_end - e1)
-        night_1 = _night_mins(e1, p1_end)
-
-        worked_2 = 0
-        night_2 = 0
-        break_min = 0
-
-        if e2 is not None and s2 is not None:
-            p2_start = e2 + 1440 if e2 < p1_end else e2
-            p2_end = s2 + 1440 if s2 < p2_start else s2
-            break_min = max(0, p2_start - p1_end)
-            worked_2 = max(0, p2_end - p2_start)
-            night_2 = _night_mins(p2_start, p2_end)
-
-        day_worked = worked_1 + worked_2
-        night_clock = night_1 + night_2
-
-        intra_sup = 0
-        if day_worked > 360 and break_min < 60:
-            intra_sup = 60 - break_min
-        elif 240 < day_worked <= 360 and break_min < 15:
-            intra_sup = 15 - break_min
-
-        he50 = 0
-        he100 = 0
-        if is_holiday:
-            he100 = day_worked
-        else:
-            diff = day_worked - daily_standard_minutes
-            if diff > 10:
-                he50 = diff
-
-        night_ficta = int(round(night_clock * (Decimal("60") / Decimal("52.5"))))
-
-        tot_he50_min += he50
-        tot_he100_min += he100
-        tot_intra_min += intra_sup
-        tot_night_ficta_min += night_ficta
-
-        rows_out.append({
-            "Data": dt_str,
-            "Dia": dia_sem,
-            "HE 50% (h)": round(he50 / 60.0, 2),
-            "HE 100% (h)": round(he100 / 60.0, 2),
-            "Intrajornada (h)": round(intra_sup / 60.0, 2),
-            "Noturna Ficta (h)": round(night_ficta / 60.0, 2),
-            "Status": "Intrajornada suprimida" if intra_sup > 0 else "Apurado",
-        })
-
-    return {
-        "table": pd.DataFrame(rows_out),
-        "he50_hours": round(tot_he50_min / 60.0, 2),
-        "he100_hours": round(tot_he100_min / 60.0, 2),
-        "intrajornada_hours": round(tot_intra_min / 60.0, 2),
-        "night_ficta_hours": round(tot_night_ficta_min / 60.0, 2),
-        "incomplete_days": incomplete_days,
-    }
-
-
+# ... existing code ... -->
 # ==============================================================================
 # 7. PORTAL DE AUTENTICAÇÃO (LOGIN / CADASTRO) E MENU LATERAL
 # ==============================================================================
+if st.session_state.get("auth_blocked_info"):
+    blk = st.session_state["auth_blocked_info"]
+    _, blk_col, _ = st.columns([1, 1.4, 1])
+    with blk_col:
+        st.markdown("## 🔒 Autorização Pendente")
+        with st.container(border=True):
+            st.error(blk.get("reason") or "Acesso não autorizado.")
+            st.markdown(f"**E-mail consultado:** `{blk.get('email', '')}`")
+            if blk.get("plano"):
+                st.caption(f"Plano registrado: {blk.get('plano')} | Validade: {blk.get('validade_ate') or 'Não definida'}")
+            st.info("Após a liberação da sua licença no painel administrativo, clique abaixo para verificar novamente.")
+            b_retry, b_back = st.columns(2)
+            if b_retry.button("Verificar Autorização Novamente", type="primary", use_container_width=True):
+                allowed, reason, lic_data = supabase_check_authorization(blk.get("email", ""))
+                if allowed:
+                    user_prof = blk.get("profile")
+                    st.session_state.auth_blocked_info = None
+                    if user_prof:
+                        st.session_state.auth_user = user_prof
+                        c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(user_prof["email"])
+                        st.session_state.cloud_connected = c_ok
+                        st.session_state.cloud_status_detail = c_msg
+                        st.session_state.calculations_history = c_calcs
+                        st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
+                    st.rerun()
+                else:
+                    st.session_state.auth_blocked_info = {**blk, "reason": reason, **lic_data}
+                    st.rerun()
+            if b_back.button("Voltar para Login", use_container_width=True):
+                st.session_state.auth_blocked_info = None
+                st.rerun()
+    st.stop()
+
 if not st.session_state.get("auth_user"):
     _, auth_col, _ = st.columns([1, 1.4, 1])
     with auth_col:
@@ -523,7 +319,16 @@ if not st.session_state.get("auth_user"):
                         with st.spinner("Autenticando no Supabase..."):
                             ok_auth, user_prof, auth_msg = supabase_auth_sign_in(login_email, login_pass)
                         if ok_auth:
-                            st.session_state.auth_user = user_prof
+                            allowed, reason, lic_data = supabase_check_authorization(user_prof["email"])
+                            if not allowed:
+                                st.session_state.auth_blocked_info = {
+                                    "email": user_prof["email"],
+                                    "reason": reason,
+                                    "profile": user_prof,
+                                    **lic_data,
+                                }
+                                st.rerun()
+                            st.session_state.auth_user = {**user_prof, "license": lic_data}
                             c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(user_prof["email"])
                             st.session_state.cloud_connected = c_ok
                             st.session_state.cloud_status_detail = c_msg
@@ -551,7 +356,16 @@ if not st.session_state.get("auth_user"):
                         with st.spinner("Criando conta do escritório..."):
                             ok_reg, new_prof, reg_msg = supabase_auth_sign_up(reg_email, reg_pass, reg_name, reg_office)
                         if ok_reg and new_prof:
-                            st.session_state.auth_user = new_prof
+                            allowed, reason, lic_data = supabase_check_authorization(new_prof["email"])
+                            if not allowed:
+                                st.session_state.auth_blocked_info = {
+                                    "email": new_prof["email"],
+                                    "reason": reason,
+                                    "profile": new_prof,
+                                    **lic_data,
+                                }
+                                st.rerun()
+                            st.session_state.auth_user = {**new_prof, "license": lic_data}
                             c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(new_prof["email"])
                             st.session_state.cloud_connected = c_ok
                             st.session_state.cloud_status_detail = c_msg
@@ -567,9 +381,23 @@ if not st.session_state.get("auth_user"):
 current_user: Dict[str, Any] = st.session_state.auth_user
 current_office_email: str = str(current_user.get("email") or "").strip().lower()
 
+# Revalida licença periodicamente durante a sessão ativa
+still_allowed, still_reason, still_lic = supabase_check_authorization(current_office_email)
+if not still_allowed:
+    st.session_state.auth_user = None
+    st.session_state.auth_blocked_info = {
+        "email": current_office_email,
+        "reason": still_reason,
+        **still_lic,
+    }
+    st.rerun()
+
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
     st.caption(f"👤 {current_user.get('full_name', 'Advogado')} ({current_office_email})")
+    lic_meta = current_user.get("license") or {}
+    if lic_meta.get("validade_ate"):
+        st.caption(f"🔑 Licença válida até: {str(lic_meta['validade_ate'])[:10]}")
     st.divider()
     menu = st.radio(
         "Navegação",
