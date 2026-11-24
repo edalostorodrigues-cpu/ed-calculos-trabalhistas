@@ -342,6 +342,27 @@ def get_gemini_api_key() -> Optional[str]:
     return env_val or None
 
 
+def generate_gemini_with_fallback(client: Any, contents: List[Any], config: Any) -> Any:
+    """Chama o modelo Gemini ativo com fallback automático caso algum ID seja descontinuado."""
+    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash"]
+    last_err: Optional[Exception] = None
+    for model_name in models_to_try:
+        try:
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            last_err = exc
+            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("Nenhum modelo Gemini disponível.")
+
+
 def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Executa análise jurídica, técnica (NR-15/NR-16) e documental com Gemini."""
     api_key = get_gemini_api_key()
@@ -384,8 +405,8 @@ def analyze_case_with_gemini(lawyer_narrative: str, files_payload: List[Dict[str
         contents.append(f"=== DOCUMENTO ANEXADO: {item['name']} ===")
         contents.append(types.Part.from_bytes(data=item["bytes"], mime_type=item["mime"]))
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = generate_gemini_with_fallback(
+        client=client,
         contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -455,8 +476,8 @@ def chat_with_case_strategist(
 
     full_prompt = "\n".join(context_blocks) + "\n" + "\n".join(conversation_text)
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = generate_gemini_with_fallback(
+        client=client,
         contents=[full_prompt],
         config=types.GenerateContentConfig(temperature=0.3),
     )
@@ -920,7 +941,7 @@ def build_complete_excel_bytes(calc: Dict[str, Any]) -> bytes:
 
 
 # ==============================================================================
-# 7. MENU LATERAL
+# 7. MENU LATERAL + CHAT CONTÍNUO COM A IA
 # ==============================================================================
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
@@ -935,6 +956,51 @@ with st.sidebar:
     )
     st.divider()
     st.caption(f"Tabelas ativas: `{TABLES_VERSION}`")
+    st.divider()
+
+    c_sb_title, c_sb_clr = st.columns([3, 1.3])
+    c_sb_title.markdown("### 💬 Chat Jurídico IA")
+    if c_sb_clr.button("Limpar", key="sb_clear_chat", use_container_width=True):
+        st.session_state.case_chat_history = []
+        st.rerun()
+
+    st.caption("Converse continuamente sobre teses, provas, riscos ou peça trechos da inicial:")
+
+    chat_box = st.container(height=340, border=True)
+    with chat_box:
+        if not st.session_state.case_chat_history:
+            st.caption("Envie uma mensagem abaixo para iniciar a conversa com a IA sobre este caso...")
+        for chat_msg in st.session_state.case_chat_history:
+            with st.chat_message(chat_msg["role"]):
+                st.markdown(chat_msg["content"])
+
+    with st.form("sidebar_chat_form", clear_on_submit=True):
+        sb_user_msg = st.text_area(
+            "Sua mensagem:",
+            placeholder="Ex.: Vale pedir rescisão indireta? Ou redija o tópico de insalubridade...",
+            height=78,
+            label_visibility="collapsed",
+        )
+        sb_send_btn = st.form_submit_button("Enviar Mensagem", type="primary", use_container_width=True)
+
+    if sb_send_btn and sb_user_msg.strip():
+        st.session_state.case_chat_history.append({"role": "user", "content": sb_user_msg.strip()})
+        latest_calc_ctx = st.session_state.calculations_history[0] if st.session_state.calculations_history else None
+        narrative_ctx = str(st.session_state.get("lawyer_narrative_box") or "")
+        ext_ctx = st.session_state.extracted_ai_data or {}
+        try:
+            with st.spinner("IA respondendo..."):
+                ai_reply = chat_with_case_strategist(
+                    user_message=sb_user_msg.strip(),
+                    chat_history=st.session_state.case_chat_history[:-1],
+                    lawyer_narrative=narrative_ctx,
+                    extracted_data=ext_ctx,
+                    latest_calc=latest_calc_ctx,
+                )
+            st.session_state.case_chat_history.append({"role": "assistant", "content": ai_reply})
+            st.rerun()
+        except Exception as chat_exc:
+            st.error(f"Erro no chat: {chat_exc}")
 
 
 # ==============================================================================
@@ -1064,51 +1130,6 @@ if menu == "Avaliação Preliminar & Auditoria":
                 "Confirmo que revisei o parecer e os parâmetros extraídos antes de fechar os valores",
                 value=st.session_state.extraction_confirmed,
             )
-
-    with st.container(border=True):
-        c_chat_hdr, c_chat_clr = st.columns([4, 1])
-        c_chat_hdr.subheader("Chat Estratégico com a IA sobre o Caso (Teses, Dúvidas e Novos Fatos)")
-        if c_chat_clr.button("Limpar Chat", use_container_width=True):
-            st.session_state.case_chat_history = []
-            st.rerun()
-
-        st.caption(
-            "Converse livremente com a IA para discutir riscos probatórios, incluir fatos novos lembrados pelo cliente, "
-            "pedir perguntas para audiência ou redigir tópicos completos da Petição Inicial."
-        )
-
-        q1, q2, q3 = st.columns(3)
-        prompt_atalho = None
-        if q1.button("Analisar Riscos e Provas Necessárias", use_container_width=True):
-            prompt_atalho = "Analise os riscos probatórios deste caso e liste exatamente quais provas documentais e testemunhais precisamos reunir antes de ajuizar."
-        if q2.button("Redigir Tópicos Completos da Inicial", use_container_width=True):
-            prompt_atalho = "Redija os tópicos jurídicos completos (Dos Fatos e Do Direito, com base na CLT, Súmulas/OJs do TST e NRs aplicáveis) prontos para eu colar na Petição Inicial."
-        if q3.button("Gerar Perguntas para Audiência", use_container_width=True):
-            prompt_atalho = "Elabore um roteiro estratégico de perguntas para o depoimento pessoal do preposto da reclamada e para nossas testemunhas em audiência de instrução."
-
-        for chat_msg in st.session_state.case_chat_history:
-            with st.chat_message(chat_msg["role"]):
-                st.markdown(chat_msg["content"])
-
-        user_chat_input = st.chat_input("Digite sua dúvida, tese ou fato novo do cliente para discutir com a IA...")
-        final_prompt = prompt_atalho or user_chat_input
-
-        if final_prompt:
-            st.session_state.case_chat_history.append({"role": "user", "content": final_prompt})
-            latest_calc_ctx = st.session_state.calculations_history[0] if st.session_state.calculations_history else None
-            try:
-                with st.spinner("Analisando juridicamente sua pergunta com base nos dados do caso..."):
-                    ai_reply = chat_with_case_strategist(
-                        user_message=final_prompt,
-                        chat_history=st.session_state.case_chat_history[:-1],
-                        lawyer_narrative=lawyer_narrative,
-                        extracted_data=ext_pre,
-                        latest_calc=latest_calc_ctx,
-                    )
-                st.session_state.case_chat_history.append({"role": "assistant", "content": ai_reply})
-                st.rerun()
-            except Exception as chat_exc:
-                st.error(f"Erro ao consultar o chat estratégico: {chat_exc}")
 
     if tc_pre is not None:
         with st.expander("Ver Espelho de Ponto Apurado Dia a Dia (Tolerância CLT + Redução Ficta)"):
