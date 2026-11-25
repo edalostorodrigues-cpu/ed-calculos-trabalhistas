@@ -26,381 +26,24 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. CONFIGURAÇÃO DA PÁGINA E ESTILO EXECUTIVO
+# 5. PORTAL DE LOGIN E CADASTRO (DESABILITADO TEMPORARIAMENTE PARA DESENVOLVIMENTO)
 # ==============================================================================
-st.set_page_config(
-    page_title="ED Cálculos Trabalhistas",
-    page_icon="⚖️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+REQUIRE_LOGIN = False  # Altere para True quando quiser reativar o bloqueio de login/licença
 
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #F4F6F9; color: #0F2537; }
-    section[data-testid="stSidebar"] { background-color: #0B1B2B; color: #FFFFFF; }
-    section[data-testid="stSidebar"] * { color: #F8FAFC; }
-    section[data-testid="stSidebar"] button {
-        background-color: #16324A !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2A4F70 !important;
+if st.session_state.auth_user is None and not REQUIRE_LOGIN:
+    st.session_state.auth_user = {
+        "email": get_admin_email() or "e.dalostorodrigues@gmail.com",
+        "full_name": "Dr. Eduardo Dalosto (Modo Desenvolvimento)",
+        "office_header": "Dalosto Advocacia Trabalhista — Parecer Pré-Processual & Liquidação",
+        "license": {"status": "ativo", "plano": "admin_dev", "validade_ate": "2099-12-31"},
     }
-    section[data-testid="stSidebar"] button:hover {
-        background-color: #1E4363 !important;
-        border-color: #60A5FA !important;
-    }
-    div[data-testid="stMetric"] {
-        background-color: #FFFFFF;
-        border: 1px solid #E2E8F0;
-        border-radius: 12px;
-        padding: 14px 18px;
-        box-shadow: 0 1px 2px rgba(15, 37, 55, 0.04);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    c_calcs, c_chats, c_ok, c_msg = supabase_load_all_cases(st.session_state.auth_user["email"])
+    st.session_state.cloud_connected = c_ok
+    st.session_state.cloud_status_detail = c_msg
+    st.session_state.calculations_history = c_calcs
+    st.session_state.case_chat_threads = {"caso_atual": [], **c_chats}
 
-
-# ==============================================================================
-# 2. TABELAS HISTÓRICAS VERSIONADAS E UTILITÁRIOS DECIMAIS EXATOS
-# ==============================================================================
-TABLES_VERSION = "2026.11-estavel"
-CENT = Decimal("0.01")
-
-HISTORICAL_MIN_WAGE: List[tuple[date, Decimal]] = [
-    (date(2026, 1, 1), Decimal("1621.00")),
-    (date(2025, 1, 1), Decimal("1518.00")),
-    (date(2024, 1, 1), Decimal("1412.00")),
-    (date(2023, 5, 1), Decimal("1320.00")),
-    (date(2023, 1, 1), Decimal("1302.00")),
-    (date(2022, 1, 1), Decimal("1212.00")),
-    (date(2021, 1, 1), Decimal("1100.00")),
-]
-
-
-def d_money(val: Any) -> Decimal:
-    """Converte qualquer entrada numérica/texto para Decimal exato com 2 casas."""
-    if val is None:
-        return Decimal("0.00")
-    if isinstance(val, Decimal):
-        return val.quantize(CENT, rounding=ROUND_HALF_UP)
-    try:
-        s = str(val).strip().replace("R$", "").replace(" ", "")
-        if not s:
-            return Decimal("0.00")
-        if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")
-        elif "," in s:
-            s = s.replace(",", ".")
-        return Decimal(s).quantize(CENT, rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError):
-        return Decimal("0.00")
-
-
-def f_float(val: Any, default: float = 0.0) -> float:
-    """Converte valor opcional (incluindo None vindo da IA) para float seguro."""
-    if val is None:
-        return default
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
-def f_int(val: Any, default: int = 0) -> int:
-    """Converte valor opcional (incluindo None vindo da IA) para int seguro."""
-    if val is None:
-        return default
-    try:
-        return int(round(float(val)))
-    except (TypeError, ValueError):
-        return default
-
-
-def fmt_brl(val: Any) -> str:
-    """Formata Decimal ou float no padrão monetário brasileiro."""
-    dec = d_money(val)
-    sign = "-" if dec < Decimal("0.00") else ""
-    abs_val = abs(dec)
-    inteiro, frac = f"{abs_val:.2f}".split(".")
-    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
-    return f"{sign}R$ {inteiro_fmt},{frac}"
-
-
-def get_historical_min_wage(ref_date: date) -> Decimal:
-    """Retorna o salário mínimo nacional vigente na data de referência."""
-    for start_dt, mw in HISTORICAL_MIN_WAGE:
-        if ref_date >= start_dt:
-            return mw
-    return HISTORICAL_MIN_WAGE[-1][1]
-
-
-def parse_hhmm(raw: Any) -> Optional[int]:
-    """Converte string HH:MM para minutos inteiros desde 00:00."""
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s or ":" not in s:
-        return None
-    parts = s.split(":")
-    if len(parts) < 2:
-        return None
-    try:
-        h, m = int(parts[0]), int(parts[1])
-        if 0 <= h <= 29 and 0 <= m <= 59:
-            return h * 60 + m
-    except ValueError:
-        return None
-    return None
-
-
-# ==============================================================================
-# 3. CONEXÃO NA NUVEM (SUPABASE REST NATIVO) E ESTADO DA SESSÃO
-# ==============================================================================
-def get_supabase_credentials() -> tuple[Optional[str], Optional[str]]:
-    """Obtém SUPABASE_URL e SUPABASE_KEY via st.secrets ou variáveis de ambiente."""
-    url_val: Optional[str] = None
-    key_val: Optional[str] = None
-    try:
-        if "SUPABASE_URL" in st.secrets:
-            url_val = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
-        if "SUPABASE_KEY" in st.secrets:
-            key_val = str(st.secrets["SUPABASE_KEY"]).strip()
-    except Exception:
-        pass
-    if not url_val:
-        url_val = os.environ.get("SUPABASE_URL", "").strip().rstrip("/") or None
-    if not key_val:
-        key_val = os.environ.get("SUPABASE_KEY", "").strip() or None
-    return url_val, key_val
-
-
-def get_admin_email() -> str:
-    """Retorna o e-mail administrador configurado em st.secrets ou ambiente."""
-    try:
-        if "ADMIN_EMAIL" in st.secrets:
-            return str(st.secrets["ADMIN_EMAIL"]).strip().lower()
-    except Exception:
-        pass
-    return os.environ.get("ADMIN_EMAIL", "").strip().lower()
-
-
-def supabase_check_authorization(email: str) -> tuple[bool, str, Dict[str, Any]]:
-    """Verifica se o e-mail possui licença ativa e válida na tabela ed_licencas_usuarios."""
-    email_clean = (email or "").strip().lower()
-    if not email_clean:
-        return False, "E-mail não informado para verificação de licença.", {}
-
-    admin_mail = get_admin_email()
-    if admin_mail and email_clean == admin_mail:
-        return True, "Acesso administrador autorizado.", {"status": "ativo", "plano": "admin"}
-
-    sb_url, sb_key = get_supabase_credentials()
-    if not sb_url or not sb_key:
-        # Mantém compatibilidade caso os secrets ainda não tenham sido configurados
-        return True, "Sem bloqueio de licença (Secrets Supabase não configurados).", {"status": "ativo"}
-
-    try:
-        email_q = urllib.parse.quote(email_clean, safe="")
-        endpoint = f"{sb_url}/rest/v1/ed_licencas_usuarios?email=eq.{email_q}&select=*"
-        req = urllib.request.Request(
-            endpoint,
-            headers=_build_supabase_headers(sb_key, {"Accept": "application/json"}),
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            rows = json.loads(resp.read().decode("utf-8"))
-
-        if not rows:
-            return (
-                False,
-                "Seu e-mail ainda não possui licença ativa. Solicite a liberação ao administrador do sistema.",
-                {"status": "nao_autorizado"},
-            )
-
-        lic = rows[0] or {}
-        status = str(lic.get("status") or "").strip().lower()
-        validade_raw = lic.get("validade_ate")
-
-        if status != "ativo":
-            return (
-                False,
-                f"Sua licença encontra-se com status '{status or 'inativo'}'. Entre em contato para regularizar o acesso.",
-                lic,
-            )
-
-        if validade_raw:
-            try:
-                val_date = datetime.strptime(str(validade_raw)[:10], "%Y-%m-%d").date()
-                if date.today() > val_date:
-                    return (
-                        False,
-                        f"Sua licença expirou em {val_date.strftime('%d/%m/%Y')}. Renove para continuar utilizando.",
-                        lic,
-                    )
-            except ValueError:
-                pass
-
-        return True, "Licença ativa e verificada.", lic
-    except urllib.error.HTTPError as http_err:
-        # Se a tabela ainda não foi criada no banco, não trava o usuário indevidamente
-        if http_err.code in (400, 404):
-            return True, "Tabela de licenças ainda não criada; acesso liberado por padrão.", {}
-        return False, f"Falha ao validar licença na nuvem (HTTP {http_err.code}).", {}
-    except Exception as exc:
-        return False, f"Erro ao consultar autorização: {exc}", {}
-
-
-def _serialize_calc_for_cloud(calc: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "audit_id": calc.get("audit_id"),
-        "process_number": calc.get("process_number"),
-        "office_header": calc.get("office_header"),
-        "worker_name": calc.get("worker_name"),
-        "employer_name": calc.get("employer_name"),
-        "role_title": calc.get("role_title"),
-        "admission_date": str(calc.get("admission_date") or ""),
-        "dismissal_date": str(calc.get("dismissal_date") or ""),
-        "termination_type": calc.get("termination_type"),
-        "monthly_divisor": calc.get("monthly_divisor"),
-        "adicional_label": calc.get("adicional_label"),
-        "adicional_pct_label": calc.get("adicional_pct_label"),
-        "bruto_atualizado": str(d_money(calc.get("bruto_atualizado"))),
-        "abatimentos": str(d_money(calc.get("abatimentos"))),
-        "liquido_devido": str(d_money(calc.get("liquido_devido"))),
-        "lawyer_narrative": calc.get("lawyer_narrative") or "",
-        "ai_opinion": calc.get("ai_opinion") or {},
-        "verbas": [
-            {
-                **{k: (str(v_item) if isinstance(v_item, Decimal) else v_item) for k, v_item in v.items()}
-            }
-            for v in (calc.get("verbas") or [])
-        ],
-    }
-
-
-def _ensure_session_state() -> None:
-    """Garante a presença de todas as chaves necessárias no st.session_state."""
-    if "auth_user" not in st.session_state:
-        st.session_state.auth_user = None
-    if "auth_blocked_info" not in st.session_state:
-        st.session_state.auth_blocked_info = None
-    if "calculations_history" not in st.session_state:
-        st.session_state.calculations_history = []
-    if "case_chat_threads" not in st.session_state:
-        st.session_state.case_chat_threads = {"caso_atual": []}
-    if "selected_chat_case_id" not in st.session_state:
-        st.session_state.selected_chat_case_id = "caso_atual"
-    if "extracted_ai_data" not in st.session_state:
-        st.session_state.extracted_ai_data = None
-    if "extraction_confirmed" not in st.session_state:
-        st.session_state.extraction_confirmed = False
-    if "timecard_result" not in st.session_state:
-        st.session_state.timecard_result = None
-    if "cloud_connected" not in st.session_state:
-        st.session_state.cloud_connected = False
-    if "cloud_status_detail" not in st.session_state:
-        st.session_state.cloud_status_detail = ""
-    if "sentence_ai_data" not in st.session_state:
-        st.session_state.sentence_ai_data = None
-    if "sentence_confirmed" not in st.session_state:
-        st.session_state.sentence_confirmed = False
-    if "sentence_timecard_result" not in st.session_state:
-        st.session_state.sentence_timecard_result = None
-
-
-_ensure_session_state()
-
-
-# ==============================================================================
-# 4. EXTRATOR IA ESPECIALIZADO EM LIQUIDAÇÃO DE SENTENÇA (PROCESSO JULGADO)
-# ==============================================================================
-class SentenceLiquidationSchema(BaseModel):
-    process_number: Optional[str] = Field(None, description="Número completo do processo trabalhista (CNJ)")
-    vara_trabalho: Optional[str] = Field(None, description="Vara do Trabalho / Tribunal")
-    worker_name: Optional[str] = Field(None, description="Nome do Reclamante / Exequente")
-    employer_name: Optional[str] = Field(None, description="Nome da Reclamada / Executada")
-    role_title: Optional[str] = Field(None, description="Cargo ou função reconhecida na sentença")
-    admission_date: Optional[str] = Field(None, description="Data de admissão reconhecida (YYYY-MM-DD)")
-    dismissal_date: Optional[str] = Field(None, description="Data de demissão/rescisão reconhecida (YYYY-MM-DD)")
-    termination_type: Optional[str] = Field(None, description="sem_justa_causa, rescisao_indireta, pedido_demissao, acordo ou justa_causa")
-    base_salary: Optional[float] = Field(None, description="Salário-base reconhecido para cálculo")
-    commissions: Optional[float] = Field(None, description="Média de comissões ou salário por fora integrado")
-    monthly_divisor: Optional[int] = Field(220, description="Divisor fixado na sentença (ex: 220, 200, 180)")
-    dispositivo_resumo: Optional[str] = Field(None, description="Resumo fiel do dispositivo da sentença (apenas verbas DEFERIDAS)")
-    verbas_deferidas: List[str] = Field(default_factory=list, description="Lista objetiva das verbas condenadas na sentença")
-    verbas_indeferidas: List[str] = Field(default_factory=list, description="Lista objetiva das verbas julgadas improcedentes (excluir do cálculo)")
-    parametros_liquidacao: Optional[str] = Field(None, description="Critérios fixados: prescrição quinquenal, dedução de valores pagos, reflexos, base de cálculo, juros/correção (ADC 58 STF)")
-    divergencias_calculo_adverso: Optional[str] = Field(None, description="Se houver planilha da empresa/perito anexada, apontar erros ou omissões encontradas")
-    adicional_sugerido: Optional[str] = Field(None, description="Nenhum, Insalubridade (sobre Salário Mínimo) ou Periculosidade (sobre Salário-Base)")
-    adicional_percentual_sugerido: Optional[float] = Field(0.0, description="Percentual deferido (10, 20, 30 ou 40)")
-    weekly_he50_hours: Optional[float] = Field(0.0, description="Horas extras 50% semanais deferidas (se não houver cartão de ponto)")
-    monthly_sundays_worked: Optional[int] = Field(0, description="Domingos/feriados mensais deferidos (100%)")
-    suppressed_break_minutes: Optional[int] = Field(0, description="Minutos diários de intervalo intrajornada deferidos")
-    weekly_night_hours: Optional[float] = Field(0.0, description="Horas noturnas semanais deferidas")
-    trct_paid_total: Optional[float] = Field(0.0, description="Total de valores já pagos cuja dedução foi autorizada na sentença")
-    fgts_nao_depositado_contrato: Optional[float] = Field(0.0, description="Diferenças de FGTS deferidas")
-    meses_estabilidade_restantes: Optional[int] = Field(0, description="Meses de indenização substitutiva de estabilidade deferidos")
-    restituicao_descontos: Optional[float] = Field(0.0, description="Devolução de descontos indevidos deferida")
-    sugerir_saldo_salario: Optional[bool] = Field(False, description="True se saldo de salário foi deferido")
-    sugerir_aviso_previo: Optional[bool] = Field(False, description="True se aviso-prévio foi deferido")
-    sugerir_13_e_ferias: Optional[bool] = Field(False, description="True se 13º e/ou férias + 1/3 foram deferidos")
-    sugerir_fgts_e_multa: Optional[bool] = Field(False, description="True se FGTS + multa rescisória foram deferidos")
-    multa_fgts_percentual_sugerido: Optional[float] = Field(40.0, description="Percentual da multa do FGTS deferida (40 ou 20)")
-    sugerir_multa_477: Optional[bool] = Field(False, description="True se multa do art. 477 CLT foi deferida")
-    sugerir_multa_467: Optional[bool] = Field(False, description="True se multa do art. 467 CLT foi deferida")
-    minuta_peticao_liquidacao: Optional[str] = Field(None, description="Esboço de petição de apresentação de cálculos de liquidação de sentença (Art. 879 CLT)")
-
-
-def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Lê a cópia integral do processo / sentença transitada em julgado e extrai exclusivamente o comando condenatório."""
-    if not GENAI_AVAILABLE:
-        raise RuntimeError("Biblioteca google-genai não instalada.")
-    api_key = ""
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
-    except Exception:
-        pass
-    if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY não configurada.")
-
-    client = genai.Client(api_key=api_key)
-    prompt = (
-        "Você é um Perito Contábil e Calculista Judicial Trabalhista especialista em Liquidação de Sentença (Art. 879 da CLT).\n"
-        "Analise atentamente a cópia do processo/sentença transitada em julgado e eventuais planilhas/documentos anexados.\n"
-        "REGRAS ESTRITAS:\n"
-        "1. Leia o DISPOSITIVO da sentença e separe rigorosamente o que foi DEFERIDO do que foi IMPROCEDENTE.\n"
-        "2. Marque como True APENAS as verbas expressamente condenadas na sentença (não inclua pedidos negados).\n"
-        "3. Extraia datas, salário-base, divisor, adicionais, prescrição e autorização de dedução de parcelas pagas.\n"
-        "4. Se houver planilha da empresa ou perito anexada, aponte eventuais divergências em 'divergencias_calculo_adverso'.\n"
-        f"\nObservações do advogado exequente: {notes or 'Nenhuma observação adicional.'}"
-    )
-
-    contents: List[Any] = [prompt]
-    for f in files:
-        contents.append(types.Part.from_bytes(data=f["bytes"], mime_type=f["mime"]))
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=SentenceLiquidationSchema,
-            temperature=0.0,
-        ),
-    )
-    return json.loads(response.text)
-
-
-# ==============================================================================
-# 5. PORTAL DE LOGIN E CADASTRO (COM CONTROLE DE LICENÇA)
-# ==============================================================================
-if st.session_state.auth_user is None:
+if st.session_state.auth_user is None and REQUIRE_LOGIN:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas — Acesso ao Sistema")
     if st.session_state.auth_blocked_info:
         blk = st.session_state.auth_blocked_info
@@ -490,16 +133,17 @@ if st.session_state.auth_user is None:
 current_user: Dict[str, Any] = st.session_state.auth_user
 current_office_email: str = str(current_user.get("email") or "").strip().lower()
 
-# Revalida licença periodicamente durante a sessão ativa
-still_allowed, still_reason, still_lic = supabase_check_authorization(current_office_email)
-if not still_allowed:
-    st.session_state.auth_user = None
-    st.session_state.auth_blocked_info = {
-        "email": current_office_email,
-        "reason": still_reason,
-        **still_lic,
-    }
-    st.rerun()
+# Revalida licença periodicamente durante a sessão ativa apenas quando REQUIRE_LOGIN=True
+if REQUIRE_LOGIN:
+    still_allowed, still_reason, still_lic = supabase_check_authorization(current_office_email)
+    if not still_allowed:
+        st.session_state.auth_user = None
+        st.session_state.auth_blocked_info = {
+            "email": current_office_email,
+            "reason": still_reason,
+            **still_lic,
+        }
+        st.rerun()
 
 with st.sidebar:
     st.markdown("## ⚖️ ED Cálculos Trabalhistas")
