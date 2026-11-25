@@ -1913,6 +1913,106 @@ elif menu == "Liquidação de Sentença & Impugnação":
                 use_container_width=True,
             )
 
+    # ==========================================================================
+    # SEÇÃO 4: CHAT JURÍDICO DE LIQUIDAÇÃO E IMPUGNAÇÃO COM A IA
+    # ==========================================================================
+    st.divider()
+    with st.container(border=True):
+        st.subheader("4. Chat Jurídico de Liquidação & Impugnação com a IA")
+        st.caption(
+            "Converse com a IA sobre os parâmetros da sentença, honorários sucumbenciais, "
+            "erros na planilha da parte contrária ou peça a minuta de impugnação/manifestação."
+        )
+
+        sent_case_options: Dict[str, str] = {"sentenca_atual": "Sentença / Processo Atual em Análise"}
+        for c_item in st.session_state.calculations_history:
+            cid = str(c_item["audit_id"])
+            sent_case_options[cid] = (
+                f"{c_item.get('worker_name', 'Exequente')} × {c_item.get('employer_name', 'Executada')} "
+                f"({cid} • {fmt_brl(c_item['liquido_devido'])})"
+            )
+
+        if "selected_sent_chat_id" not in st.session_state or st.session_state.selected_sent_chat_id not in sent_case_options:
+            st.session_state.selected_sent_chat_id = "sentenca_atual"
+
+        s_sel_col, s_clr_col = st.columns([4, 1])
+        active_sent_id = s_sel_col.selectbox(
+            "Processo / Liquidação selecionada para conversar:",
+            options=list(sent_case_options.keys()),
+            index=list(sent_case_options.keys()).index(st.session_state.selected_sent_chat_id),
+            format_func=lambda k: sent_case_options[k],
+            key="sent_chat_selector_widget",
+        )
+        st.session_state.selected_sent_chat_id = active_sent_id
+
+        if active_sent_id not in st.session_state.case_chat_threads:
+            st.session_state.case_chat_threads[active_sent_id] = []
+
+        if s_clr_col.button("Limpar Conversa", key="sent_clear_chat_btn", use_container_width=True):
+            st.session_state.case_chat_threads[active_sent_id] = []
+            if active_sent_id != "sentenca_atual":
+                calc_sync = next((c for c in st.session_state.calculations_history if c["audit_id"] == active_sent_id), None)
+                if calc_sync:
+                    supabase_upsert_case(calc_sync, [], current_office_email)
+            st.rerun()
+
+        sent_thread = st.session_state.case_chat_threads[active_sent_id]
+
+        sent_chat_viewport = st.container(height=420, border=True)
+        with sent_chat_viewport:
+            if not sent_thread:
+                st.info(
+                    "Digite sua dúvida abaixo (ex.: 'Calcule os honorários sucumbenciais de 15% sobre o líquido', "
+                    "'Redija a impugnação aos cálculos da reclamada' ou 'Confira se o dispositivo deferiu reflexos')."
+                )
+            for msg_item in sent_thread:
+                with st.chat_message(msg_item["role"]):
+                    st.markdown(msg_item["content"])
+
+        with st.form("sentence_wide_chat_form", clear_on_submit=True):
+            sent_user_msg = st.text_area(
+                "Mensagem para o Perito Calculista / Advogado Trabalhista (IA):",
+                placeholder="Ex.: Confira os parâmetros da sentença, aponte divergências no cálculo da reclamada ou redija a petição de liquidação...",
+                height=95,
+                label_visibility="collapsed",
+            )
+            sc1, sc2 = st.columns([4, 1.2])
+            sc1.caption("O histórico deste processo fica salvo na nuvem associado ao código da liquidação.")
+            sent_send_btn = sc2.form_submit_button("Enviar para IA", type="primary", use_container_width=True)
+
+        if sent_send_btn and sent_user_msg.strip():
+            s_clean_msg = sent_user_msg.strip()
+            st.session_state.case_chat_threads[active_sent_id].append({"role": "user", "content": s_clean_msg})
+
+            if active_sent_id == "sentenca_atual":
+                s_ctx_calc = st.session_state.calculations_history[0] if st.session_state.calculations_history else None
+                s_ctx_notes = str(st.session_state.get("sentence_notes_box") or "")
+                s_ctx_ext = st.session_state.sentence_ai_data or {}
+            else:
+                s_ctx_calc = next(
+                    (c for c in st.session_state.calculations_history if c["audit_id"] == active_sent_id),
+                    None,
+                )
+                s_ctx_notes = str((s_ctx_calc or {}).get("lawyer_narrative") or "")
+                s_ctx_ext = (s_ctx_calc or {}).get("ai_opinion") or {}
+
+            try:
+                with st.spinner("Consultando Perito Calculista IA..."):
+                    s_ai_reply = chat_with_case_strategist(
+                        user_message=s_clean_msg,
+                        chat_history=st.session_state.case_chat_threads[active_sent_id][:-1],
+                        lawyer_narrative=s_ctx_notes,
+                        extracted_data=s_ctx_ext,
+                        latest_calc=s_ctx_calc,
+                        all_saved_cases=st.session_state.calculations_history,
+                    )
+                st.session_state.case_chat_threads[active_sent_id].append({"role": "assistant", "content": s_ai_reply})
+                if active_sent_id != "sentenca_atual" and s_ctx_calc is not None:
+                    supabase_upsert_case(s_ctx_calc, st.session_state.case_chat_threads[active_sent_id], current_office_email)
+                st.rerun()
+            except Exception as s_chat_exc:
+                st.error(f"Erro no chat de liquidação: {s_chat_exc}")
+
 elif menu == "Meus Cálculos e Relatórios":
     st.title("Meus Cálculos e Relatórios Salvos")
     st.caption("Baixe o dossiê completo em Excel (.XLSX) ou diretamente em PDF (.PDF) para arquivar no processo.")
