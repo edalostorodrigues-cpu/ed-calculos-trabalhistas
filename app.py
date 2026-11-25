@@ -560,7 +560,13 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
     if params.get("inc_intrajornada") and f_float(params.get("intrajornada_hours"), 0.0) > 0:
         hintra = Decimal(str(f_float(params.get("intrajornada_hours"), 0.0)))
         val_intra = (valor_hora * Decimal("1.50") * hintra).quantize(CENT, rounding=ROUND_HALF_UP)
-        add_verba("VER-06C", "Intervalo Intrajornada Suprimido (Art. 71, §4º CLT)", remuneracao_base, "(Valor Hora × 1,50) × Horas Suprimidas", f"{hintra}h", "+50%", val_intra, inc_fgts=False)
+        teto_intra = d_money(params.get("teto_intrajornada"))
+        formula_intra = "(Valor Hora × 1,50) × Horas Suprimidas"
+        if teto_intra > Decimal("0.00") and val_intra > teto_intra:
+            val_intra = teto_intra
+            formula_intra = "Limitado ao Teto da Sentença (Art. 879, § 1º CLT / IAC TST)"
+        refl_intra = (val_intra * fator_refl_jornada).quantize(CENT, rounding=ROUND_HALF_UP) if params.get("inc_reflexos_intrajornada") else Decimal("0.00")
+        add_verba("VER-06C", "Intervalo Intrajornada Suprimido (Art. 71, §4º CLT)", remuneracao_base, formula_intra, f"{hintra}h", "+50%", val_intra, refl_intra, inc_fgts=bool(params.get("inc_reflexos_intrajornada")))
 
     if params.get("inc_noturno") and f_float(params.get("night_hours"), 0.0) > 0:
         hnot = Decimal(str(f_float(params.get("night_hours"), 0.0)))
@@ -607,8 +613,26 @@ def run_labor_calculation(params: Dict[str, Any]) -> Dict[str, Any]:
         add_verba("VER-10", "Multa do Art. 467 da CLT (50% sobre Verbas Incontroversas)", base_467, "50% × Verbas Rescisórias Incontroversas", "1", "50%", val_467, inc_fgts=False)
 
     bruto_total = sum((v["Total Apurado"] for v in verbas), Decimal("0.00")).quantize(CENT, rounding=ROUND_HALF_UP)
+    teto_global = d_money(params.get("teto_global_condenacao"))
+    if teto_global > Decimal("0.00") and bruto_total > teto_global:
+        bruto_total = teto_global
+
     abatimentos = d_money(params.get("offsets"))
-    liquido_devido = max(Decimal("0.00"), bruto_total - abatimentos).quantize(CENT, rounding=ROUND_HALF_UP)
+    liquido_historico = max(Decimal("0.00"), bruto_total - abatimentos).quantize(CENT, rounding=ROUND_HALF_UP)
+
+    atualizacao_pct = Decimal(str(f_float(params.get("atualizacao_juros_pct"), 0.0))) / Decimal("100")
+    val_atualizacao = (liquido_historico * atualizacao_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+    if val_atualizacao > Decimal("0.00"):
+        add_verba("VER-12", f"Atualização Monetária + Juros Legais ({params.get('atualizacao_juros_pct', 0):g}%)", liquido_historico, "Principal Líquido × Índice Acumulado (ADC 58 STF)", "1", f"{params.get('atualizacao_juros_pct', 0):g}%", val_atualizacao, inc_fgts=False)
+
+    liquido_corrigido = (liquido_historico + val_atualizacao).quantize(CENT, rounding=ROUND_HALF_UP)
+
+    hon_pct = Decimal(str(f_float(params.get("honorarios_sucumbenciais_pct"), 0.0))) / Decimal("100")
+    val_honorarios = (liquido_corrigido * hon_pct).quantize(CENT, rounding=ROUND_HALF_UP)
+    if val_honorarios > Decimal("0.00"):
+        add_verba("VER-13", f"Honorários Advocatícios Sucumbenciais ({params.get('honorarios_sucumbenciais_pct', 0):g}%)", liquido_corrigido, "Total Líquido Atualizado × % Sucumbência", "1", f"{params.get('honorarios_sucumbenciais_pct', 0):g}%", val_honorarios, inc_fgts=False)
+
+    liquido_devido = (liquido_corrigido + val_honorarios).quantize(CENT, rounding=ROUND_HALF_UP)
 
     raw_hash = hashlib.sha256(f"{params.get('worker_name')}|{params.get('employer_name')}|{liquido_devido}|{datetime.utcnow().isoformat()}".encode()).hexdigest()[:8].upper()
     audit_id = f"ED-{raw_hash}"
@@ -773,8 +797,10 @@ def analyze_case_with_gemini(narrative: str, files: List[Dict[str, Any]]) -> Dic
 def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
     client = _get_gemini_client()
     prompt = (
-        "Você é um Perito Calculista Trabalhista especialista em Liquidação de Sentença (Art. 879 CLT). "
+        "Você é um Perito Calculista Trabalhista especialista em Liquidação de Sentença (Art. 879, § 1º CLT e IAC-1000156-59.2020.5.09.0000 TST). "
         "Analise a cópia do processo/sentença transitada em julgado e documentos anexados. "
+        "REGRA CRÍTICA DE COISA JULGADA: Verifique se a sentença limitou a condenação aos valores estimados na petição inicial (tetos históricos). "
+        "Se houver teto expresso (ex.: intervalo intrajornada limitado a R$ 1.337,60, descontos limitados a R$ 2.000,00), preencha os campos de teto! "
         "Separe rigorosamente o que foi DEFERIDO no dispositivo (descartando os pedidos improcedentes). "
         "Retorne EXCLUSIVAMENTE um JSON válido com as chaves: "
         "process_number (str), worker_name (str), employer_name (str), role_title (str), "
@@ -782,6 +808,11 @@ def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dic
         "termination_type (sem_justa_causa|rescisao_indireta|pedido_demissao|acordo|justa_causa), monthly_divisor (int), "
         "base_salary (float), commissions (float), adicional_sugerido (Nenhum|Insalubridade|Periculosidade), "
         "adicional_percentual_sugerido (float), trct_paid_total (float), "
+        "teto_intrajornada (float: valor teto fixado na sentença para intervalo intrajornada, ou 0 se ilimitado), "
+        "incluir_reflexos_intrajornada (bool), "
+        "teto_global_condenacao (float: teto global se a sentença limitou o total, ou 0), "
+        "honorarios_sucumbenciais_pct (float: ex 15.0 se deferidos honorários ao patrono do autor, ou 0), "
+        "indice_correcao_juros_estimado_pct (float: percentual estimado de correção + juros até hoje, ex 12.0), "
         "dispositivo_resumo (str), parametros_liquidacao (str), divergencias_calculo_adverso (str ou null), "
         "verbas_deferidas (lista de strings), verbas_indeferidas (lista de strings), "
         "weekly_he50_hours (float), monthly_sundays_worked (int), suppressed_break_minutes (int), weekly_night_hours (float), "
@@ -1776,6 +1807,39 @@ elif menu == "Liquidação de Sentença & Impugnação":
         s_estab_m = sv3.number_input("Meses Estabilidade Deferidos", min_value=0, max_value=24, value=max(0, min(24, f_int(s_ext.get("meses_estabilidade_restantes"), 0))))
         s_restit = sv3.number_input("Devolução Descontos Deferida (R$)", min_value=0.0, value=max(0.0, f_float(s_ext.get("restituicao_descontos"), 0.0)), step=50.0)
 
+        st.markdown("#### 🔒 Travas de Coisa Julgada (Limites da Inicial), Correção/Juros e Honorários")
+        lim1, lim2, lim3, lim4 = st.columns(4)
+        s_teto_intra = lim1.number_input(
+            "Teto Sentença Intrajornada (R$) [0 = sem teto]",
+            min_value=0.0,
+            value=max(0.0, f_float(s_ext.get("teto_intrajornada"), 0.0)),
+            step=50.0,
+        )
+        s_refl_intra = lim1.checkbox(
+            "Somar reflexos além do teto intrajornada",
+            value=bool(s_ext.get("incluir_reflexos_intrajornada", False)),
+        )
+        s_teto_global = lim2.number_input(
+            "Teto Global da Condenação (R$) [0 = sem teto]",
+            min_value=0.0,
+            value=max(0.0, f_float(s_ext.get("teto_global_condenacao"), 0.0)),
+            step=100.0,
+        )
+        s_atu_juros_pct = lim3.number_input(
+            "Atualização Monetária + Juros Acumulados (%)",
+            min_value=0.0,
+            max_value=500.0,
+            value=max(0.0, f_float(s_ext.get("indice_correcao_juros_estimado_pct"), 0.0)),
+            step=1.0,
+        )
+        s_hon_suc_pct = lim4.number_input(
+            "Honorários Sucumbenciais Deferidos (%)",
+            min_value=0.0,
+            max_value=30.0,
+            value=max(0.0, min(30.0, f_float(s_ext.get("honorarios_sucumbenciais_pct"), 0.0))),
+            step=1.0,
+        )
+
         liquidar_btn = st.form_submit_button("Calcular Liquidação de Sentença e Gerar Planilha", type="primary")
 
     if liquidar_btn:
@@ -1845,13 +1909,13 @@ elif menu == "Liquidação de Sentença & Impugnação":
                 "inc_multa_477": s_ped_477,
                 "inc_multa_467": s_ped_467,
                 "inc_reflexos_completos": s_ped_reflexos,
-                "inc_he50": tot_s_he50 > 0,
-                "he50_hours": tot_s_he50,
-                "he50_pct": 50,
-                "inc_he100": tot_s_he100 > 0,
-                "he100_hours": tot_s_he100,
-                "inc_intrajornada": tot_s_intra > 0,
-                "intrajornada_hours": tot_s_intra,
+                "inc_intrajornada": tot_s_intra > 0 or s_teto_intra > 0,
+                "intrajornada_hours": tot_s_intra if tot_s_intra > 0 else (1.0 if s_teto_intra > 0 else 0.0),
+                "teto_intrajornada": s_teto_intra,
+                "inc_reflexos_intrajornada": s_refl_intra,
+                "teto_global_condenacao": s_teto_global,
+                "atualizacao_juros_pct": s_atu_juros_pct,
+                "honorarios_sucumbenciais_pct": s_hon_suc_pct,
                 "inc_noturno": tot_s_not > 0,
                 "night_hours": tot_s_not,
                 "night_pct": 20,
@@ -1861,7 +1925,7 @@ elif menu == "Liquidação de Sentença & Impugnação":
 
             if s_restit > 0:
                 r_dec = d_money(s_restit)
-                res_sent["verbas"].append({
+                res_sent["verbas"].insert(0, {
                     "Código": "VER-11",
                     "Verba": "Restituição de Descontos Deferida em Sentença",
                     "Período": f"{s_adm.strftime('%d/%m/%Y')} a {s_dism.strftime('%d/%m/%Y')}",
@@ -1875,7 +1939,18 @@ elif menu == "Liquidação de Sentença & Impugnação":
                     "Incide FGTS": False,
                 })
                 res_sent["bruto_atualizado"] += r_dec
-                res_sent["liquido_devido"] += r_dec
+                atu_extra = (r_dec * (Decimal(str(s_atu_juros_pct)) / Decimal("100"))).quantize(CENT, rounding=ROUND_HALF_UP)
+                hon_extra = ((r_dec + atu_extra) * (Decimal(str(s_hon_suc_pct)) / Decimal("100"))).quantize(CENT, rounding=ROUND_HALF_UP)
+                res_sent["liquido_devido"] += (r_dec + atu_extra + hon_extra)
+                for v_item in res_sent["verbas"]:
+                    if v_item["Código"] == "VER-12":
+                        v_item["Base de Cálculo"] += r_dec
+                        v_item["Valor Original"] += atu_extra
+                        v_item["Total Apurado"] += atu_extra
+                    elif v_item["Código"] == "VER-13":
+                        v_item["Base de Cálculo"] += (r_dec + atu_extra)
+                        v_item["Valor Original"] += hon_extra
+                        v_item["Total Apurado"] += hon_extra
 
             sent_client_key = f"{s_reclamante.strip().lower()}|{s_reclamada.strip().lower()}"
             prev_sent_chat: List[Dict[str, str]] = list(st.session_state.case_chat_threads.get("sentenca_atual", []))
