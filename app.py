@@ -35,7 +35,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Deixe False enquanto ajustamos as abas; mude para True para ativar login/licença
 REQUIRE_LOGIN = False
 
 GEMINI_MODEL_PRIMARY = "gemini-3.8-flash"
@@ -90,6 +89,8 @@ def fmt_num(val: Decimal | float | int, places: int = 2) -> str:
         inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
         return f"{inteiro_fmt},{dec}"
     return f"{int(s):,}".replace(",", ".")
+
+
 def safe_latin1(text: Any) -> str:
     if text is None:
         return ""
@@ -245,7 +246,7 @@ def build_monthly_competences(
     exact_total_days: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Gera a grade mensal (competência YYYY-MM) no padrão PJe-Calc, contando
+    Gera a grade mensal (competência MM/AAAA) no padrão PJe-Calc, contando
     os dias úteis reais do calendário conforme a escala (5 = Seg-Sex, 6 = Seg-Sáb)
     e ajustando proporcionalmente caso seja informado o total exato de dias trabalhados.
     """
@@ -293,7 +294,6 @@ def build_monthly_competences(
 
     raw_total_days = sum(m["dias_uteis_calc"] for m in months)
     if exact_total_days and exact_total_days > 0 and raw_total_days > 0:
-        # Distribui proporcionalmente o total exato de dias trabalhados nas competências
         remaining = int(exact_total_days)
         for idx, m in enumerate(months):
             if idx == len(months) - 1:
@@ -332,6 +332,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     exact_total_days = int(params.get("exact_total_days", 0) or 0)
 
     tipo_rescisao = str(params.get("tipo_rescisao", "Sem Justa Causa (Iniciativa Empregador)"))
+    is_dispensa_sem_justa = ("Sem Justa Causa" in tipo_rescisao) or ("Indireta" in tipo_rescisao)
     aviso_indenizado = bool(params.get("aviso_indenizado", False))
     ferias_vencidas_qtd = int(params.get("ferias_vencidas_qtd", 0) or 0)
     multa_477 = bool(params.get("multa_477", False))
@@ -354,6 +355,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Parâmetros de Coisa Julgada / Sentença (Tetos Art. 879 § 1º CLT, Reflexos, Atualização, Honorários)
     aplicar_reflexos = bool(params.get("aplicar_reflexos", True))
+    reflexos_em_dsr = bool(params.get("reflexos_em_dsr", False))
     reflexos_em_fgts = bool(params.get("reflexos_em_fgts", True))
     incluir_verbas_rescisorias = bool(params.get("incluir_verbas_rescisorias", False))
 
@@ -379,14 +381,11 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     total_dias_efetivos = sum(m["dias_efetivos"] for m in months)
     total_avos = sum(m["avos_15"] for m in months)
 
-    # Anos completos para Aviso Prévio Proporcional (Lei 12.506/2011)
     anos_completos = max(0, (rescisao - admissao).days // 365)
     dias_aviso_previo = min(90, 30 + (3 * anos_completos))
 
-    # Base de cálculo mensal (Súmula 264/TST)
     val_insalub = money_round(salario_minimo * (insalubridade_pct / Decimal("100")))
     val_peric = money_round((salario_base + salario_por_fora) * (periculosidade_pct / Decimal("100")))
-    # Não cumula insalubridade e periculosidade (prevalece o mais benéfico - art. 193 §2º CLT)
     if val_peric >= val_insalub:
         adicional_mensal = val_peric
         adicional_nome = f"Adicional de Periculosidade ({fmt_num(periculosidade_pct, 0)}%)"
@@ -433,16 +432,12 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
         )
         return final_val
 
-    # --------------------------------------------------------------------------
-    # A. ADICIONAL AMBIENTAL (INSALUBRIDADE / PERICULOSIDADE)
-    # --------------------------------------------------------------------------
+    # A. ADICIONAL AMBIENTAL
     total_adicional = Decimal("0")
     if adicional_mensal > 0:
         bruto_adic = Decimal("0")
         for m in months:
-            fator = Decimal(str(m["dias_corridos"])) / Decimal("30")
-            if fator > 1:
-                fator = Decimal("1")
+            fator = min(Decimal("1"), Decimal(str(m["dias_corridos"])) / Decimal("30"))
             v_mes = money_round(adicional_mensal * fator)
             bruto_adic += v_mes
             ocorrencias.append(
@@ -465,9 +460,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             teto_adicional,
         )
 
-    # --------------------------------------------------------------------------
     # B. HORAS EXTRAS 50% E 100%
-    # --------------------------------------------------------------------------
     total_he50 = Decimal("0")
     if he50_horas_mes > 0:
         bruto_he50 = Decimal("0")
@@ -519,9 +512,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             bruto_he100,
         )
 
-    # --------------------------------------------------------------------------
     # C. INTERVALO INTRAJORNADA (ART. 71, § 4º CLT) - MÊS A MÊS POR DIAS REAIS
-    # --------------------------------------------------------------------------
     total_intrajornada = Decimal("0")
     if intrajornada_min_dia > 0 or teto_intrajornada > 0:
         horas_dia_intra = (intrajornada_min_dia / Decimal("60")).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
@@ -544,15 +535,13 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
         total_intrajornada = add_verba(
             "030",
             "Intervalo Intrajornada Suprimido (+50% - Art. 71 § 4º CLT)",
-            "Indenizatória/Salarial",
+            "Salarial / Reflexos",
             f"({fmt_brl(remuneracao_base_hora)} / {int(divisor)}) x 1,50 x {fmt_num(horas_dia_intra)}h/dia x {total_dias_efetivos} dias úteis ({work_days_per_week}d/sem)",
             bruto_intra,
             teto_intrajornada,
         )
 
-    # --------------------------------------------------------------------------
-    # D. ADICIONAL NOTURNO (ART. 73 CLT - HORA FICTA 52m30s)
-    # --------------------------------------------------------------------------
+    # D. ADICIONAL NOTURNO (ART. 73 CLT)
     total_noturno = Decimal("0")
     if noturno_horas_mes > 0:
         fator_ficto = Decimal("60") / Decimal("52.5")
@@ -580,9 +569,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             bruto_not,
         )
 
-    # --------------------------------------------------------------------------
     # E. DEVOLUÇÃO DE DESCONTOS INDEVIDOS (ART. 462 CLT)
-    # --------------------------------------------------------------------------
     total_descontos = Decimal("0")
     if descontos_devolver > 0 or teto_descontos > 0:
         base_desc = descontos_devolver if descontos_devolver > 0 else teto_descontos
@@ -595,9 +582,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             teto_descontos,
         )
 
-    # --------------------------------------------------------------------------
     # F. OUTRAS PARCELAS DEFERIDAS
-    # --------------------------------------------------------------------------
     total_outras = Decimal("0")
     if outras_verbas_valor > 0:
         total_outras = add_verba(
@@ -608,70 +593,64 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             outras_verbas_valor,
         )
 
-    # --------------------------------------------------------------------------
-    # G. REFLEXOS LEGAIS DAS PARCELAS HABITUAIS (DSR, 13º, FÉRIAS+1/3, AVISO, FGTS)
-    # --------------------------------------------------------------------------
+    # G. REFLEXOS LEGAIS DAS PARCELAS HABITUAIS (RESPEITANDO MODALIDADE DA RESCISÃO E COMANDO DA SENTENÇA)
     base_reflexos_total = total_adicional + total_he50 + total_he100 + total_intrajornada + total_noturno
-    total_reflexos = Decimal("0")
     if aplicar_reflexos and base_reflexos_total > 0:
-        media_mensal_reflexo = (base_reflexos_total / total_meses).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
-
-        # 1. DSR (Súmula 172/TST) sobre horas extras / noturno / intrajornada (exclui adicional mensal fixo)
-        base_dsr = total_he50 + total_he100 + total_intrajornada + total_noturno
         ref_dsr = Decimal("0")
-        if base_dsr > 0:
-            ref_dsr = add_verba(
-                "071",
-                "Reflexos em Repouso Semanal Remunerado - DSR (Súmula 172/TST)",
-                "Salarial",
-                f"{fmt_brl(base_dsr)} x (1/6 proporcional aos domingos/feriados)",
-                base_dsr / Decimal("6"),
-            )
+        if reflexos_em_dsr:
+            base_dsr = total_he50 + total_he100 + total_intrajornada + total_noturno
+            if base_dsr > 0:
+                ref_dsr = add_verba(
+                    "071",
+                    "Reflexos em Repouso Semanal Remunerado - DSR (Súmula 172/TST)",
+                    "Salarial",
+                    f"{fmt_brl(base_dsr)} x (1/6 proporcional)",
+                    base_dsr / Decimal("6"),
+                )
 
-        base_com_dsr_mensal = ((base_reflexos_total + ref_dsr) / total_meses).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+        # Média mensal proporcional sobre 12 meses/competências conforme avos adquiridos (<= 12)
         avos_dec = Decimal(str(min(12, max(1, total_avos))))
+        media_mensal_12 = ((base_reflexos_total + ref_dsr) / Decimal("12")).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+        fator_avos_12 = (avos_dec / total_meses).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
 
         ref_13 = add_verba(
             "072",
-            "Reflexos em 13º Salário",
+            f"Reflexos em 13º Salário ({int(avos_dec)}/12 avos)",
             "Salarial",
-            f"Média mensal {fmt_brl(base_com_dsr_mensal)} x ({int(avos_dec)}/12 avos)",
-            base_com_dsr_mensal * (avos_dec / Decimal("12")),
+            f"({fmt_brl(base_reflexos_total + ref_dsr)} / 12) x ({int(avos_dec)}/{int(total_meses)} proporção)",
+            media_mensal_12 * fator_avos_12,
         )
         ref_ferias = add_verba(
             "073",
-            "Reflexos em Férias + 1/3 Constitucional",
+            f"Reflexos em Férias + 1/3 Constitucional ({int(avos_dec)}/12 avos)",
             "Indenizatória",
-            f"Média mensal {fmt_brl(base_com_dsr_mensal)} x ({int(avos_dec)}/12 avos) x 1,3333",
-            base_com_dsr_mensal * (avos_dec / Decimal("12")) * (Decimal("4") / Decimal("3")),
+            f"({fmt_brl(base_reflexos_total + ref_dsr)} / 12) x ({int(avos_dec)}/{int(total_meses)}) x 1,3333",
+            media_mensal_12 * fator_avos_12 * (Decimal("4") / Decimal("3")),
         )
         ref_aviso = Decimal("0")
-        if "Sem Justa Causa" in tipo_rescisao or "Indireta" in tipo_rescisao:
+        if is_dispensa_sem_justa:
+            media_mensal_contrato = ((base_reflexos_total + ref_dsr) / total_meses).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
             ref_aviso = add_verba(
                 "074",
                 f"Reflexos em Aviso Prévio Proporcional ({dias_aviso_previo} dias)",
                 "Indenizatória",
-                f"Média mensal {fmt_brl(base_com_dsr_mensal)} x ({dias_aviso_previo}/30 dias)",
-                base_com_dsr_mensal * (Decimal(str(dias_aviso_previo)) / Decimal("30")),
+                f"Média mensal {fmt_brl(media_mensal_contrato)} x ({dias_aviso_previo}/30 dias)",
+                media_mensal_contrato * (Decimal(str(dias_aviso_previo)) / Decimal("30")),
             )
 
-        ref_fgts = Decimal("0")
         if reflexos_em_fgts:
             base_fgts_ref = base_reflexos_total + ref_dsr + ref_13 + ref_aviso
-            mult_fgts = Decimal("0.112") if ("Sem Justa Causa" in tipo_rescisao or "Indireta" in tipo_rescisao) else Decimal("0.08")
-            pct_label = "11,2% (8% + 40%)" if mult_fgts == Decimal("0.112") else "8%"
-            ref_fgts = add_verba(
+            mult_fgts = Decimal("0.112") if is_dispensa_sem_justa else Decimal("0.08")
+            pct_label = "11,2% (8% + 40%)" if is_dispensa_sem_justa else "8% (sem multa 40% - Pedido de Demissão)"
+            add_verba(
                 "075",
                 f"Reflexos em FGTS ({pct_label})",
                 "Fundiária",
-                f"Base incidente {fmt_brl(base_fgts_ref)} x {pct_label}",
+                f"Base incidente {fmt_brl(base_fgts_ref)} x {'11,2%' if is_dispensa_sem_justa else '8%'}",
                 base_fgts_ref * mult_fgts,
             )
-        total_reflexos = ref_dsr + ref_13 + ref_ferias + ref_aviso + ref_fgts
 
-    # --------------------------------------------------------------------------
     # H. VERBAS RESCISÓRIAS (AVALIAÇÃO PRELIMINAR / RESCISÃO INADIMPLIDA)
-    # --------------------------------------------------------------------------
     if incluir_verbas_rescisorias and remuneracao_base_hora > 0:
         dias_saldo = rescisao.day
         add_verba(
@@ -681,7 +660,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
             f"({fmt_brl(remuneracao_base_hora)} / 30) x {dias_saldo} dias",
             (remuneracao_base_hora / Decimal("30")) * Decimal(str(dias_saldo)),
         )
-        if aviso_indenizado and ("Sem Justa Causa" in tipo_rescisao or "Indireta" in tipo_rescisao):
+        if aviso_indenizado and is_dispensa_sem_justa:
             add_verba(
                 "082",
                 f"Aviso Prévio Indenizado ({dias_aviso_previo} dias - Lei 12.506/2011)",
@@ -713,7 +692,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
                 f"{fmt_brl(remuneracao_base_hora)} x {ferias_vencidas_qtd} x 1,3333",
                 remuneracao_base_hora * Decimal(str(ferias_vencidas_qtd)) * (Decimal("4") / Decimal("3")),
             )
-        if "Sem Justa Causa" in tipo_rescisao or "Indireta" in tipo_rescisao:
+        if is_dispensa_sem_justa:
             fgts_contrato = remuneracao_base_hora * Decimal("0.08") * total_meses
             add_verba(
                 "086",
@@ -740,11 +719,10 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
                 subtotal_resc * Decimal("0.50"),
             )
 
-    # --------------------------------------------------------------------------
     # I. FECHAMENTO PRINCIPAL + TETO GLOBAL + ATUALIZAÇÃO/JUROS + HONORÁRIOS
-    # --------------------------------------------------------------------------
     principal_historico = money_round(sum(D(v["valor"]) for v in verbas))
     if teto_global > 0 and principal_historico > teto_global:
+        diff_teto = money_round(teto_global) - principal_historico
         principal_historico = money_round(teto_global)
         verbas.append(
             {
@@ -752,8 +730,8 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
                 "verba": "Redutor de Teto Global da Condenação (Art. 879 § 1º CLT)",
                 "incidencia": "Limite Coisa Julgada",
                 "formula": f"Ajuste para respeitar o teto global fixado na sentença ({fmt_brl(teto_global)})",
-                "valor": float(principal_historico - money_round(sum(D(v["valor"]) for v in verbas))),
-                "valor_fmt": fmt_brl(principal_historico - money_round(sum(D(v["valor"]) for v in verbas))),
+                "valor": float(diff_teto),
+                "valor_fmt": fmt_brl(diff_teto),
             }
         )
 
@@ -804,7 +782,6 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
     pdf.set_auto_page_break(auto=True, margin=14)
     pdf.add_page()
 
-    # Cabeçalho Institucional Padrão PJe-Calc
     pdf.set_fill_color(28, 43, 66)
     pdf.rect(10, 10, 190, 22, style="F")
     pdf.set_text_color(255, 255, 255)
@@ -818,7 +795,6 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
     pdf.set_text_color(20, 20, 20)
     pdf.ln(6)
 
-    # Bloco 1: Identificação do Processo e Parâmetros do Contrato
     pdf.set_fill_color(238, 242, 247)
     pdf.set_font("Helvetica", "B", 9.5)
     pdf.cell(0, 7, safe_latin1(" 1. IDENTIFICAÇÃO DO PROCESSO E PARÂMETROS DO VÍNCULO"), border=1, ln=1, fill=True)
@@ -834,18 +810,14 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
         (f"Reclamante: {reclamante}", f"Reclamada: {reclamada}"),
         (f"Admissão: {calc.get('admissao')}  |  Saída: {calc.get('rescisao')}", f"Competências: {calc.get('total_meses')} meses ({calc.get('total_dias_efetivos')} dias úteis - {calc.get('work_days_per_week')}d/sem)"),
         (f"Salário-Base: {fmt_brl(calc.get('salario_base', 0))}  |  Divisor: {calc.get('divisor', 220)}", f"Hora Normal (Súm. 264): {fmt_brl(calc.get('valor_hora_normal', 0))}"),
-        (f"Critério Atualização: {calc.get('criterio_atualizacao', '')}", ""),
+        (f"Modalidade Rescisão: {calc.get('tipo_rescisao', '')}", f"Critério: {str(calc.get('criterio_atualizacao', ''))[:42]}"),
     ]
     for left_txt, right_txt in rows_id:
-        if right_txt:
-            pdf.cell(95, 6, safe_latin1(f" {left_txt}"), border=1)
-            pdf.cell(95, 6, safe_latin1(f" {right_txt}"), border=1, ln=1)
-        else:
-            pdf.cell(190, 6, safe_latin1(f" {left_txt}"), border=1, ln=1)
+        pdf.cell(95, 6, safe_latin1(f" {left_txt}"), border=1)
+        pdf.cell(95, 6, safe_latin1(f" {right_txt}"), border=1, ln=1)
 
     pdf.ln(4)
 
-    # Bloco 2: Planilha Resumo das Verbas Liquidadas (Padrão PJe-Calc)
     pdf.set_font("Helvetica", "B", 9.5)
     pdf.cell(0, 7, safe_latin1(" 2. RESUMO DAS VERBAS LIQUIDADAS E MEMÓRIA DE CÁLCULO"), border=1, ln=1, fill=True)
 
@@ -868,7 +840,6 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
 
     pdf.ln(4)
 
-    # Bloco 3: Quadro de Fechamento da Liquidação (Principal + Juros + Honorários)
     pdf.set_font("Helvetica", "B", 9.5)
     pdf.cell(0, 7, safe_latin1(" 3. FECHAMENTO GERAL DA LIQUIDAÇÃO"), border=1, ln=1, fill=True)
 
@@ -884,7 +855,6 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
         pdf.cell(148, 6.5, safe_latin1(f" {label}"), border=1, fill=is_bold)
         pdf.cell(42, 6.5, safe_latin1(f"{val_str} "), border=1, align="R", fill=is_bold, ln=1)
 
-    # Bloco 4: Demonstrativo de Ocorrências Mês a Mês (Competências)
     ocorr = calc.get("ocorrencias", [])
     if ocorr:
         pdf.ln(4)
@@ -914,10 +884,7 @@ def build_pjecalc_pdf_bytes(calc: Dict[str, Any], office_header: str = "ED Cálc
 
 
 def build_pjecalc_pjc_bytes(calc: Dict[str, Any]) -> bytes:
-    """
-    Gera o arquivo estruturado .PJC (XML compatível com o padrão PJe-Calc Cidadão)
-    contendo dados do processo, contrato, verbas liquidadas e ocorrências mensais.
-    """
+    """Gera o arquivo estruturado .PJC (XML compatível com o padrão PJe-Calc Cidadão)."""
     root = ET.Element("CalculoPJeCalc", versao="2.11.2", sistema="ED-Calculos-Trabalhistas")
 
     proc_el = ET.SubElement(root, "Processo")
@@ -929,6 +896,7 @@ def build_pjecalc_pjc_bytes(calc: Dict[str, Any]) -> bytes:
     param_el = ET.SubElement(root, "ParametrosCalculo")
     ET.SubElement(param_el, "DataAdmissao").text = str(calc.get("admissao_iso") or "")
     ET.SubElement(param_el, "DataDemissao").text = str(calc.get("rescisao_iso") or "")
+    ET.SubElement(param_el, "ModalidadeRescisao").text = str(calc.get("tipo_rescisao") or "")
     ET.SubElement(param_el, "UltimaRemuneracao").text = f"{D(calc.get('salario_base', 0)):.2f}"
     ET.SubElement(param_el, "CargaHorariaMensal").text = str(calc.get("divisor", 220))
     ET.SubElement(param_el, "DiasUteisSemana").text = str(calc.get("work_days_per_week", 5))
@@ -962,8 +930,7 @@ def build_pjecalc_pjc_bytes(calc: Dict[str, Any]) -> bytes:
     ET.SubElement(resumo_el, "HonorariosSucumbencia").text = f"{D(calc.get('valor_honorarios', 0)):.2f}"
     ET.SubElement(resumo_el, "TotalGeral").text = f"{D(calc.get('total_geral', 0)):.2f}"
 
-    xml_str = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return xml_str
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def build_pjecalc_excel_bytes(calc: Dict[str, Any]) -> bytes:
@@ -975,6 +942,7 @@ def build_pjecalc_excel_bytes(calc: Dict[str, Any]) -> bytes:
             {"Item": "Reclamante", "Valor": calc.get("client_name", "")},
             {"Item": "Reclamada", "Valor": calc.get("defendant_name", "")},
             {"Item": "Período do Vínculo", "Valor": f"{calc.get('admissao')} a {calc.get('rescisao')}"},
+            {"Item": "Modalidade da Rescisão", "Valor": calc.get("tipo_rescisao", "")},
             {"Item": "Competências / Dias Úteis", "Valor": f"{calc.get('total_meses')} meses / {calc.get('total_dias_efetivos')} dias ({calc.get('work_days_per_week')}d/sem)"},
             {"Item": "Salário-Base / Divisor", "Valor": f"{fmt_brl(calc.get('salario_base', 0))} / {calc.get('divisor', 220)}"},
             {"Item": "Principal Histórico", "Valor": calc.get("principal_historico_fmt", "")},
@@ -1057,10 +1025,9 @@ def analyze_sentence_with_gemini(
     uploaded_files: List[Any],
 ) -> Dict[str, Any]:
     """
-    Lê a sentença / cópia do processo + observações do advogado e extrai JSON
-    estruturado com datas reais do vínculo, escala semanal, dias efetivos,
-    verbas deferidas/improcedentes, tetos da coisa julgada (Art. 879 §1º CLT),
-    critérios de juros/correção e honorários sucumbenciais.
+    Lê a sentença / embargos / TRCT / cópia do processo + observações do advogado
+    e extrai JSON estruturado com datas reais, modalidade de rescisão, dias úteis,
+    verbas deferidas/excluídas por embargos/litispendência e tetos da coisa julgada.
     """
     client = get_gemini_client()
     if not client:
@@ -1070,7 +1037,7 @@ def analyze_sentence_with_gemini(
 
     prompt = f"""
 Você é um Perito Contador Trabalhista Sênior especialista em PJe-Calc e Liquidação de Sentença (Art. 879 da CLT).
-Analise rigorosamente os documentos anexados (Sentença, Cópia do Processo, TRCT, Cartões de Ponto, Despachos) e as observações do advogado abaixo.
+Analise rigorosamente os documentos anexados (Sentença, Decisão de Embargos de Declaração, TRCT, Contracheques, Despacho de Liquidação) e as observações do advogado abaixo.
 
 OBSERVAÇÕES / DECLARAÇÃO DO ADVOGADO:
 {obs_advogado or 'Nenhuma observação adicional.'}
@@ -1078,15 +1045,17 @@ OBSERVAÇÕES / DECLARAÇÃO DO ADVOGADO:
 {tab_text}
 
 REGRAS CRÍTICAS DE EXTRAÇÃO (SIGA À RISCA):
-1. DATAS DO VÍNCULO: Extraia exclusivamente a data de ADMISSÃO e a data de RESCISÃO/SAÍDA do contrato de trabalho (CTPS/TRCT/fundamentação). NUNCA confunda com data de ajuizamento, despacho ou publicação da sentença! Formato YYYY-MM-DD.
-2. ESCALA SEMANAL E DIAS TRABALHADOS: Verifique se a jornada reconhecida era Segunda a Sexta (work_days_per_week = 5) ou Segunda a Sábado (work_days_per_week = 6). Se a sentença ou os autos indicarem o número exato de dias úteis trabalhados (ex.: 225 dias), preencha exact_total_days; caso contrário, coloque 0.
-3. COISA JULGADA E TETOS DA INICIAL (Art. 879 §1º CLT / IAC TST): Se o dispositivo da sentença limitar a condenação aos valores indicados/estimados na petição inicial (ex.: "no limite do valor estimado de R$ 1.337,60" ou "no valor estimado de R$ 2.000,00"), preencha obrigatoriamente os campos de teto correspondentes!
-4. VERBAS IMPROCEDENTES: Tudo que foi julgado improcedente ou que o advogado informou que NÃO TEM DIREITO deve ir com valor 0 e listado em verbas_improcedentes.
-5. HONORÁRIOS E ATUALIZAÇÃO: Extraia o percentual de honorários sucumbenciais (ex.: 15) e o critério de correção monetária/juros (ADC 58 STF / IPCA-E / SELIC / IPCA + Art. 406 CC).
+1. DATAS DO VÍNCULO: Extraia exclusivamente a data de ADMISSÃO e a data de DESLIGAMENTO/RESCISÃO do contrato de trabalho (CTPS/TRCT/fundamentação). NUNCA confunda com data de ajuizamento, despacho ou sentença! Formato YYYY-MM-DD.
+2. MODALIDADE DA RESCISÃO: Verifique no TRCT e na sentença se foi "Pedido de Demissão", "Sem Justa Causa (Iniciativa Empregador)" ou "Justa Causa". No Pedido de Demissão, não há aviso prévio indenizado ao autor nem multa de 40% do FGTS (apenas FGTS 8%).
+3. SALÁRIO-BASE RECONHECIDO: Utilize o salário mensal expressamente fixado na sentença sem somar insalubridade se o título não determinou alteração da base salarial.
+4. ESCALA E DIAS ÚTEIS: Verifique se a escala é Segunda a Sexta (work_days_per_week = 5) ou Segunda a Sábado (6) e informe exact_total_days se houver contagem exata (ex.: 235 dias úteis).
+5. COISA JULGADA E TETOS DA INICIAL (Art. 879 §1º CLT / IAC TST): Se a sentença limitar a condenação aos valores indicados/estimados na petição inicial (ex.: "no limite do valor estimado de R$ 1.337,60" ou "no valor estimado de R$ 2.000,00"), preencha obrigatoriamente teto_intrajornada e/ou teto_descontos!
+6. EMBARGOS DE DECLARAÇÃO / LITISPENDÊNCIA / IMPROCEDÊNCIA: Tudo que foi excluído por embargos de declaração, litispendência, improcedência ou declaração do advogado deve ir com valor 0 e listado em verbas_improcedentes.
+7. REFLEXOS EXATOS DEFERIDOS: Marque reflexos_em_dsr = true SOMENTE se a sentença deferir expressamente reflexos em DSR/RSR. Se deferir apenas aviso prévio, férias+1/3, 13º e FGTS, deixe reflexos_em_dsr = false.
 
 Retorne APENAS um JSON válido com esta estrutura exata:
 {{
-  "process_number": "0000000-00.2025.5.04.0000",
+  "process_number": "0000000-00.2026.5.04.0000",
   "court_name": "Vara do Trabalho",
   "client_name": "Nome do Reclamante",
   "defendant_name": "Nome da Reclamada",
@@ -1097,7 +1066,7 @@ Retorne APENAS um JSON válido com esta estrutura exata:
   "divisor": 220,
   "work_days_per_week": 5,
   "exact_total_days": 0,
-  "tipo_rescisao": "Sem Justa Causa (Iniciativa Empregador)",
+  "tipo_rescisao": "Pedido de Demissão",
   "insalubridade_pct": 0.0,
   "periculosidade_pct": 0.0,
   "he50_horas_mes": 0.0,
@@ -1108,6 +1077,7 @@ Retorne APENAS um JSON válido com esta estrutura exata:
   "outras_verbas_desc": "",
   "outras_verbas_valor": 0.0,
   "aplicar_reflexos": true,
+  "reflexos_em_dsr": false,
   "reflexos_em_fgts": true,
   "incluir_verbas_rescisorias": false,
   "teto_he50": 0.0,
@@ -1115,12 +1085,12 @@ Retorne APENAS um JSON válido com esta estrutura exata:
   "teto_adicional": 0.0,
   "teto_descontos": 0.0,
   "teto_global": 0.0,
-  "criterio_atualizacao": "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC)",
+  "criterio_atualizacao": "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC - Lei 14.905/2024)",
   "atualizacao_juros_pct": 0.0,
   "honorarios_sucumbencia_pct": 15.0,
   "verbas_deferidas": ["Lista detalhada de cada parcela deferida e seus parâmetros"],
-  "verbas_improcedentes": ["Lista detalhada dos pedidos julgados improcedentes"],
-  "parecer_sentenca": "Resumo técnico claro do comando condenatório, limites da coisa julgada, reflexos e cuidados contra excesso de execução."
+  "verbas_improcedentes": ["Lista detalhada dos pedidos julgados improcedentes ou excluídos em embargos"],
+  "parecer_sentenca": "Resumo técnico claro do comando condenatório, decisão dos embargos, limites da coisa julgada e critérios de atualização."
 }}
 """
     contents = parts + [prompt]
@@ -1340,6 +1310,38 @@ with st.sidebar:
         index=1,
     )
 
+    st.divider()
+    st.session_state["office_header"] = st.text_input(
+        "Timbre do Escritório nos PDFs:",
+        value=st.session_state["office_header"],
+    )
+    if get_supabase_headers():
+        st.success(f"☁️ Nuvem Conectada ({len(st.session_state['cloud_cases'])} caso(s))")
+    else:
+        st.warning("☁️ Modo Local (configure SUPABASE_URL/KEY para nuvem)")
+
+
+# ==============================================================================
+# 10. ABA 1: AVALIAÇÃO PRELIMINAR & AJUIZAMENTO (PETIÇÃO INICIAL)
+# ==============================================================================
+if menu.startswith("1."):
+    st.title("Avaliação Preliminar & Liquidação de Petição Inicial (Art. 840, § 1º CLT)")
+    st.caption("Anexe o relato do cliente, TRCT, contracheques ou fotos do ambiente/EPI. A IA analisa o caso e entrega a liquidação pronta no padrão PJe-Calc.")
+
+    with st.container(border=True):
+        st.subheader("1. Relato do Caso e Upload de Provas / Documentos")
+        relato_txt = st.text_area(
+            "Descreva os fatos narrados pelo cliente (função, jornada, ambiente insalubre/perigoso, salários, rescisão):",
+            height=130,
+            key="relato_prelim_txt",
+        )
+        prelim_files = st.file_uploader(
+            "Anexe documentos ou fotos (PDF, PNG, JPG, CSV, XLSX, TXT)",
+            type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx", "xls", "txt"],
+            accept_multiple_files=True,
+            key="prelim_files_uploader",
+        )
+
         if st.button("🔍 Analisar Caso com IA e Calcular Petição Inicial", type="primary", key="btn_prelim_ai"):
             with st.spinner("Analisando fatos, documentos, NRs 15/16 e calculando no padrão PJe-Calc..."):
                 try:
@@ -1353,6 +1355,7 @@ with st.sidebar:
                             "salario_por_fora": float(ext.get("salario_por_fora") or 0.0),
                             "divisor": int(ext.get("divisor") or 220),
                             "work_days_per_week": int(ext.get("work_days_per_week") or 5),
+                            "tipo_rescisao": str(ext.get("tipo_rescisao") or "Sem Justa Causa (Iniciativa Empregador)"),
                             "insalubridade_pct": float(ext.get("insalubridade_pct") or 0.0),
                             "periculosidade_pct": float(ext.get("periculosidade_pct") or 0.0),
                             "he50_horas_mes": float(ext.get("he50_horas_mes") or 0.0),
@@ -1368,6 +1371,7 @@ with st.sidebar:
                             "multa_477": bool(ext.get("multa_477", False)),
                             "multa_467": bool(ext.get("multa_467", False)),
                             "aplicar_reflexos": True,
+                            "reflexos_em_dsr": True,
                             "reflexos_em_fgts": True,
                         }
                     )
@@ -1419,7 +1423,7 @@ with st.sidebar:
         p_resc_chk = c15.checkbox("Incluir Verbas Rescisórias", value=bool(p_ext.get("incluir_verbas_rescisorias", True)), key="p_resc_chk")
         p_aviso_chk = c16.checkbox("Aviso Prévio Indenizado", value=bool(p_ext.get("aviso_indenizado", True)), key="p_aviso_chk")
 
-        if st.button("🧮 Calcular Liquidação da Inicial e Salvar na Nuvem", type="primary", key="btn_calc_prelim"):
+        if st.button("🧮 Recalcular Liquidação da Inicial e Salvar na Nuvem", type="primary", key="btn_calc_prelim"):
             calc_res = run_pjecalc_engine(
                 {
                     "admissao": p_adm,
@@ -1437,6 +1441,7 @@ with st.sidebar:
                     "incluir_verbas_rescisorias": p_resc_chk,
                     "aviso_indenizado": p_aviso_chk,
                     "aplicar_reflexos": True,
+                    "reflexos_em_dsr": True,
                     "reflexos_em_fgts": True,
                 }
             )
@@ -1468,8 +1473,32 @@ with st.sidebar:
         safe_cli = re.sub(r"[^0-9A-Za-z_-]+", "_", res_p.get("client_name", "cliente"))
         d1.download_button("📄 Baixar Demonstrativo PJe-Calc (.PDF)", build_pjecalc_pdf_bytes(res_p, st.session_state["office_header"]), f"Inicial_PJeCalc_{safe_cli}.pdf", "application/pdf", use_container_width=True)
         d2.download_button("⚖️ Baixar Arquivo PJe-Calc (.PJC)", build_pjecalc_pjc_bytes(res_p), f"Inicial_PJeCalc_{safe_cli}.pjc", "application/xml", use_container_width=True)
+        d3.download_button("📊 Baixar Planilha Excel (.XLSX)", build_pjecalc_excel_bytes(res_p), f"Inicial_PJeCalc_{safe_cli}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+
+# ==============================================================================
+# 11. ABA 2: LIQUIDAÇÃO DE SENTENÇA TRANSITADA EM JULGADO (PADRÃO PJE-CALC)
+# ==============================================================================
+elif menu.startswith("2."):
+    st.title("Liquidação de Sentença Transitada em Julgado (Art. 879 CLT)")
+    st.caption("Anexe a cópia integral do processo / sentença / embargos de declaração. A IA extrai o comando condenatório, respeita os tetos da coisa julgada e entrega a liquidação pronta em PDF e .PJC.")
+
+    with st.container(border=True):
+        st.subheader("1. Upload da Cópia do Processo / Sentença + Observações do Advogado")
+        obs_sentenca = st.text_area(
+            "Observações do advogado sobre a sentença, embargos de declaração ou pontos para conferir (opcional):",
+            height=110,
+            key="obs_sentenca_txt",
+        )
+        sent_files = st.file_uploader(
+            "Anexe a Sentença / Cópia do Processo (PDF) e anexos (TRCT, Contracheques, Cartão de Ponto CSV/XLSX)",
+            type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx", "xls", "txt"],
+            accept_multiple_files=True,
+            key="sent_files_uploader",
+        )
+
         if st.button("⚖️ Ler Sentença / Processo e Calcular Liquidação Pronta (PJe-Calc)", type="primary", key="btn_read_sentence"):
-            with st.spinner("Lendo sentença, extraindo comando condenatório e calculando liquidação pronta no padrão PJe-Calc..."):
+            with st.spinner("Lendo sentença, embargos, TRCT e calculando liquidação pronta no padrão PJe-Calc..."):
                 try:
                     ext_s = analyze_sentence_with_gemini(obs_sentenca, sent_files)
                     st.session_state["sentence_extracted"] = ext_s
@@ -1482,6 +1511,7 @@ with st.sidebar:
                             "divisor": int(ext_s.get("divisor") or 220),
                             "work_days_per_week": int(ext_s.get("work_days_per_week") or 5),
                             "exact_total_days": int(ext_s.get("exact_total_days") or 0),
+                            "tipo_rescisao": str(ext_s.get("tipo_rescisao") or "Pedido de Demissão"),
                             "insalubridade_pct": float(ext_s.get("insalubridade_pct") or 0.0),
                             "periculosidade_pct": float(ext_s.get("periculosidade_pct") or 0.0),
                             "he50_horas_mes": float(ext_s.get("he50_horas_mes") or 0.0),
@@ -1492,6 +1522,7 @@ with st.sidebar:
                             "outras_verbas_desc": str(ext_s.get("outras_verbas_desc") or "Outras Verbas Deferidas"),
                             "outras_verbas_valor": float(ext_s.get("outras_verbas_valor") or 0.0),
                             "aplicar_reflexos": bool(ext_s.get("aplicar_reflexos", True)),
+                            "reflexos_em_dsr": bool(ext_s.get("reflexos_em_dsr", False)),
                             "reflexos_em_fgts": bool(ext_s.get("reflexos_em_fgts", True)),
                             "incluir_verbas_rescisorias": False,
                             "teto_intrajornada": float(ext_s.get("teto_intrajornada") or 0.0),
@@ -1501,7 +1532,7 @@ with st.sidebar:
                             "teto_global": float(ext_s.get("teto_global") or 0.0),
                             "criterio_atualizacao": str(
                                 ext_s.get("criterio_atualizacao")
-                                or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC)"
+                                or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC - Lei 14.905/2024)"
                             ),
                             "atualizacao_juros_pct": float(ext_s.get("atualizacao_juros_pct") or 0.0),
                             "honorarios_sucumbencia_pct": float(ext_s.get("honorarios_sucumbencia_pct") or 15.0),
@@ -1552,17 +1583,17 @@ with st.sidebar:
                 st.markdown(s_ext["parecer_sentenca"])
 
     with st.container(border=True):
-        st.subheader("2. Conferência dos Parâmetros da Liquidação (Motor PJe-Calc + Coisa Julgada)")
+        st.subheader("2. Conferência / Ajuste Manual dos Parâmetros (Motor PJe-Calc + Coisa Julgada)")
 
         sp1, sp2, sp3, sp4 = st.columns([1.8, 2.2, 2.2, 1.8])
-        s_proc = sp1.text_input("Número do Processo *", value=str(s_ext.get("process_number") or "0000000-00.2025.5.04.0000"))
+        s_proc = sp1.text_input("Número do Processo *", value=str(s_ext.get("process_number") or "0020108-86.2026.5.04.0233"))
         s_client = sp2.text_input("Reclamante *", value=str(s_ext.get("client_name") or ""))
         s_def = sp3.text_input("Reclamada *", value=str(s_ext.get("defendant_name") or ""))
         s_court = sp4.text_input("Vara do Trabalho", value=str(s_ext.get("court_name") or "Vara do Trabalho"))
 
         sd1, sd2, sd3, sd4 = st.columns(4)
         s_adm = sd1.date_input("Data de Admissão (Vínculo)", value=parse_date_safe(s_ext.get("admissao"), dt.date(2024, 8, 13)), key="s_adm")
-        s_res = sd2.date_input("Data de Rescisão (Vínculo)", value=parse_date_safe(s_ext.get("rescisao"), dt.date(2025, 7, 7)), key="s_res")
+        s_res = sd2.date_input("Data de Desligamento (Vínculo)", value=parse_date_safe(s_ext.get("rescisao"), dt.date(2025, 7, 7)), key="s_res")
         s_esc = sd3.selectbox(
             "Escala Semanal Reconhecida",
             [5, 6],
@@ -1571,43 +1602,58 @@ with st.sidebar:
             key="s_esc",
         )
         s_exact_days = sd4.number_input(
-            "Dias Trabalhados Exatos (0 = auto)",
+            "Dias Úteis Trabalhados (0 = auto)",
             min_value=0,
             max_value=3650,
             value=int(s_ext.get("exact_total_days") or 0),
             step=1,
-            help="Informe o número exato de dias úteis trabalhados (ex.: 225) ou deixe 0 para o calendário calcular automaticamente.",
+            help="Informe o número exato de dias úteis (ex.: 235) ou deixe 0 para o calendário calcular automaticamente.",
             key="s_exact_days",
         )
 
+        modalidades_lista = [
+            "Pedido de Demissão",
+            "Sem Justa Causa (Iniciativa Empregador)",
+            "Rescisão Indireta",
+            "Justa Causa",
+        ]
+        mod_ai = str(s_ext.get("tipo_rescisao") or "Pedido de Demissão")
+        mod_idx = 0
+        for idx_m, m_lbl in enumerate(modalidades_lista):
+            if mod_ai.lower() in m_lbl.lower() or m_lbl.lower() in mod_ai.lower():
+                mod_idx = idx_m
+                break
+
         sv1, sv2, sv3, sv4 = st.columns(4)
-        s_sal = sv1.number_input("Salário-Base (R$)", min_value=0.0, value=float(s_ext.get("salario_base") or 2228.60), step=10.0, key="s_sal")
+        s_sal = sv1.number_input("Salário-Base Reconhecido (R$)", min_value=0.0, value=float(s_ext.get("salario_base") or 2228.60), step=10.0, key="s_sal")
         s_div = sv2.number_input("Divisor Mensal", min_value=100, max_value=240, value=int(s_ext.get("divisor") or 220), step=10, key="s_div")
         s_intra = sv3.number_input("Intervalo Intrajornada (min/dia)", min_value=0.0, max_value=120.0, value=float(s_ext.get("intrajornada_min_dia") or 0.0), step=5.0, key="s_intra")
-        s_he50 = sv4.number_input("Horas Extras 50% / mês", min_value=0.0, value=float(s_ext.get("he50_horas_mes") or 0.0), step=1.0, key="s_he50")
+        s_tipo_resc = sv4.selectbox("Modalidade da Rescisão (TRCT)", modalidades_lista, index=mod_idx, key="s_tipo_resc")
 
         sv5, sv6, sv7, sv8 = st.columns(4)
         s_desc = sv5.number_input("Restituição de Descontos (R$)", min_value=0.0, value=float(s_ext.get("descontos_devolver") or 0.0), step=50.0, key="s_desc")
-        s_insal = sv6.selectbox("Insalubridade (%)", [0.0, 10.0, 20.0, 40.0], index=[0.0, 10.0, 20.0, 40.0].index(float(s_ext.get("insalubridade_pct") or 0.0)) if float(s_ext.get("insalubridade_pct") or 0.0) in [0.0, 10.0, 20.0, 40.0] else 0, key="s_insal")
-        s_peric = sv7.selectbox("Periculosidade (%)", [0.0, 30.0], index=1 if float(s_ext.get("periculosidade_pct") or 0.0) >= 30.0 else 0, key="s_peric")
+        s_he50 = sv6.number_input("Horas Extras 50% / mês", min_value=0.0, value=float(s_ext.get("he50_horas_mes") or 0.0), step=1.0, key="s_he50")
+        s_insal = sv7.selectbox("Insalubridade (%)", [0.0, 10.0, 20.0, 40.0], index=[0.0, 10.0, 20.0, 40.0].index(float(s_ext.get("insalubridade_pct") or 0.0)) if float(s_ext.get("insalubridade_pct") or 0.0) in [0.0, 10.0, 20.0, 40.0] else 0, key="s_insal")
         s_outras_val = sv8.number_input("Outras Verbas Deferidas (R$)", min_value=0.0, value=float(s_ext.get("outras_verbas_valor") or 0.0), step=50.0, key="s_outras_val")
 
         st.markdown("##### 🔒 Travas de Coisa Julgada (Tetos da Inicial - Art. 879, § 1º CLT), Reflexos e Honorários")
         st1, st2, st3, st4 = st.columns(4)
-        s_teto_intra = st1.number_input("Teto Intervalo Intrajornada (R$)", min_value=0.0, value=float(s_ext.get("teto_intrajornada") or 0.0), step=10.0, help="Se a sentença limitou ao valor da inicial (ex.: R$ 1.337,60), informe aqui.", key="s_teto_intra")
+        s_teto_intra = st1.number_input("Teto Intervalo Intrajornada (R$)", min_value=0.0, value=float(s_ext.get("teto_intrajornada") or 0.0), step=10.0, key="s_teto_intra")
         s_teto_desc = st2.number_input("Teto Descontos Indevidos (R$)", min_value=0.0, value=float(s_ext.get("teto_descontos") or 0.0), step=10.0, key="s_teto_desc")
         s_teto_he50 = st3.number_input("Teto Horas Extras 50% (R$)", min_value=0.0, value=float(s_ext.get("teto_he50") or 0.0), step=10.0, key="s_teto_he50")
         s_teto_global = st4.number_input("Teto Global Condenação (R$)", min_value=0.0, value=float(s_ext.get("teto_global") or 0.0), step=50.0, key="s_teto_global")
 
         sh1, sh2, sh3, sh4 = st.columns(4)
         s_ref_chk = sh1.checkbox("Calcular Reflexos Deferidos", value=bool(s_ext.get("aplicar_reflexos", True)), key="s_ref_chk")
-        s_fgts_chk = sh2.checkbox("Incluir Reflexos em FGTS", value=bool(s_ext.get("reflexos_em_fgts", True)), key="s_fgts_chk")
-        s_juros_pct = sh3.number_input("Atualização + Juros Acumulados (%)", min_value=0.0, max_value=500.0, value=float(s_ext.get("atualizacao_juros_pct") or 0.0), step=0.5, key="s_juros_pct")
+        s_dsr_chk = sh2.checkbox("Incluir Reflexo em DSR", value=bool(s_ext.get("reflexos_em_dsr", False)), key="s_dsr_chk")
+        s_fgts_chk = sh3.checkbox("Incluir Reflexos em FGTS", value=bool(s_ext.get("reflexos_em_fgts", True)), key="s_fgts_chk")
         s_hon_pct = sh4.number_input("Honorários Sucumbência (%)", min_value=0.0, max_value=30.0, value=float(s_ext.get("honorarios_sucumbencia_pct") or 15.0), step=1.0, key="s_hon_pct")
 
-        s_crit_atu = st.text_input(
+        sc1, sc2 = st.columns([1.2, 2.8])
+        s_juros_pct = sc1.number_input("Atualização + Juros Acumulados (%)", min_value=0.0, max_value=500.0, value=float(s_ext.get("atualizacao_juros_pct") or 0.0), step=0.5, key="s_juros_pct")
+        s_crit_atu = sc2.text_input(
             "Critério de Correção Monetária e Juros (Sentença / ADC 58 STF):",
-            value=str(s_ext.get("criterio_atualizacao") or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC)"),
+            value=str(s_ext.get("criterio_atualizacao") or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC - Lei 14.905/2024)"),
             key="s_crit_atu",
         )
 
@@ -1617,7 +1663,7 @@ with st.sidebar:
             key="conf_liq_chk",
         )
 
-        if st.button("🧮 Calcular Liquidação de Sentença (Padrão PJe-Calc)", type="primary", disabled=not conf_liq, key="btn_calc_sentence"):
+        if st.button("🧮 Recalcular Liquidação de Sentença (Padrão PJe-Calc)", type="primary", disabled=not conf_liq, key="btn_calc_sentence"):
             res_s = run_pjecalc_engine(
                 {
                     "admissao": s_adm,
@@ -1626,14 +1672,15 @@ with st.sidebar:
                     "divisor": s_div,
                     "work_days_per_week": s_esc,
                     "exact_total_days": s_exact_days,
+                    "tipo_rescisao": s_tipo_resc,
                     "insalubridade_pct": s_insal,
-                    "periculosidade_pct": s_peric,
                     "he50_horas_mes": s_he50,
                     "intrajornada_min_dia": s_intra,
                     "descontos_devolver": s_desc,
                     "outras_verbas_desc": str(s_ext.get("outras_verbas_desc") or "Outras Verbas Deferidas"),
                     "outras_verbas_valor": s_outras_val,
                     "aplicar_reflexos": s_ref_chk,
+                    "reflexos_em_dsr": s_dsr_chk,
                     "reflexos_em_fgts": s_fgts_chk,
                     "incluir_verbas_rescisorias": False,
                     "teto_intrajornada": s_teto_intra,
@@ -1661,7 +1708,6 @@ with st.sidebar:
             )
             st.success(f"Liquidação calculada no padrão PJe-Calc e salva! Total Geral: {res_s['total_geral_fmt']}")
 
-    # Exibição do Demonstrativo PJe-Calc e Botões de Exportação (PDF + .PJC + Excel)
     if st.session_state.get("sentence_calc_result"):
         res_liq = st.session_state["sentence_calc_result"]
 
@@ -1680,7 +1726,7 @@ with st.sidebar:
                     hide_index=True,
                 )
             else:
-                st.warning("Nenhuma verba foi apurada porque os parâmetros acima estão zerados (ex.: preencha o Intervalo Intrajornada, Restituição de Descontos ou clique em 'Ler Sentença' primeiro).")
+                st.warning("Nenhuma verba foi apurada porque os parâmetros acima estão zerados. Anexe a sentença acima e clique em 'Ler Sentença / Processo e Calcular Liquidação Pronta'.")
         with tab_ocorr_m:
             if res_liq.get("ocorrencias"):
                 st.dataframe(pd.DataFrame(res_liq["ocorrencias"]), use_container_width=True, hide_index=True)
