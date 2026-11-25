@@ -1502,40 +1502,61 @@ elif menu.startswith("2."):
                 try:
                     ext_s = analyze_sentence_with_gemini(obs_sentenca, sent_files)
                     st.session_state["sentence_extracted"] = ext_s
+                    # Sincroniza os keys dos widgets da tela para exibir imediatamente os valores extraídos
+                    st.session_state["s_adm"] = parse_date_safe(ext_s.get("admissao"), dt.date(2024, 8, 13))
+                    st.session_state["s_res"] = parse_date_safe(ext_s.get("rescisao"), dt.date(2025, 7, 7))
+                    st.session_state["s_esc"] = 5 if int(ext_s.get("work_days_per_week") or 5) == 5 else 6
+                    st.session_state["s_exact_days"] = int(ext_s.get("exact_total_days") or 0)
+                    st.session_state["s_sal"] = float(ext_s.get("salario_base") or 0.0)
+                    st.session_state["s_div"] = int(ext_s.get("divisor") or 220)
+                    st.session_state["s_intra"] = float(ext_s.get("intrajornada_min_dia") or 0.0)
+                    st.session_state["s_desc"] = float(ext_s.get("descontos_devolver") or 0.0)
+                    st.session_state["s_he50"] = float(ext_s.get("he50_horas_mes") or 0.0)
+                    st.session_state["s_outras_val"] = float(ext_s.get("outras_verbas_valor") or 0.0)
+                    st.session_state["s_teto_intra"] = float(ext_s.get("teto_intrajornada") or 0.0)
+                    st.session_state["s_teto_desc"] = float(ext_s.get("teto_descontos") or 0.0)
+                    st.session_state["s_teto_he50"] = float(ext_s.get("teto_he50") or 0.0)
+                    st.session_state["s_teto_global"] = float(ext_s.get("teto_global") or 0.0)
+                    st.session_state["s_ref_chk"] = bool(ext_s.get("aplicar_reflexos", True))
+                    st.session_state["s_dsr_chk"] = bool(ext_s.get("reflexos_em_dsr", False))
+                    st.session_state["s_fgts_chk"] = bool(ext_s.get("reflexos_em_fgts", True))
+                    st.session_state["s_hon_pct"] = float(ext_s.get("honorarios_sucumbencia_pct") or 15.0)
+                    st.session_state["s_juros_pct"] = float(ext_s.get("atualizacao_juros_pct") or 0.0)
+                    st.session_state["s_crit_atu"] = str(
+                        ext_s.get("criterio_atualizacao")
+                        or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC - Lei 14.905/2024)"
+                    )
+
                     res_auto_s = run_pjecalc_engine(
                         {
-                            "admissao": parse_date_safe(ext_s.get("admissao"), dt.date(2024, 8, 13)),
-                            "rescisao": parse_date_safe(ext_s.get("rescisao"), dt.date(2025, 7, 7)),
-                            "salario_base": float(ext_s.get("salario_base") or 0.0),
+                            "admissao": st.session_state["s_adm"],
+                            "rescisao": st.session_state["s_res"],
+                            "salario_base": st.session_state["s_sal"],
                             "salario_por_fora": float(ext_s.get("salario_por_fora") or 0.0),
-                            "divisor": int(ext_s.get("divisor") or 220),
-                            "work_days_per_week": int(ext_s.get("work_days_per_week") or 5),
-                            "exact_total_days": int(ext_s.get("exact_total_days") or 0),
+                            "divisor": st.session_state["s_div"],
+                            "work_days_per_week": st.session_state["s_esc"],
+                            "exact_total_days": st.session_state["s_exact_days"],
                             "tipo_rescisao": str(ext_s.get("tipo_rescisao") or "Pedido de Demissão"),
                             "insalubridade_pct": float(ext_s.get("insalubridade_pct") or 0.0),
                             "periculosidade_pct": float(ext_s.get("periculosidade_pct") or 0.0),
-                            "he50_horas_mes": float(ext_s.get("he50_horas_mes") or 0.0),
+                            "he50_horas_mes": st.session_state["s_he50"],
                             "he100_horas_mes": float(ext_s.get("he100_horas_mes") or 0.0),
-                            "intrajornada_min_dia": float(ext_s.get("intrajornada_min_dia") or 0.0),
+                            "intrajornada_min_dia": st.session_state["s_intra"],
                             "noturno_horas_mes": float(ext_s.get("noturno_horas_mes") or 0.0),
-                            "descontos_devolver": float(ext_s.get("descontos_devolver") or 0.0),
+                            "descontos_devolver": st.session_state["s_desc"],
                             "outras_verbas_desc": str(ext_s.get("outras_verbas_desc") or "Outras Verbas Deferidas"),
-                            "outras_verbas_valor": float(ext_s.get("outras_verbas_valor") or 0.0),
-                            "aplicar_reflexos": bool(ext_s.get("aplicar_reflexos", True)),
-                            "reflexos_em_dsr": bool(ext_s.get("reflexos_em_dsr", False)),
-                            "reflexos_em_fgts": bool(ext_s.get("reflexos_em_fgts", True)),
+                            "outras_verbas_valor": st.session_state["s_outras_val"],
+                            "aplicar_reflexos": st.session_state["s_ref_chk"],
+                            "reflexos_em_dsr": st.session_state["s_dsr_chk"],
+                            "reflexos_em_fgts": st.session_state["s_fgts_chk"],
                             "incluir_verbas_rescisorias": False,
-                            "teto_intrajornada": float(ext_s.get("teto_intrajornada") or 0.0),
-                            "teto_descontos": float(ext_s.get("teto_descontos") or 0.0),
-                            "teto_he50": float(ext_s.get("teto_he50") or 0.0),
-                            "teto_adicional": float(ext_s.get("teto_adicional") or 0.0),
-                            "teto_global": float(ext_s.get("teto_global") or 0.0),
-                            "criterio_atualizacao": str(
-                                ext_s.get("criterio_atualizacao")
-                                or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC - Lei 14.905/2024)"
-                            ),
-                            "atualizacao_juros_pct": float(ext_s.get("atualizacao_juros_pct") or 0.0),
-                            "honorarios_sucumbencia_pct": float(ext_s.get("honorarios_sucumbencia_pct") or 15.0),
+                            "teto_intrajornada": st.session_state["s_teto_intra"],
+                            "teto_descontos": st.session_state["s_teto_desc"],
+                            "teto_he50": st.session_state["s_teto_he50"],
+                            "teto_global": st.session_state["s_teto_global"],
+                            "criterio_atualizacao": st.session_state["s_crit_atu"],
+                            "atualizacao_juros_pct": st.session_state["s_juros_pct"],
+                            "honorarios_sucumbencia_pct": st.session_state["s_hon_pct"],
                         }
                     )
                     res_auto_s["process_number"] = str(ext_s.get("process_number") or "").strip()
@@ -1551,7 +1572,7 @@ elif menu.startswith("2."):
                         ai_report=ext_s.get("parecer_sentenca", ""),
                         chat_history=st.session_state.get("sentence_chat_current", []),
                     )
-                    st.success(f"Sentença lida e liquidação pronta no padrão PJe-Calc! Total Geral: {res_auto_s['total_geral_fmt']}")
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"Erro ao analisar o processo via Gemini: {exc}")
 
