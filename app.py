@@ -303,9 +303,118 @@ def _ensure_session_state() -> None:
         st.session_state.cloud_connected = False
     if "cloud_status_detail" not in st.session_state:
         st.session_state.cloud_status_detail = ""
+    if "sentence_ai_data" not in st.session_state:
+        st.session_state.sentence_ai_data = None
+    if "sentence_confirmed" not in st.session_state:
+        st.session_state.sentence_confirmed = False
+    if "sentence_timecard_result" not in st.session_state:
+        st.session_state.sentence_timecard_result = None
 
 
 _ensure_session_state()
+
+
+# ==============================================================================
+# 4. EXTRATOR IA ESPECIALIZADO EM LIQUIDAÇÃO DE SENTENÇA (PROCESSO JULGADO)
+# ==============================================================================
+class SentenceLiquidationSchema(BaseModel):
+    process_number: Optional[str] = Field(None, description="Número completo do processo trabalhista (CNJ)")
+    vara_trabalho: Optional[str] = Field(None, description="Vara do Trabalho / Tribunal")
+    worker_name: Optional[str] = Field(None, description="Nome do Reclamante / Exequente")
+    employer_name: Optional[str] = Field(None, description="Nome da Reclamada / Executada")
+    role_title: Optional[str] = Field(None, description="Cargo ou função reconhecida na sentença")
+    admission_date: Optional[str] = Field(None, description="Data de admissão reconhecida (YYYY-MM-DD)")
+    dismissal_date: Optional[str] = Field(None, description="Data de demissão/rescisão reconhecida (YYYY-MM-DD)")
+    termination_type: Optional[str] = Field(None, description="sem_justa_causa, rescisao_indireta, pedido_demissao, acordo ou justa_causa")
+    base_salary: Optional[float] = Field(None, description="Salário-base reconhecido para cálculo")
+    commissions: Optional[float] = Field(None, description="Média de comissões ou salário por fora integrado")
+    monthly_divisor: Optional[int] = Field(220, description="Divisor fixado na sentença (ex: 220, 200, 180)")
+    dispositivo_resumo: Optional[str] = Field(None, description="Resumo fiel do dispositivo da sentença (apenas verbas DEFERIDAS)")
+    verbas_deferidas: List[str] = Field(default_factory=list, description="Lista objetiva das verbas condenadas na sentença")
+    verbas_indeferidas: List[str] = Field(default_factory=list, description="Lista objetiva das verbas julgadas improcedentes (excluir do cálculo)")
+    parametros_liquidacao: Optional[str] = Field(None, description="Critérios fixados: prescrição quinquenal, dedução de valores pagos, reflexos, base de cálculo, juros/correção (ADC 58 STF)")
+    divergencias_calculo_adverso: Optional[str] = Field(None, description="Se houver planilha da empresa/perito anexada, apontar erros ou omissões encontradas")
+    adicional_sugerido: Optional[str] = Field(None, description="Nenhum, Insalubridade (sobre Salário Mínimo) ou Periculosidade (sobre Salário-Base)")
+    adicional_percentual_sugerido: Optional[float] = Field(0.0, description="Percentual deferido (10, 20, 30 ou 40)")
+    weekly_he50_hours: Optional[float] = Field(0.0, description="Horas extras 50% semanais deferidas (se não houver cartão de ponto)")
+    monthly_sundays_worked: Optional[int] = Field(0, description="Domingos/feriados mensais deferidos (100%)")
+    suppressed_break_minutes: Optional[int] = Field(0, description="Minutos diários de intervalo intrajornada deferidos")
+    weekly_night_hours: Optional[float] = Field(0.0, description="Horas noturnas semanais deferidas")
+    trct_paid_total: Optional[float] = Field(0.0, description="Total de valores já pagos cuja dedução foi autorizada na sentença")
+    fgts_nao_depositado_contrato: Optional[float] = Field(0.0, description="Diferenças de FGTS deferidas")
+    meses_estabilidade_restantes: Optional[int] = Field(0, description="Meses de indenização substitutiva de estabilidade deferidos")
+    restituicao_descontos: Optional[float] = Field(0.0, description="Devolução de descontos indevidos deferida")
+    sugerir_saldo_salario: Optional[bool] = Field(False, description="True se saldo de salário foi deferido")
+    sugerir_aviso_previo: Optional[bool] = Field(False, description="True se aviso-prévio foi deferido")
+    sugerir_13_e_ferias: Optional[bool] = Field(False, description="True se 13º e/ou férias + 1/3 foram deferidos")
+    sugerir_fgts_e_multa: Optional[bool] = Field(False, description="True se FGTS + multa rescisória foram deferidos")
+    multa_fgts_percentual_sugerido: Optional[float] = Field(40.0, description="Percentual da multa do FGTS deferida (40 ou 20)")
+    sugerir_multa_477: Optional[bool] = Field(False, description="True se multa do art. 477 CLT foi deferida")
+    sugerir_multa_467: Optional[bool] = Field(False, description="True se multa do art. 467 CLT foi deferida")
+    minuta_peticao_liquidacao: Optional[str] = Field(None, description="Esboço de petição de apresentação de cálculos de liquidação de sentença (Art. 879 CLT)")
+
+
+def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Lê a cópia integral do processo / sentença transitada em julgado e extrai exclusivamente o comando condenatório."""
+    if not GENAI_AVAILABLE:
+        raise RuntimeError("Biblioteca google-genai não instalada.")
+    api_key = ""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY não configurada.")
+
+    client = genai.Client(api_key=api_key)
+    prompt = (
+        "Você é um Perito Contábil e Calculista Judicial Trabalhista especialista em Liquidação de Sentença (Art. 879 da CLT).\n"
+        "Analise atentamente a cópia do processo/sentença transitada em julgado e eventuais planilhas/documentos anexados.\n"
+        "REGRAS ESTRITAS:\n"
+        "1. Leia o DISPOSITIVO da sentença e separe rigorosamente o que foi DEFERIDO do que foi IMPROCEDENTE.\n"
+        "2. Marque como True APENAS as verbas expressamente condenadas na sentença (não inclua pedidos negados).\n"
+        "3. Extraia datas, salário-base, divisor, adicionais, prescrição e autorização de dedução de parcelas pagas.\n"
+        "4. Se houver planilha da empresa ou perito anexada, aponte eventuais divergências em 'divergencias_calculo_adverso'.\n"
+        f"\nObservações do advogado exequente: {notes or 'Nenhuma observação adicional.'}"
+    )
+
+    contents: List[Any] = [prompt]
+    for f in files:
+        contents.append(types.Part.from_bytes(data=f["bytes"], mime_type=f["mime"]))
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SentenceLiquidationSchema,
+            temperature=0.0,
+        ),
+    )
+    return json.loads(response.text)
+
+
+# ==============================================================================
+# 5. PORTAL DE LOGIN E CADASTRO (COM CONTROLE DE LICENÇA)
+# ==============================================================================
+if st.session_state.auth_user is None:
+    st.markdown("## ⚖️ ED Cálculos Trabalhistas — Acesso ao Sistema")
+    if st.session_state.auth_blocked_info:
+        blk = st.session_state.auth_blocked_info
+        st.error(f"**Acesso Restrito ({blk.get('email', '')}):** {blk.get('reason', 'Licença inativa.')}")
+        if st.button("Tentar Novamente / Voltar ao Login"):
+            st.session_state.auth_blocked_info = None
+            st.rerun()
+        st.stop()
+
+    _, center_col, _ = st.columns([1, 1.4, 1])
+    with center_col:
+        with st.container(border=True):
+            tab_login, tab_signup = st.tabs(["Entrar (Login)", "Cadastrar Escritório"])
+
             with tab_login:
                 with st.form("login_auth_form"):
                     login_email = st.text_input("E-mail profissional *", placeholder="advogado@escritorio.com.br")
@@ -403,6 +512,7 @@ with st.sidebar:
         "Navegação",
         [
             "Avaliação Preliminar & Auditoria",
+            "Liquidação de Sentença & Impugnação",
             "Meus Cálculos e Relatórios",
         ],
     )
@@ -995,6 +1105,320 @@ if menu == "Avaliação Preliminar & Auditoria":
                 st.rerun()
             except Exception as wide_chat_exc:
                 st.error(f"Erro no chat: {wide_chat_exc}")
+
+elif menu == "Liquidação de Sentença & Impugnação":
+    st.title("Liquidação de Sentença Transitada em Julgado (Art. 879 CLT)")
+    st.markdown(
+        "Anexe a **cópia integral do processo / sentença sem recurso** (e, se houver, cartões de ponto, contracheques ou planilha da parte contrária). "
+        "A IA identifica **exclusivamente o que foi deferido no dispositivo**, descarta os pedidos improcedentes e preenche o motor decimal exato para gerar a planilha de liquidação."
+    )
+
+    with st.container(border=True):
+        st.subheader("1. Upload da Cópia do Processo / Sentença + Documentos dos Autos")
+        sent_notes = st.text_area(
+            "Observações do advogado sobre a sentença ou pontos para conferir no cálculo adverso (opcional):",
+            placeholder="Ex.: Processo transitado em julgado sem recurso. Conferir horas extras deferidas acima da 8ª diária, reflexos em DSR/13º/férias/FGTS + 40% e dedução do TRCT.",
+            height=105,
+            key="sentence_notes_box",
+        )
+        sent_files = st.file_uploader(
+            "Anexe a Sentença / Cópia do Processo (PDF) e anexos (Cartão de Ponto CSV/XLSX, Contracheques, Planilha Adversa)",
+            type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx", "txt"],
+            accept_multiple_files=True,
+            key="sentence_dossier_uploader",
+        )
+        if sent_files:
+            st.caption(f"**{len(sent_files)} arquivo(s) anexado(s):** " + ", ".join(f"`{f.name}`" for f in sent_files))
+
+        if st.button("Ler Sentença / Processo e Extrair Comando Condenatório (IA)", type="primary"):
+            if not sent_notes.strip() and not sent_files:
+                st.warning("Anexe a cópia do processo/sentença em PDF ou descreva o dispositivo da sentença.")
+            else:
+                g_files: List[Dict[str, Any]] = []
+                tc_dfs: List[pd.DataFrame] = []
+                for f in (sent_files or []):
+                    fn_low = f.name.lower()
+                    if fn_low.endswith(".csv"):
+                        raw_t = f.getvalue().decode("utf-8", errors="ignore")
+                        first_l = raw_t.splitlines()[0] if raw_t.splitlines() else ""
+                        sep = ";" if ";" in first_l else ","
+                        df_t = pd.read_csv(io.StringIO(raw_t), sep=sep)
+                        if {"Entrada1", "Saida1"}.issubset(set(df_t.columns)):
+                            tc_dfs.append(df_t)
+                        else:
+                            g_files.append({"name": f.name, "bytes": raw_t.encode("utf-8"), "mime": "text/plain"})
+                    elif fn_low.endswith(".xlsx"):
+                        df_t = pd.read_excel(f)
+                        if {"Entrada1", "Saida1"}.issubset(set(df_t.columns)):
+                            tc_dfs.append(df_t)
+                        else:
+                            g_files.append({"name": f.name, "bytes": df_t.to_csv(index=False).encode("utf-8"), "mime": "text/plain"})
+                    else:
+                        m_map = {
+                            ".pdf": "application/pdf",
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".txt": "text/plain",
+                        }
+                        ext = "." + fn_low.rsplit(".", 1)[-1] if "." in fn_low else ".txt"
+                        g_files.append({"name": f.name, "bytes": f.getvalue(), "mime": m_map.get(ext, "application/pdf")})
+
+                if tc_dfs:
+                    st.session_state.sentence_timecard_result = process_timecard_dataframe(pd.concat(tc_dfs, ignore_index=True))
+                    st.success("Cartão de ponto dos autos apurado matematicamente!")
+
+                try:
+                    with st.spinner("Lendo os autos e extraindo dispositivo condenatório da sentença..."):
+                        st.session_state.sentence_ai_data = analyze_sentence_with_gemini(sent_notes, g_files)
+                        st.session_state.sentence_confirmed = False
+                    st.success("Leitura da sentença concluída! Confira abaixo o que foi deferido e indeferido.")
+                except Exception as s_exc:
+                    st.error(f"Erro ao analisar o processo via Gemini: {s_exc}")
+
+    s_ext = st.session_state.sentence_ai_data or {}
+    s_tc = st.session_state.sentence_timecard_result
+
+    if s_ext:
+        with st.container(border=True):
+            st.subheader("Diagnóstico do Dispositivo da Sentença (Trânsito em Julgado)")
+            if s_ext.get("dispositivo_resumo"):
+                st.info(f"**Resumo do Comando Condenatório:** {s_ext['dispositivo_resumo']}")
+            if s_ext.get("parametros_liquidacao"):
+                st.warning(f"**Critérios de Liquidação Fixados pelo Juízo:** {s_ext['parametros_liquidacao']}")
+            if s_ext.get("divergencias_calculo_adverso"):
+                st.error(f"**Divergências / Erros Identificados no Cálculo Adverso:** {s_ext['divergencias_calculo_adverso']}")
+
+            col_def, col_indef = st.columns(2)
+            with col_def:
+                st.markdown("#### ✅ Verbas DEFERIDAS (Entram no Cálculo)")
+                for item in (s_ext.get("verbas_deferidas") or ["Nenhuma verba listada"]):
+                    st.markdown(f"- ✅ {item}")
+            with col_indef:
+                st.markdown("#### ❌ Verbas IMPROCEDENTES (Excluídas)")
+                for item in (s_ext.get("verbas_indeferidas") or ["Nenhum pedido improcedente informado"]):
+                    st.markdown(f"- ❌ {item}")
+
+            st.session_state.sentence_confirmed = st.checkbox(
+                "Confirmo que conferi o dispositivo da sentença e os parâmetros extraídos antes de liquidar",
+                value=st.session_state.sentence_confirmed,
+                key="chk_confirm_sentence_liq",
+            )
+
+    def _parse_dt_sent(val: Optional[str], fallback: date) -> date:
+        if not val:
+            return fallback
+        try:
+            return datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return fallback
+
+    with st.form("sentence_liquidation_form"):
+        st.subheader("2. Parâmetros da Liquidação de Sentença (Art. 879 CLT)")
+        s_timbre = st.text_input(
+            "Timbre do Escritório / Advogado (PDF)",
+            value=str(current_user.get("office_header") or "Escritório de Advocacia Trabalhista — Liquidação de Sentença"),
+        )
+        sp1, sp2, sp3, sp4 = st.columns(4)
+        s_proc = sp1.text_input("Número do Processo (CNJ) *", value=str(s_ext.get("process_number") or "0000000-00.2025.5.04.0000"))
+        s_reclamante = sp2.text_input("Exequente / Reclamante *", value=str(s_ext.get("worker_name") or ""))
+        s_reclamada = sp3.text_input("Executada / Reclamada *", value=str(s_ext.get("employer_name") or ""))
+        s_cargo = sp4.text_input("Cargo / Função", value=str(s_ext.get("role_title") or ""))
+
+        s_motivos = ["sem_justa_causa", "rescisao_indireta", "pedido_demissao", "acordo", "justa_causa"]
+        s_mot_ext = s_ext.get("termination_type") if s_ext.get("termination_type") in s_motivos else "sem_justa_causa"
+
+        sd1, sd2, sd3, sd4 = st.columns(4)
+        s_adm = sd1.date_input("Admissão Reconhecida *", value=_parse_dt_sent(s_ext.get("admission_date"), date(2024, 2, 1)), key="s_adm_dt")
+        s_dism = sd2.date_input("Rescisão Reconhecida *", value=_parse_dt_sent(s_ext.get("dismissal_date"), date(2026, 10, 31)), key="s_dism_dt")
+        s_motivo = sd3.selectbox("Modalidade da Rescisão", s_motivos, index=s_motivos.index(s_mot_ext))
+        s_divisor = sd4.number_input("Divisor Fixado", min_value=1, max_value=300, value=max(1, min(300, f_int(s_ext.get("monthly_divisor"), 220))))
+
+        sr1, sr2, sr3, sr4, sr5 = st.columns([2, 2, 2.2, 1.5, 2])
+        s_sal = sr1.number_input("Salário-Base (R$) *", min_value=0.0, value=max(0.0, f_float(s_ext.get("base_salary"), 0.0)), step=50.0)
+        s_comis = sr2.number_input("Comissões / Integrações (R$/mês)", min_value=0.0, value=max(0.0, f_float(s_ext.get("commissions"), 0.0)), step=50.0)
+        s_adic_opts = ["Nenhum", "Insalubridade (sobre Salário Mínimo)", "Periculosidade (sobre Salário-Base)"]
+        s_raw_adic = str(s_ext.get("adicional_sugerido") or "Nenhum")
+        s_adic_idx = 1 if "Insalubridade" in s_raw_adic else (2 if "Periculosidade" in s_raw_adic else 0)
+        s_adic = sr3.selectbox("Adicional Deferido", s_adic_opts, index=s_adic_idx)
+        s_adic_pct = sr4.number_input("Percentual (%)", min_value=0.0, max_value=100.0, value=max(0.0, min(100.0, f_float(s_ext.get("adicional_percentual_sugerido"), 0.0))), step=5.0)
+        s_deducao = sr5.number_input("Dedução Valores Pagos (R$)", min_value=0.0, value=max(0.0, f_float(s_ext.get("trct_paid_total"), 0.0)), step=100.0)
+
+        if s_tc is not None:
+            st.info(
+                f"Cartão de ponto dos autos apurado: **{s_tc['he50_hours']}h** HE 50% | "
+                f"**{s_tc['he100_hours']}h** HE 100% | **{s_tc['intrajornada_hours']}h** intrajornada | "
+                f"**{s_tc['night_ficta_hours']}h** noturnas fictas."
+            )
+            s_he50_sem = 0.0
+            s_dom_mes = 0
+            s_intra_min = 0
+            s_not_sem = 0.0
+        else:
+            sj1, sj2, sj3, sj4 = st.columns(4)
+            s_he50_sem = sj1.number_input("HE 50% / Semana Deferidas", min_value=0.0, value=max(0.0, f_float(s_ext.get("weekly_he50_hours"), 0.0)), step=0.5)
+            s_dom_mes = sj2.number_input("Domingos/Fer. 100% / Mês", min_value=0, max_value=10, value=max(0, min(10, f_int(s_ext.get("monthly_sundays_worked"), 0))))
+            s_intra_min = sj3.number_input("Intrajornada Suprimida (min/dia)", min_value=0, max_value=120, value=max(0, min(120, f_int(s_ext.get("suppressed_break_minutes"), 0))), step=5)
+            s_not_sem = sj4.number_input("Horas Noturnas / Semana", min_value=0.0, value=max(0.0, f_float(s_ext.get("weekly_night_hours"), 0.0)), step=0.5)
+
+        st.subheader("3. Verbas Deferidas no Dispositivo da Sentença")
+        sv1, sv2, sv3 = st.columns(3)
+        s_ped_saldo = sv1.checkbox("Saldo de Salário Deferido", value=bool(s_ext.get("sugerir_saldo_salario", False)))
+        s_dias_saldo = sv1.number_input("Dias Saldo de Salário", min_value=0, max_value=31, value=int(s_dism.day))
+        s_ped_reflexos = sv1.checkbox("Reflexos em 13º, Férias + 1/3 e Aviso", value=True)
+
+        s_ped_aviso = sv2.checkbox("Aviso-Prévio Indenizado Deferido", value=bool(s_ext.get("sugerir_aviso_previo", False)))
+        s_ped_13_fer = sv2.checkbox("13º e/ou Férias + 1/3 Deferidos", value=bool(s_ext.get("sugerir_13_e_ferias", False)))
+        s_ped_477 = sv2.checkbox("Multa Art. 477 CLT Deferida", value=bool(s_ext.get("sugerir_multa_477", False)))
+        s_ped_467 = sv2.checkbox("Multa Art. 467 CLT Deferida", value=bool(s_ext.get("sugerir_multa_467", False)))
+
+        s_ped_fgts = sv3.checkbox("FGTS + Multa Rescisória Deferidos", value=bool(s_ext.get("sugerir_fgts_e_multa", False)))
+        s_multa_fgts_pct = sv3.number_input("Percentual Multa FGTS (%)", min_value=0.0, max_value=100.0, value=max(0.0, min(100.0, f_float(s_ext.get("multa_fgts_percentual_sugerido"), 40.0))), step=5.0)
+        s_fgts_dif = sv3.number_input("Diferenças FGTS Contrato (R$)", min_value=0.0, value=max(0.0, f_float(s_ext.get("fgts_nao_depositado_contrato"), 0.0)), step=100.0)
+        s_estab_m = sv3.number_input("Meses Estabilidade Deferidos", min_value=0, max_value=24, value=max(0, min(24, f_int(s_ext.get("meses_estabilidade_restantes"), 0))))
+        s_restit = sv3.number_input("Devolução Descontos Deferida (R$)", min_value=0.0, value=max(0.0, f_float(s_ext.get("restituicao_descontos"), 0.0)), step=50.0)
+
+        liquidar_btn = st.form_submit_button("Calcular Liquidação de Sentença e Gerar Planilha", type="primary")
+
+    if liquidar_btn:
+        if s_ext and not st.session_state.sentence_confirmed:
+            st.error("Marque a caixa de confirmação de revisão da sentença antes de calcular a liquidação.")
+        elif s_sal <= 0 or not s_reclamante.strip():
+            st.error("Informe o nome do reclamante e o salário-base reconhecido na sentença.")
+        elif s_dism < s_adm:
+            st.error("A data de rescisão não pode ser anterior à admissão.")
+        else:
+            s_meses_contrato = max(1, (s_dism.year - s_adm.year) * 12 + (s_dism.month - s_adm.month) + 1)
+            s_meses_presc = min(60, s_meses_contrato)
+            s_semanas = Decimal(str(s_meses_presc)) * Decimal("4.3333")
+
+            if s_tc is not None:
+                tot_s_he50 = f_float(s_tc.get("he50_hours"), 0.0)
+                tot_s_he100 = f_float(s_tc.get("he100_hours"), 0.0)
+                tot_s_intra = f_float(s_tc.get("intrajornada_hours"), 0.0)
+                tot_s_not = f_float(s_tc.get("night_ficta_hours"), 0.0)
+            else:
+                tot_s_he50 = float((Decimal(str(s_he50_sem)) * s_semanas).quantize(CENT, rounding=ROUND_HALF_UP))
+                tot_s_he100 = float((Decimal(str(s_dom_mes * 8)) * Decimal(str(s_meses_presc))).quantize(CENT, rounding=ROUND_HALF_UP))
+                tot_s_intra = float(((Decimal(str(s_intra_min)) / Decimal("60")) * (Decimal(str(s_meses_presc)) * Decimal("22"))).quantize(CENT, rounding=ROUND_HALF_UP))
+                tot_s_not = float((Decimal(str(s_not_sem)) * s_semanas * Decimal("1.142857")).quantize(CENT, rounding=ROUND_HALF_UP))
+
+            s_sm_vigente = get_historical_min_wage(s_dism)
+            s_insal_mensal = Decimal("0.00")
+            s_adic_lbl = "0%"
+            s_pct_dec = Decimal(str(s_adic_pct)) / Decimal("100")
+            if s_adic == "Insalubridade (sobre Salário Mínimo)" and s_adic_pct > 0:
+                s_insal_mensal = (s_sm_vigente * s_pct_dec).quantize(CENT, rounding=ROUND_HALF_UP)
+                s_adic_lbl = f"{s_adic_pct:g}% SM (NR-15)"
+            elif s_adic == "Periculosidade (sobre Salário-Base)" and s_adic_pct > 0:
+                s_insal_mensal = (d_money(s_sal) * s_pct_dec).quantize(CENT, rounding=ROUND_HALF_UP)
+                s_adic_lbl = f"{s_adic_pct:g}% Sal. (NR-16)"
+
+            res_sent = run_labor_calculation({
+                "process_number": f"LIQ-{s_proc.strip()}",
+                "office_header": s_timbre,
+                "worker_name": s_reclamante,
+                "employer_name": s_reclamada,
+                "role_title": s_cargo,
+                "admission_date": s_adm,
+                "dismissal_date": s_dism,
+                "termination_type": s_motivo,
+                "monthly_divisor": s_divisor,
+                "base_salary": s_sal,
+                "commissions": s_comis,
+                "insalubrity": float(s_insal_mensal),
+                "adicional_label": s_adic,
+                "adicional_pct_label": s_adic_lbl,
+                "inc_adicional_retroativo": s_insal_mensal > Decimal("0.00"),
+                "offsets": s_deducao,
+                "inc_saldo_salario": s_ped_saldo,
+                "saldo_dias": s_dias_saldo,
+                "inc_aviso_previo": s_ped_aviso,
+                "inc_13": s_ped_13_fer,
+                "inc_ferias": s_ped_13_fer,
+                "periodos_ferias_vencidas": 0,
+                "meses_sem_registro": 0,
+                "plus_acumulo_pct": 0.0,
+                "dif_equiparacao_mensal": 0.0,
+                "inc_fgts": s_ped_fgts,
+                "fgts_multa_pct": s_multa_fgts_pct,
+                "fgts_nao_depositado": s_fgts_dif,
+                "meses_estabilidade": s_estab_m,
+                "inc_multa_477": s_ped_477,
+                "inc_multa_467": s_ped_467,
+                "inc_reflexos_completos": s_ped_reflexos,
+                "inc_he50": tot_s_he50 > 0,
+                "he50_hours": tot_s_he50,
+                "he50_pct": 50,
+                "inc_he100": tot_s_he100 > 0,
+                "he100_hours": tot_s_he100,
+                "inc_intrajornada": tot_s_intra > 0,
+                "intrajornada_hours": tot_s_intra,
+                "inc_noturno": tot_s_not > 0,
+                "night_hours": tot_s_not,
+                "night_pct": 20,
+                "ai_opinion": s_ext,
+                "lawyer_narrative": sent_notes,
+            })
+
+            if s_restit > 0:
+                r_dec = d_money(s_restit)
+                res_sent["verbas"].append({
+                    "Código": "VER-11",
+                    "Verba": "Restituição de Descontos Deferida em Sentença",
+                    "Período": f"{s_adm.strftime('%d/%m/%Y')} a {s_dism.strftime('%d/%m/%Y')}",
+                    "Base de Cálculo": r_dec,
+                    "Fórmula": "Devolução integral conforme comando sentencial",
+                    "Quantidade": "1",
+                    "Percentual": "100%",
+                    "Valor Original": r_dec,
+                    "Reflexos": Decimal("0.00"),
+                    "Total Apurado": r_dec,
+                    "Incide FGTS": False,
+                })
+                res_sent["bruto_atualizado"] += r_dec
+                res_sent["liquido_devido"] += r_dec
+
+            st.session_state.calculations_history = [res_sent] + st.session_state.calculations_history
+            st.session_state.case_chat_threads[res_sent["audit_id"]] = []
+            st.session_state.selected_chat_case_id = res_sent["audit_id"]
+            supabase_upsert_case(res_sent, [], current_office_email)
+
+            st.success(f"Liquidação de Sentença concluída e salva na nuvem! Código: **{res_sent['audit_id']}**")
+            sk1, sk2, sk3 = st.columns(3)
+            sk1.metric("Total Bruto Liquidado", fmt_brl(res_sent["bruto_atualizado"]))
+            sk2.metric("(-) Deduções Autorizadas", fmt_brl(res_sent["abatimentos"]))
+            sk3.metric("Total Líquido da Execução", fmt_brl(res_sent["liquido_devido"]))
+
+            df_sent = pd.DataFrame(res_sent["verbas"])
+            if not df_sent.empty:
+                for col in ["Base de Cálculo", "Valor Original", "Reflexos", "Total Apurado"]:
+                    df_sent[col] = df_sent[col].apply(fmt_brl)
+                st.dataframe(
+                    df_sent[["Código", "Verba", "Quantidade", "Percentual", "Base de Cálculo", "Fórmula", "Valor Original", "Reflexos", "Total Apurado"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if s_ext.get("minuta_peticao_liquidacao"):
+                with st.expander("Petição de Apresentação de Cálculos de Liquidação (Art. 879 CLT)", expanded=True):
+                    st.text_area("Minuta pronta para protocolar no PJe:", value=str(s_ext["minuta_peticao_liquidacao"]), height=240)
+
+            sdl1, sdl2 = st.columns(2)
+            sdl1.download_button(
+                "Baixar Planilha de Liquidação (.XLSX)",
+                data=build_complete_excel_bytes(res_sent),
+                file_name=f"Liquidacao_Sentenca_{res_sent['audit_id']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            sdl2.download_button(
+                "Baixar Relatório de Liquidação (.PDF)",
+                data=build_printable_dossier_pdf_bytes(res_sent),
+                file_name=f"Liquidacao_Sentenca_{res_sent['audit_id']}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
 elif menu == "Meus Cálculos e Relatórios":
     st.title("Meus Cálculos e Relatórios Salvos")
