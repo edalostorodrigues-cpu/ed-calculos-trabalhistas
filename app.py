@@ -179,6 +179,7 @@ def supabase_load_all_cases(office_email: str) -> Tuple[List[Dict[str, Any]], Di
             rows = json.loads(resp.read().decode("utf-8"))
         calcs: List[Dict[str, Any]] = []
         chats: Dict[str, List[Dict[str, str]]] = {}
+        seen_keys: set = set()
         target_email = (office_email or "").strip().lower()
         for r in rows:
             row_office = str(r.get("office_email") or "").strip().lower()
@@ -189,6 +190,10 @@ def supabase_load_all_cases(office_email: str) -> Tuple[List[Dict[str, Any]], Di
                 payload = json.loads(payload)
             if payload:
                 c_obj = _deserialize_calc_from_cloud(payload)
+                dedup_key = f"{str(c_obj.get('worker_name', '')).strip().lower()}|{str(c_obj.get('employer_name', '')).strip().lower()}|{str(c_obj.get('process_number', '')).strip().lower()}"
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
                 calcs.append(c_obj)
                 aid = str(c_obj.get("audit_id") or r.get("audit_id") or "")
                 ch = r.get("chat_history_json") or []
@@ -1872,10 +1877,24 @@ elif menu == "Liquidação de Sentença & Impugnação":
                 res_sent["bruto_atualizado"] += r_dec
                 res_sent["liquido_devido"] += r_dec
 
-            st.session_state.calculations_history = [res_sent] + st.session_state.calculations_history
-            st.session_state.case_chat_threads[res_sent["audit_id"]] = []
+            sent_client_key = f"{s_reclamante.strip().lower()}|{s_reclamada.strip().lower()}"
+            prev_sent_chat: List[Dict[str, str]] = list(st.session_state.case_chat_threads.get("sentenca_atual", []))
+            kept_history: List[Dict[str, Any]] = []
+            for old_c in st.session_state.calculations_history:
+                old_k = f"{str(old_c.get('worker_name', '')).strip().lower()}|{str(old_c.get('employer_name', '')).strip().lower()}"
+                if old_k == sent_client_key:
+                    old_aid = str(old_c["audit_id"])
+                    if st.session_state.case_chat_threads.get(old_aid):
+                        prev_sent_chat = list(st.session_state.case_chat_threads[old_aid])
+                else:
+                    kept_history.append(old_c)
+
+            st.session_state.calculations_history = [res_sent] + kept_history
+            st.session_state.case_chat_threads[res_sent["audit_id"]] = prev_sent_chat
             st.session_state.selected_chat_case_id = res_sent["audit_id"]
-            supabase_upsert_case(res_sent, [], current_office_email)
+            st.session_state.selected_sent_chat_id = res_sent["audit_id"]
+            st.session_state["sent_chat_selector_widget"] = res_sent["audit_id"]
+            supabase_upsert_case(res_sent, prev_sent_chat, current_office_email)
 
             st.success(f"Liquidação de Sentença concluída e salva na nuvem! Código: **{res_sent['audit_id']}**")
             sk1, sk2, sk3 = st.columns(3)
@@ -1925,8 +1944,13 @@ elif menu == "Liquidação de Sentença & Impugnação":
         )
 
         sent_case_options: Dict[str, str] = {"sentenca_atual": "Sentença / Processo Atual em Análise"}
+        seen_sent_labels: set = set()
         for c_item in st.session_state.calculations_history:
             cid = str(c_item["audit_id"])
+            uniq_proc_key = f"{str(c_item.get('worker_name', '')).strip().lower()}|{str(c_item.get('employer_name', '')).strip().lower()}"
+            if uniq_proc_key in seen_sent_labels:
+                continue
+            seen_sent_labels.add(uniq_proc_key)
             sent_case_options[cid] = (
                 f"{c_item.get('worker_name', 'Exequente')} × {c_item.get('employer_name', 'Executada')} "
                 f"({cid} • {fmt_brl(c_item['liquido_devido'])})"
