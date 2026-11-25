@@ -1458,7 +1458,10 @@ if menu.startswith("1."):
     if st.session_state.get("prelim_calc_result"):
         res_p = st.session_state["prelim_calc_result"]
         st.markdown("### Quadro de Pedidos Liquidados (Art. 840, § 1º CLT)")
-        st.dataframe(pd.DataFrame(res_p["verbas"])[["codigo", "verba", "formula", "valor_fmt"]], use_container_width=True, hide_index=True)
+        if res_p.get("verbas"):
+            st.dataframe(pd.DataFrame(res_p["verbas"])[["codigo", "verba", "formula", "valor_fmt"]], use_container_width=True, hide_index=True)
+        else:
+            st.warning("Nenhuma verba foi calculada porque todos os parâmetros de quantidade/valor estão zerados.")
         st.metric("Valor Total Liquidado da Causa", res_p["total_geral_fmt"])
 
         d1, d2, d3 = st.columns(3)
@@ -1670,11 +1673,14 @@ elif menu.startswith("2."):
 
         tab_res_v, tab_ocorr_m = st.tabs(["📑 Resumo das Verbas Liquidadas", "📅 Ocorrências Mês a Mês (PJe-Calc)"])
         with tab_res_v:
-            st.dataframe(
-                pd.DataFrame(res_liq["verbas"])[["codigo", "verba", "incidencia", "formula", "valor_fmt"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+            if res_liq.get("verbas"):
+                st.dataframe(
+                    pd.DataFrame(res_liq["verbas"])[["codigo", "verba", "incidencia", "formula", "valor_fmt"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.warning("Nenhuma verba foi apurada porque os parâmetros acima estão zerados (ex.: preencha o Intervalo Intrajornada, Restituição de Descontos ou clique em 'Ler Sentença' primeiro).")
         with tab_ocorr_m:
             if res_liq.get("ocorrencias"):
                 st.dataframe(pd.DataFrame(res_liq["ocorrencias"]), use_container_width=True, hide_index=True)
