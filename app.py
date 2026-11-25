@@ -19,11 +19,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 from fpdf import FPDF
 from google import genai
 from google.genai import types
-from supabase import Client, create_client
 
 # ==============================================================================
 # 1. CONFIGURAÇÃO DA PÁGINA E CHAVE DE LOGIN (DESABILITADA TEMPORARIAMENTE)
@@ -141,30 +141,31 @@ def parse_date_safe(val: Any, fallback: dt.date) -> dt.date:
 # ==============================================================================
 # 3. CONEXÃO COM SUPABASE E PERSISTÊNCIA MULTI-CLIENTE NA NUVEM
 # ==============================================================================
-@st.cache_resource
-def init_supabase() -> Optional[Client]:
-    url = get_secret("SUPABASE_URL")
+def get_supabase_headers() -> Optional[Tuple[str, Dict[str, str]]]:
+    url = get_secret("SUPABASE_URL").rstrip("/")
     key = get_secret("SUPABASE_KEY")
     if not url or not key:
         return None
-    try:
-        return create_client(url, key)
-    except Exception:
-        return None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=representation",
+    }
+    return url, headers
 
 
 def load_cloud_cases(office_email: str) -> List[Dict[str, Any]]:
-    sb = init_supabase()
-    if not sb:
+    cfg = get_supabase_headers()
+    if not cfg:
         return []
+    url, headers = cfg
     try:
-        res = (
-            sb.table("ed_calculos_clientes")
-            .select("*")
-            .order("updated_at", desc=True)
-            .execute()
-        )
-        rows = res.data or []
+        endpoint = f"{url}/rest/v1/ed_calculos_clientes?select=*&order=updated_at.desc"
+        resp = requests.get(endpoint, headers=headers, timeout=15)
+        if resp.status_code >= 400:
+            return []
+        rows = resp.json() or []
         seen_keys = set()
         cases: List[Dict[str, Any]] = []
         for row in rows:
@@ -203,9 +204,10 @@ def load_cloud_cases(office_email: str) -> List[Dict[str, Any]]:
 
 
 def upsert_cloud_case(office_email: str, record: Dict[str, Any]) -> Tuple[bool, str]:
-    sb = init_supabase()
-    if not sb:
+    cfg = get_supabase_headers()
+    if not cfg:
         return False, "Supabase não configurado nos Secrets."
+    url, headers = cfg
     try:
         case_id = str(record.get("case_id") or f"ED-{uuid.uuid4().hex[:8].upper()}")
         payload = {
@@ -224,7 +226,10 @@ def upsert_cloud_case(office_email: str, record: Dict[str, Any]) -> Tuple[bool, 
             "payload": payload,
             "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
-        sb.table("ed_calculos_clientes").upsert(data).execute()
+        endpoint = f"{url}/rest/v1/ed_calculos_clientes"
+        resp = requests.post(endpoint, headers=headers, json=data, timeout=15)
+        if resp.status_code >= 400:
+            return False, f"Erro HTTP {resp.status_code}: {resp.text}"
         return True, "Salvo na nuvem Supabase."
     except Exception as exc:
         return False, f"Falha ao gravar no Supabase: {exc}"
@@ -1341,7 +1346,7 @@ with st.sidebar:
         value=st.session_state["office_header"],
     )
 
-    sb_ok = init_supabase() is not None
+    sb_ok = get_supabase_headers() is not None
     gem_ok = bool(get_secret("GEMINI_API_KEY"))
     st.markdown(f"**Nuvem Supabase:** {'🟢 Conectada' if sb_ok else '🔴 Não configurada'}")
     st.markdown(f"**Motor IA ({GEMINI_MODEL_PRIMARY}):** {'🟢 Ativo' if gem_ok else '🔴 Sem chave'}")
