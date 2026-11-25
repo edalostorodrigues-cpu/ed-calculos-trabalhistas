@@ -1,6 +1,5 @@
 streamlit
-   pandas
-   openpyxl
-   pydantic
-   google-genai
-   fpdf2
+pandas
+pypdf
+reportlab
+openpyxl
