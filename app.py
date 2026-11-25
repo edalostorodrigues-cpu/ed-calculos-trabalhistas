@@ -82,14 +82,14 @@ def fmt_brl(val: Decimal | float | int) -> str:
 
 
 def fmt_num(val: Decimal | float | int, places: int = 2) -> str:
-    q = Decimal("10") ** (-places)
+    q = Decimal("10") ** (-places) if places > 0 else Decimal("1")
     v = D(val).quantize(q, rounding=ROUND_HALF_UP)
     s = f"{v:.{places}f}"
-    inteiro, dec = s.split(".")
-    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
-    return f"{inteiro_fmt},{dec}"
-
-
+    if "." in s:
+        inteiro, dec = s.split(".")
+        inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
+        return f"{inteiro_fmt},{dec}"
+    return f"{int(s):,}".replace(",", ".")
 def safe_latin1(text: Any) -> str:
     if text is None:
         return ""
