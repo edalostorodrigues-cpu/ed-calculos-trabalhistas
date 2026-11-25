@@ -14,7 +14,33 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from pypdf import PdfReader
+
+# Importação resiliente para leitura de PDF (evita ModuleNotFoundError no Streamlit Cloud)
+PDF_BACKEND = None
+try:
+    from pypdf import PdfReader as _PdfReader
+    PDF_BACKEND = "pypdf"
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader as _PdfReader
+        PDF_BACKEND = "PyPDF2"
+    except ImportError:
+        _PdfReader = None
+
+try:
+    import pdfplumber as _pdfplumber
+    if PDF_BACKEND is None:
+        PDF_BACKEND = "pdfplumber"
+except ImportError:
+    _pdfplumber = None
+
+try:
+    import fitz as _fitz  # PyMuPDF
+    if PDF_BACKEND is None:
+        PDF_BACKEND = "pymupdf"
+except ImportError:
+    _fitz = None
+
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
@@ -159,12 +185,34 @@ def extract_text_from_uploaded_file(uploaded_file: Any) -> str:
     raw = uploaded_file.getvalue()
     if name.endswith(".pdf"):
         try:
-            reader = PdfReader(io.BytesIO(raw))
-            pages = []
-            for idx, page in enumerate(reader.pages, start=1):
-                txt = page.extract_text() or ""
-                pages.append(f"--- PÁGINA {idx} ---\n{txt}")
-            return "\n".join(pages)
+            if _PdfReader is not None:
+                reader = _PdfReader(io.BytesIO(raw))
+                pages = []
+                for idx, page in enumerate(reader.pages, start=1):
+                    txt = page.extract_text() or ""
+                    pages.append(f"--- PÁGINA {idx} ---\n{txt}")
+                return "\n".join(pages)
+            if _pdfplumber is not None:
+                pages = []
+                with _pdfplumber.open(io.BytesIO(raw)) as pdf:
+                    for idx, page in enumerate(pdf.pages, start=1):
+                        txt = page.extract_text() or ""
+                        pages.append(f"--- PÁGINA {idx} ---\n{txt}")
+                return "\n".join(pages)
+            if _fitz is not None:
+                doc = _fitz.open(stream=raw, filetype="pdf")
+                pages = [f"--- PÁGINA {idx} ---\n{page.get_text()}" for idx, page in enumerate(doc, start=1)]
+                return "\n".join(pages)
+            # Fallback de extração de texto bruto caso nenhuma biblioteca PDF esteja instalada no ambiente
+            latin_txt = raw.decode("latin-1", errors="ignore")
+            paren_strings = re.findall(r"\(([^()]{2,})\)", latin_txt)
+            extracted_fallback = " ".join(s for s in paren_strings if re.search(r"[A-Za-zÀ-ÿ0-9]", s))
+            if len(extracted_fallback) > 80:
+                return extracted_fallback
+            return (
+                "[Aviso: Adicione 'pypdf' e 'reportlab' ao arquivo requirements.txt do repositório para leitura "
+                "completa de PDFs, ou cole o texto da sentença diretamente no campo abaixo.]"
+            )
         except Exception as e:
             return f"[Erro ao ler PDF {uploaded_file.name}: {e}]"
     if name.endswith(".csv"):
