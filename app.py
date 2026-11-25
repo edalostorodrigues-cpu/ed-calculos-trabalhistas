@@ -1340,51 +1340,51 @@ with st.sidebar:
         index=1,
     )
 
-    st.divider()
-    st.session_state["office_header"] = st.text_input(
-        "Timbre do Escritório / OAB (PDFs):",
-        value=st.session_state["office_header"],
-    )
-
-    sb_ok = get_supabase_headers() is not None
-    gem_ok = bool(get_secret("GEMINI_API_KEY"))
-    st.markdown(f"**Nuvem Supabase:** {'🟢 Conectada' if sb_ok else '🔴 Não configurada'}")
-    st.markdown(f"**Motor IA ({GEMINI_MODEL_PRIMARY}):** {'🟢 Ativo' if gem_ok else '🔴 Sem chave'}")
-
-    if st.button("🔄 Sincronizar Clientes da Nuvem", use_container_width=True):
-        st.session_state["cloud_cases"] = load_cloud_cases(st.session_state["office_email"])
-        st.rerun()
-
-
-# ==============================================================================
-# 10. ABA 1: AVALIAÇÃO PRELIMINAR & AUDITORIA PARA AJUIZAMENTO (ART. 840 § 1º CLT)
-# ==============================================================================
-if menu.startswith("1."):
-    st.title("Avaliação Preliminar & Liquidação para Ajuizamento (Art. 840, § 1º CLT)")
-    st.caption(
-        "Relate os fatos da entrevista com o cliente e anexe fotos do ambiente/EPI, TRCT, ponto ou contracheques. "
-        "A IA identifica verbas ocultas (NRs 15/16, horas extras, reflexos) e preenche o motor decimal."
-    )
-
-    with st.container(border=True):
-        st.subheader("1. Relato da Entrevista + Upload de Provas/Documentos")
-        relato_txt = st.text_area(
-            "Relato livre do advogado / condições do ambiente de trabalho e fatos narrados pelo cliente:",
-            height=130,
-            placeholder="Ex.: Cliente admitido em 01/02/2024 como operador/motoboy com salário de R$ 2.400,00 + R$ 600,00 por fora. Trabalhava sem EPI e fazia 10h extras/mês...",
-            key="prelim_relato_input",
-        )
-        prelim_files = st.file_uploader(
-            "Anexe documentos ou fotos do ambiente/EPI (PDF, PNG, JPG, CSV, XLSX, TXT)",
-            accept_multiple_files=True,
-            key="prelim_files_up",
-        )
-        if st.button("🔍 Analisar Caso com IA e Preencher Parâmetros", type="primary", key="btn_prelim_ai"):
-            with st.spinner("Analisando fatos, documentos e NRs 15/16 com Gemini 3.8 Flash..."):
+        if st.button("🔍 Analisar Caso com IA e Calcular Petição Inicial", type="primary", key="btn_prelim_ai"):
+            with st.spinner("Analisando fatos, documentos, NRs 15/16 e calculando no padrão PJe-Calc..."):
                 try:
                     ext = analyze_preliminary_case_with_gemini(relato_txt, prelim_files)
                     st.session_state["prelim_extracted"] = ext
-                    st.success("Análise concluída! Confira o parecer e os parâmetros preenchidos abaixo.")
+                    calc_auto = run_pjecalc_engine(
+                        {
+                            "admissao": parse_date_safe(ext.get("admissao"), dt.date(2024, 2, 1)),
+                            "rescisao": parse_date_safe(ext.get("rescisao"), dt.date.today()),
+                            "salario_base": float(ext.get("salario_base") or 0.0),
+                            "salario_por_fora": float(ext.get("salario_por_fora") or 0.0),
+                            "divisor": int(ext.get("divisor") or 220),
+                            "work_days_per_week": int(ext.get("work_days_per_week") or 5),
+                            "insalubridade_pct": float(ext.get("insalubridade_pct") or 0.0),
+                            "periculosidade_pct": float(ext.get("periculosidade_pct") or 0.0),
+                            "he50_horas_mes": float(ext.get("he50_horas_mes") or 0.0),
+                            "he100_horas_mes": float(ext.get("he100_horas_mes") or 0.0),
+                            "intrajornada_min_dia": float(ext.get("intrajornada_min_dia") or 0.0),
+                            "noturno_horas_mes": float(ext.get("noturno_horas_mes") or 0.0),
+                            "descontos_devolver": float(ext.get("descontos_devolver") or 0.0),
+                            "outras_verbas_desc": str(ext.get("outras_verbas_desc") or ""),
+                            "outras_verbas_valor": float(ext.get("outras_verbas_valor") or 0.0),
+                            "incluir_verbas_rescisorias": bool(ext.get("incluir_verbas_rescisorias", True)),
+                            "aviso_indenizado": bool(ext.get("aviso_indenizado", True)),
+                            "ferias_vencidas_qtd": int(ext.get("ferias_vencidas_qtd") or 0),
+                            "multa_477": bool(ext.get("multa_477", False)),
+                            "multa_467": bool(ext.get("multa_467", False)),
+                            "aplicar_reflexos": True,
+                            "reflexos_em_fgts": True,
+                        }
+                    )
+                    calc_auto["client_name"] = str(ext.get("client_name") or "Cliente Inicial")
+                    calc_auto["defendant_name"] = str(ext.get("defendant_name") or "Reclamada")
+                    calc_auto["process_number"] = "Pré-Processual (Art. 840 §1º CLT)"
+                    calc_auto["court_name"] = "Petição Inicial Trabalhista"
+                    st.session_state["prelim_calc_result"] = calc_auto
+                    upsert_local_and_cloud_case(
+                        client_name=calc_auto["client_name"],
+                        process_number="",
+                        mode="preliminar",
+                        calc_result=calc_auto,
+                        ai_report=ext.get("parecer_juridico", ""),
+                        chat_history=st.session_state.get("prelim_chat_current", []),
+                    )
+                    st.success(f"Análise e cálculos concluídos automaticamente! Total estimado: {calc_auto['total_geral_fmt']}")
                 except Exception as exc:
                     st.error(f"Erro na análise preliminar: {exc}")
 
@@ -1468,59 +1468,59 @@ if menu.startswith("1."):
         safe_cli = re.sub(r"[^0-9A-Za-z_-]+", "_", res_p.get("client_name", "cliente"))
         d1.download_button("📄 Baixar Demonstrativo PJe-Calc (.PDF)", build_pjecalc_pdf_bytes(res_p, st.session_state["office_header"]), f"Inicial_PJeCalc_{safe_cli}.pdf", "application/pdf", use_container_width=True)
         d2.download_button("⚖️ Baixar Arquivo PJe-Calc (.PJC)", build_pjecalc_pjc_bytes(res_p), f"Inicial_PJeCalc_{safe_cli}.pjc", "application/xml", use_container_width=True)
-        d3.download_button("📊 Baixar Planilha Excel (.XLSX)", build_pjecalc_excel_bytes(res_p), f"Inicial_PJeCalc_{safe_cli}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-
-    # Chat Jurídico da Aba 1
-    st.divider()
-    st.subheader("3. Chat Jurídico Estratégico (Petição Inicial & Provas)")
-    for m in st.session_state.get("prelim_chat_current", []):
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-
-    q_prelim = st.chat_input("Pergunte sobre teses, pedidos da inicial, NRs 15/16 ou peça a redação de um tópico...", key="chat_input_prelim")
-    if q_prelim:
-        st.session_state["prelim_chat_current"].append({"role": "user", "content": q_prelim})
-        ctx = {
-            "client_name": (st.session_state.get("prelim_calc_result") or {}).get("client_name", p_ext.get("client_name", "Cliente")),
-            "process_number": "Pré-Processual",
-            "calc_result": st.session_state.get("prelim_calc_result"),
-            "ai_report": p_ext.get("parecer_juridico", ""),
-        }
-        ans = run_legal_chat_turn(q_prelim, ctx, st.session_state["prelim_chat_current"], "Avaliação Preliminar & Petição Inicial")
-        st.session_state["prelim_chat_current"].append({"role": "assistant", "content": ans})
-        st.rerun()
-
-
-# ==============================================================================
-# 11. ABA 2: LIQUIDAÇÃO DE SENTENÇA TRANSITADA EM JULGADO (PADRÃO PJE-CALC)
-# ==============================================================================
-elif menu.startswith("2."):
-    st.title("Liquidação de Sentença Transitada em Julgado (Padrão PJe-Calc)")
-    st.caption(
-        "Anexe a cópia integral do processo / sentença sem recurso (e documentos dos autos). "
-        "A IA extrai exclusivamente o comando condenatório deferido, aplica as travas de teto da coisa julgada "
-        "(Art. 879, § 1º CLT) e gera o demonstrativo mês a mês, PDF PJe-Calc, arquivo .PJC e Excel."
-    )
-
-    with st.container(border=True):
-        st.subheader("1. Upload da Cópia do Processo / Sentença + Observações do Advogado")
-        obs_sentenca = st.text_area(
-            "Observações do advogado sobre a sentença ou pontos para conferir no cálculo adverso (opcional):",
-            height=110,
-            placeholder="Ex.: Honorários advocatícios de sucumbência de 15% ao patrono do autor. NÃO TEM DIREITO: pedidos de horas extras e reflexos em FGTS. Observar teto da inicial...",
-            key="liq_obs_adv",
-        )
-        sent_files = st.file_uploader(
-            "Anexe a Sentença / Cópia do Processo (PDF) e anexos (Cartão de Ponto CSV/XLSX, Contracheques, Planilha Adversa)",
-            accept_multiple_files=True,
-            key="liq_files_up",
-        )
-        if st.button("⚖️ Ler Sentença / Processo e Extrair Comando Condenatório (IA)", type="primary", key="btn_read_sentence"):
-            with st.spinner("Lendo sentença, datas reais do vínculo, escalas e tetos da coisa julgada com Gemini 3.8 Flash..."):
+        if st.button("⚖️ Ler Sentença / Processo e Calcular Liquidação Pronta (PJe-Calc)", type="primary", key="btn_read_sentence"):
+            with st.spinner("Lendo sentença, extraindo comando condenatório e calculando liquidação pronta no padrão PJe-Calc..."):
                 try:
                     ext_s = analyze_sentence_with_gemini(obs_sentenca, sent_files)
                     st.session_state["sentence_extracted"] = ext_s
-                    st.success("Sentença analisada! Confira abaixo as verbas deferidas/improcedentes e os parâmetros extraídos.")
+                    res_auto_s = run_pjecalc_engine(
+                        {
+                            "admissao": parse_date_safe(ext_s.get("admissao"), dt.date(2024, 8, 13)),
+                            "rescisao": parse_date_safe(ext_s.get("rescisao"), dt.date(2025, 7, 7)),
+                            "salario_base": float(ext_s.get("salario_base") or 0.0),
+                            "salario_por_fora": float(ext_s.get("salario_por_fora") or 0.0),
+                            "divisor": int(ext_s.get("divisor") or 220),
+                            "work_days_per_week": int(ext_s.get("work_days_per_week") or 5),
+                            "exact_total_days": int(ext_s.get("exact_total_days") or 0),
+                            "insalubridade_pct": float(ext_s.get("insalubridade_pct") or 0.0),
+                            "periculosidade_pct": float(ext_s.get("periculosidade_pct") or 0.0),
+                            "he50_horas_mes": float(ext_s.get("he50_horas_mes") or 0.0),
+                            "he100_horas_mes": float(ext_s.get("he100_horas_mes") or 0.0),
+                            "intrajornada_min_dia": float(ext_s.get("intrajornada_min_dia") or 0.0),
+                            "noturno_horas_mes": float(ext_s.get("noturno_horas_mes") or 0.0),
+                            "descontos_devolver": float(ext_s.get("descontos_devolver") or 0.0),
+                            "outras_verbas_desc": str(ext_s.get("outras_verbas_desc") or "Outras Verbas Deferidas"),
+                            "outras_verbas_valor": float(ext_s.get("outras_verbas_valor") or 0.0),
+                            "aplicar_reflexos": bool(ext_s.get("aplicar_reflexos", True)),
+                            "reflexos_em_fgts": bool(ext_s.get("reflexos_em_fgts", True)),
+                            "incluir_verbas_rescisorias": False,
+                            "teto_intrajornada": float(ext_s.get("teto_intrajornada") or 0.0),
+                            "teto_descontos": float(ext_s.get("teto_descontos") or 0.0),
+                            "teto_he50": float(ext_s.get("teto_he50") or 0.0),
+                            "teto_adicional": float(ext_s.get("teto_adicional") or 0.0),
+                            "teto_global": float(ext_s.get("teto_global") or 0.0),
+                            "criterio_atualizacao": str(
+                                ext_s.get("criterio_atualizacao")
+                                or "ADC 58 STF (IPCA-E pré-judicial + SELIC / IPCA + Art. 406 CC)"
+                            ),
+                            "atualizacao_juros_pct": float(ext_s.get("atualizacao_juros_pct") or 0.0),
+                            "honorarios_sucumbencia_pct": float(ext_s.get("honorarios_sucumbencia_pct") or 15.0),
+                        }
+                    )
+                    res_auto_s["process_number"] = str(ext_s.get("process_number") or "").strip()
+                    res_auto_s["client_name"] = str(ext_s.get("client_name") or "Reclamante").strip()
+                    res_auto_s["defendant_name"] = str(ext_s.get("defendant_name") or "Reclamada").strip()
+                    res_auto_s["court_name"] = str(ext_s.get("court_name") or "Vara do Trabalho").strip()
+                    st.session_state["sentence_calc_result"] = res_auto_s
+                    upsert_local_and_cloud_case(
+                        client_name=res_auto_s["client_name"],
+                        process_number=res_auto_s["process_number"],
+                        mode="liquidacao_sentenca",
+                        calc_result=res_auto_s,
+                        ai_report=ext_s.get("parecer_sentenca", ""),
+                        chat_history=st.session_state.get("sentence_chat_current", []),
+                    )
+                    st.success(f"Sentença lida e liquidação pronta no padrão PJe-Calc! Total Geral: {res_auto_s['total_geral_fmt']}")
                 except Exception as exc:
                     st.error(f"Erro ao analisar o processo via Gemini: {exc}")
 
