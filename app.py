@@ -621,11 +621,12 @@ def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dic
 
     resp = client.models.generate_content(
         model=GEMINI_MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
-    )
-    return json.loads(resp.text)
-# ... existing code ...
+        sp1, sp2, sp3, sp4 = st.columns([1.8, 2.2, 2.2, 1.8])
+        s_proc = sp1.text_input("Número do Processo *", value=str(s_ext.get("process_number") or "0000000-00.2025.5.04.0000"))
+        s_reclamante = sp2.text_input("Reclamante / Exequente *", value=str(s_ext.get("worker_name") or ""))
+        s_reclamada = sp3.text_input("Reclamada / Executada *", value=str(s_ext.get("employer_name") or ""))
+        s_cargo = sp4.text_input("Função / Cargo", value=str(s_ext.get("role_title") or ""))
+
         sd1, sd2, sd3, sd4 = st.columns(4)
         s_adm = sd1.date_input("Admissão Reconhecida *", value=_parse_dt_sent(s_ext.get("admission_date"), date(2024, 2, 1)), key="s_adm_dt")
         s_dism = sd2.date_input("Rescisão Reconhecida *", value=_parse_dt_sent(s_ext.get("dismissal_date"), date(2026, 10, 31)), key="s_dism_dt")
