@@ -6,233 +6,15 @@ import math
 import os
 import re
 import tempfile
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
-
-import pandas as pd
-import streamlit as st
-
-# Importação resiliente para leitura de PDF (evita ModuleNotFoundError no Streamlit Cloud)
-PDF_BACKEND = None
-try:
-    from pypdf import PdfReader as _PdfReader
-    PDF_BACKEND = "pypdf"
-except ImportError:
-    try:
-        from PyPDF2 import PdfReader as _PdfReader
-        PDF_BACKEND = "PyPDF2"
-    except ImportError:
-        _PdfReader = None
-
-try:
-    import pdfplumber as _pdfplumber
-    if PDF_BACKEND is None:
-        PDF_BACKEND = "pdfplumber"
-except ImportError:
-    _pdfplumber = None
-
-try:
-    import fitz as _fitz  # PyMuPDF
-    if PDF_BACKEND is None:
-        PDF_BACKEND = "pymupdf"
-except ImportError:
-    _fitz = None
-
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
-# ==============================================================================
-# CONFIGURAÇÃO INICIAL DA PÁGINA STREAMLIT
-# ==============================================================================
-st.set_page_config(
-    page_title="ED Cálculos Trabalhistas — Padrão PJe-Calc Cidadão",
-    page_icon="⚖️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ==============================================================================
-# UTILITÁRIOS DE PRECISÃO DECIMAL, DATAS E FORMATAÇÃO BRASILEIRA (PADRÃO PJE-CALC)
-# ==============================================================================
-TWO_PLACES = Decimal("0.01")
-FOUR_PLACES = Decimal("0.0001")
-EIGHT_PLACES = Decimal("0.00000001")
-
-
-def D(value: Any) -> Decimal:
-    """Converte qualquer entrada numérica ou string BRL para Decimal exato."""
-    if value is None:
-        return Decimal("0")
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, (int, float)):
-        if math.isnan(value) or math.isinf(value):
-            return Decimal("0")
-        return Decimal(str(value))
-    s = str(value).strip()
-    if not s:
-        return Decimal("0")
-    s = s.replace("R$", "").replace(" ", "")
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    try:
-        return Decimal(s)
-    except Exception:
-        return Decimal("0")
-
-
-def money_round(val: Any) -> Decimal:
-    """Arredondamento oficial PJe-Calc (2 casas decimais, HALF_UP)."""
-    return D(val).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
-
-
-def rate_round(val: Any) -> Decimal:
-    """Arredondamento de multiplicadores e índices (8 casas decimais, HALF_UP)."""
-    return D(val).quantize(EIGHT_PLACES, rounding=ROUND_HALF_UP)
-
-
-def fmt_brl(val: Any) -> str:
-    """Formata valor monetário no padrão brasileiro (1.234,56)."""
-    v = money_round(val)
-    sign = "-" if v < 0 else ""
-    v_abs = abs(v)
-    int_part, dec_part = f"{v_abs:.2f}".split(".")
-    int_fmt = f"{int(int_part):,}".replace(",", ".")
-    return f"{sign}{int_fmt},{dec_part}"
-
-
-def fmt_num(val: Any, decimals: int = 4) -> str:
-    """Formata número decimal no padrão PJe-Calc (ex.: 220,0000 ou 1,50000000)."""
-    q = Decimal("10") ** (-decimals)
-    v = D(val).quantize(q, rounding=ROUND_HALF_UP)
-    sign = "-" if v < 0 else ""
-    v_abs = abs(v)
-    int_part, dec_part = f"{v_abs:.{decimals}f}".split(".")
-    int_fmt = f"{int(int_part):,}".replace(",", ".")
-    return f"{sign}{int_fmt},{dec_part}"
-
-
-def parse_br_date(val: Any, fallback: Optional[date] = None) -> date:
-    """Interpreta datas DD/MM/AAAA, AAAA-MM-DD ou objetos date/datetime."""
-    if isinstance(val, datetime):
-        return val.date()
-    if isinstance(val, date):
-        return val
-    s = str(val or "").strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(s[:10], fmt).date()
-        except Exception:
-            continue
-    return fallback if fallback is not None else date.today()
-
-
-def count_business_days_and_sundays(start_d: date, end_d: date, saturday_is_workday: bool = True) -> Tuple[int, int, int]:
-    """Conta dias corridos, dias úteis e domingos/feriados no intervalo mensal."""
-    if end_d < start_d:
-        return 0, 0, 0
-    cal_days = (end_d - start_d).days + 1
-    work_days = 0
-    sundays = 0
-    cur = start_d
-    while cur <= end_d:
-        wd = cur.weekday()  # 0=Seg ... 5=Sab, 6=Dom
-        if wd == 6:
-            sundays += 1
-        elif wd == 5 and not saturday_is_workday:
-            sundays += 1
-        else:
-            work_days += 1
-        cur += timedelta(days=1)
-    return cal_days, max(1, work_days), max(1, sundays)
-
-
-def calc_aviso_previo_dias(admissao: date, demissao: date) -> int:
-    """Calcula dias de aviso prévio conforme Lei nº 12.506/2011 (30 + 3 por ano completo, máx 90)."""
-    if demissao <= admissao:
-        return 30
-    anos_completos = demissao.year - admissao.year
-    if (demissao.month, demissao.day) < (admissao.month, admissao.day):
-        anos_completos -= 1
-    anos_completos = max(0, anos_completos)
-    return min(90, 30 + (anos_completos * 3))
-
-
-# ==============================================================================
-# LEITOR E PARSER DE SENTENÇAS, EMBARGOS E ANEXOS (PDF / CSV / XLSX / TXT)
-# ==============================================================================
-def extract_text_from_uploaded_file(uploaded_file: Any) -> str:
-    """Extrai texto completo de PDF, TXT, CSV ou XLSX enviados pelo usuário."""
-    if uploaded_file is None:
-        return ""
-    name = uploaded_file.name.lower()
-    raw = uploaded_file.getvalue()
-    if name.endswith(".pdf"):
-        try:
-            if _PdfReader is not None:
-                reader = _PdfReader(io.BytesIO(raw))
-                pages = []
-                for idx, page in enumerate(reader.pages, start=1):
-                    txt = page.extract_text() or ""
-                    pages.append(f"--- PÁGINA {idx} ---\n{txt}")
-                return "\n".join(pages)
-            if _pdfplumber is not None:
-                pages = []
-                with _pdfplumber.open(io.BytesIO(raw)) as pdf:
-                    for idx, page in enumerate(pdf.pages, start=1):
-                        txt = page.extract_text() or ""
-                        pages.append(f"--- PÁGINA {idx} ---\n{txt}")
-                return "\n".join(pages)
-            if _fitz is not None:
-                doc = _fitz.open(stream=raw, filetype="pdf")
-                pages = [f"--- PÁGINA {idx} ---\n{page.get_text()}" for idx, page in enumerate(doc, start=1)]
-                return "\n".join(pages)
-            # Fallback de extração de texto bruto caso nenhuma biblioteca PDF esteja instalada no ambiente
-            latin_txt = raw.decode("latin-1", errors="ignore")
-            paren_strings = re.findall(r"\(([^()]{2,})\)", latin_txt)
-            extracted_fallback = " ".join(s for s in paren_strings if re.search(r"[A-Za-zÀ-ÿ0-9]", s))
-            if len(extracted_fallback) > 80:
-                return extracted_fallback
-            return (
-                "[Aviso: Adicione 'pypdf' e 'reportlab' ao arquivo requirements.txt do repositório para leitura "
-                "completa de PDFs, ou cole o texto da sentença diretamente no campo abaixo.]"
-            )
-        except Exception as e:
-            return f"[Erro ao ler PDF {uploaded_file.name}: {e}]"
-    if name.endswith(".csv"):
-        try:
-            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
-            return df.to_string(index=False)
-        except Exception:
-            return raw.decode("utf-8", errors="ignore")
-    if name.endswith((".xlsx", ".xls")):
-        try:
-            df = pd.read_excel(io.BytesIO(raw))
-            return df.to_string(index=False)
-        except Exception as e:
-            return f"[Erro ao ler planilha {uploaded_file.name}: {e}]"
-    return raw.decode("utf-8", errors="ignore")
-
-
-def parse_sentence_parameters(text: str) -> Dict[str, Any]:
-    """Extrai automaticamente parâmetros processuais, contratuais e verbas deferidas da sentença."""
-    clean = re.sub(r"\s+", " ", text or "")
+def parse_sentence_parameters(text: str, lawyer_notes: str = "") -> Dict[str, Any]:
+    """Extrai automaticamente parâmetros processuais, contratuais e verbas deferidas da sentença e do relato do advogado."""
+    combined_src = f"{text or ''}\n{lawyer_notes or ''}"
+    clean = re.sub(r"\s+", " ", combined_src)
     low = clean.lower()
 
     # Número CNJ
@@ -258,7 +40,7 @@ def parse_sentence_parameters(text: str) -> Dict[str, Any]:
             pass
 
     m_adm = re.search(r"(?:admiss[ãa]o|admitid[oa]\s+em)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", low)
-    m_dem = re.search(r"(?:demiss[ãa]o|dispensad[oa]\s+em|rescis[ãa]o|afastamento)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", low)
+    m_dem = re.search(r"(?:demiss[ãa]o|dispensad[oa]\s+em|rescis[ãa]o|afastamento|sa[íi]da)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", low)
     m_aju = re.search(r"(?:ajuizamento|ajuizada\s+em|distribui[çc][ãa]o)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", low)
 
     admissao = parse_br_date(m_adm.group(1)) if m_adm else (min(parsed_dates) if parsed_dates else date(2023, 3, 1))
@@ -278,14 +60,35 @@ def parse_sentence_parameters(text: str) -> Dict[str, Any]:
     elif "200" in low and ("divisor" in low or "40 horas" in low):
         divisor = 200.0
 
-    # Verbas detectadas no dispositivo
-    tem_he50 = bool(re.search(r"horas?\s+extras?|sobrejornada|50%", low))
+    # Extração de quantidades explícitas mencionadas na sentença ou relato do advogado
+    m_qtd_he50 = re.search(r"(\d+(?:[,\.]\d+)?)\s*horas?\s*extras?\s*(?:50%|mensais|por\s+m[êe]s)?", low)
+    qtd_he50_val = float(D(m_qtd_he50.group(1))) if m_qtd_he50 else 15.0
+
+    m_qtd_he100 = re.search(r"(\d+(?:[,\.]\d+)?)\s*(?:horas?\s*extras?\s*100%|domingos|feriados)", low)
+    qtd_he100_val = float(D(m_qtd_he100.group(1))) if m_qtd_he100 else 6.0
+
+    m_qtd_intra = re.search(r"(\d+(?:[,\.]\d+)?)\s*(?:horas?|minutos?)\s*(?:de\s+)?(?:intervalo|intrajornada)", low)
+    qtd_intra_val = float(D(m_qtd_intra.group(1))) if m_qtd_intra else 10.0
+    if m_qtd_intra and "minuto" in m_qtd_intra.group(0):
+        qtd_intra_val = round(qtd_intra_val / 60.0, 4)
+
+    # Verbas detectadas APENAS se constarem efetivamente deferidas no texto
+    tem_he50 = bool(re.search(r"horas?\s+extras?|sobrejornada|50%", low)) and not bool(re.search(r"improcedente[s]?\s+(?:o\s+pedido\s+de\s+)?horas?\s+extras?", low))
     tem_he100 = bool(re.search(r"100%|domingos\s+e\s+feriados\s+trabalhados|dobras?", low))
     tem_intrajornada = bool(re.search(r"intrajornada|intervalo\s+para\s+repouso|art\.?\s*71", low))
     tem_noturno = bool(re.search(r"adicional\s+noturno|hora\s+noturna|art\.?\s*73", low))
     tem_insalubridade = bool(re.search(r"insalubridade", low))
     tem_periculosidade = bool(re.search(r"periculosidade", low))
-    tem_verbas_rescis = bool(re.search(r"verbas\s+rescis[óo]rias|aviso\s+pr[ée]vio|saldo\s+de\s+sal[áa]rio|multa\s+do\s+art\.?\s*477|467", low))
+    # Não força verbas rescisórias se o texto não mencionar pedido/deferimento de rescisórias
+    tem_verbas_rescis = bool(re.search(r"verbas\s+rescis[óo]rias|aviso\s+pr[ée]vio|saldo\s+de\s+sal[áa]rio|f[ée]rias\s+proporcionais|13[ºo]\s+proporcional", low))
+
+    # Abatimento / Valores já pagos no TRCT mencionados no texto
+    m_pago = re.search(r"(?:abatimento|dedu[çc][ãa]o|j[áa]\s+pag[oa]s?|trct)\s*(?:de|no\s+valor\s+de)?\s*R?\$?\s*([\d\.]+,\d{2})", low)
+    valor_pago_abatimento = float(D(m_pago.group(1))) if m_pago else 0.0
+
+    # Verba adicional/diferença específica citada pelo advogado
+    m_dif_mensal = re.search(r"(?:diferen[çc]a\s+salarial|comiss[õo]es|pr[êe]mios|ac[úu]mulo\s+de\s+fun[çc][ãa]o|equipara[çc][ãa]o)\s*(?:de|no\s+valor\s+de)?\s*R?\$?\s*([\d\.]+,\d{2})", low)
+    verba_extra_mensal = float(D(m_dif_mensal.group(1))) if m_dif_mensal else 0.0
 
     grau_insal = 20
     if "40%" in low and tem_insalubridade:
@@ -307,7 +110,10 @@ def parse_sentence_parameters(text: str) -> Dict[str, Any]:
     return {
         "processo": processo,
         "calculo_numero": "1",
+        "vara_trabalho": "VARA DO TRABALHO",
         "reclamante": reclamante,
+        "advogado_reclamante": "ADVOGADO(A) DO RECLAMANTE",
+        "oab_advogado": "OAB/RS 00.000",
         "reclamado": reclamado,
         "estado": "RS",
         "municipio": "PORTO ALEGRE",
@@ -322,18 +128,21 @@ def parse_sentence_parameters(text: str) -> Dict[str, Any]:
         "sabado_dia_util": True,
         "projetar_aviso_previo": True,
         "aplicar_prescricao_quinquenal": True,
-        "tem_verbas_rescis": tem_verbas_rescis or True,
+        "tem_verbas_rescis": tem_verbas_rescis,
         "verbas_rescis_pagas": False,
+        "valor_pago_abatimento": valor_pago_abatimento,
+        "verba_extra_nome": "DIFERENÇAS SALARIAIS / PARCELA DEFERIDA",
+        "verba_extra_mensal": verba_extra_mensal,
         "multa_477": bool(re.search(r"477", low)),
         "multa_467": bool(re.search(r"467", low)),
         "tem_he50": tem_he50,
-        "qtd_he50_mensal": 22.0 if tem_he50 else 0.0,
+        "qtd_he50_mensal": qtd_he50_val if tem_he50 else 0.0,
         "tem_he100": tem_he100,
-        "qtd_he100_mensal": 8.0 if tem_he100 else 0.0,
+        "qtd_he100_mensal": qtd_he100_val if tem_he100 else 0.0,
         "tem_intrajornada": tem_intrajornada,
-        "qtd_intrajornada_mensal": 15.0 if tem_intrajornada else 0.0,
+        "qtd_intrajornada_mensal": qtd_intra_val if tem_intrajornada else 0.0,
         "tem_noturno": tem_noturno,
-        "qtd_horas_noturnas_mensal": 40.0 if tem_noturno else 0.0,
+        "qtd_horas_noturnas_mensal": 30.0 if tem_noturno else 0.0,
         "adicional_tipo": "Periculosidade (30%)" if tem_periculosidade else ("Insalubridade" if tem_insalubridade else "Nenhum"),
         "grau_insalubridade": grau_insal,
         "aplicar_reflexos": True,
@@ -570,6 +379,46 @@ def run_pjecalc_engine(params: Dict[str, Any], cartao_ponto_df: Optional[pd.Data
                 sum(D(r["devido"]) for r in rows_ad),
                 Decimal("0"),
                 rows_ad,
+            )
+
+    # ==========================================================================
+    # A2. VERBA MENSAL ESPECÍFICA / DIFERENÇA SALARIAL (RELATO DO ADVOGADO)
+    # ==========================================================================
+    total_verba_extra = Decimal("0")
+    verba_extra_mensal_val = D(params.get("verba_extra_mensal", 0))
+    if verba_extra_mensal_val > 0:
+        nome_v_extra = str(params.get("verba_extra_nome", "DIFERENÇAS SALARIAIS / PARCELA DEFERIDA")).upper()
+        rows_extra: List[Dict[str, Any]] = []
+        for m in months:
+            dias_prop = Decimal(str(min(30, m["dias_corridos"])))
+            v_ext = money_round((verba_extra_mensal_val / Decimal("30")) * dias_prop)
+            if v_ext > 0:
+                ocorrencias.append({"competencia": m["competencia"], "verba": nome_v_extra, "valor_devido": float(v_ext)})
+                rows_extra.append(
+                    {
+                        "periodo_mensal": m["periodo_mensal_pje"],
+                        "base": float(verba_extra_mensal_val),
+                        "divisor": 30.0,
+                        "multiplicador": 1.0,
+                        "quantidade": float(dias_prop),
+                        "dobra": "Não",
+                        "devido": float(v_ext),
+                        "pago": 0.0,
+                        "diferenca": float(v_ext),
+                        "indice_correcao": 1.0,
+                        "valor_corrigido": float(v_ext),
+                    }
+                )
+        if rows_extra:
+            total_verba_extra = add_verba(
+                "015",
+                nome_v_extra,
+                "Contribuição Social / IRPF / FGTS",
+                "((((VALOR MENSAL DEFERIDO) / 30,0000) X 1,00000000) X DIAS)",
+                "Parcela mensal apurada conforme comando sentencial e relato técnico",
+                sum(D(r["devido"]) for r in rows_extra),
+                Decimal("0"),
+                rows_extra,
             )
 
     # ==========================================================================
@@ -860,7 +709,7 @@ def run_pjecalc_engine(params: Dict[str, Any], cartao_ponto_df: Optional[pd.Data
     aplicar_reflexos = bool(params.get("aplicar_reflexos", True))
     reflexos_em_dsr = bool(params.get("reflexos_em_dsr", True))
     reflexos_em_fgts = bool(params.get("reflexos_em_fgts", True))
-    base_reflexos_total = total_adicional + total_he50 + total_he100 + total_intrajornada + total_noturno
+    base_reflexos_total = total_adicional + total_verba_extra + total_he50 + total_he100 + total_intrajornada + total_noturno
 
     if aplicar_reflexos and base_reflexos_total > 0:
         dsr_por_comp: Dict[str, Decimal] = {}
@@ -1189,6 +1038,11 @@ def run_pjecalc_engine(params: Dict[str, Any], cartao_ponto_df: Optional[pd.Data
     hon_pct = D(params.get("honorarios_sucumbencia_pct", 15.0))
     honorarios_valor = money_round(bruto_devido_reclamante * (hon_pct / Decimal("100")))
 
+    # Abatimento de valores já pagos / incontroversos (TRCT / recibos)
+    valor_abatimento = money_round(D(params.get("valor_pago_abatimento", 0)))
+    if valor_abatimento > 0:
+        liquido_devido_reclamante = max(Decimal("0"), money_round(liquido_devido_reclamante - valor_abatimento))
+
     total_devido_reclamado = money_round(
         liquido_devido_reclamante + inss_empregado + inss_empregador + irpf_reclamante + honorarios_valor
     )
@@ -1238,6 +1092,7 @@ def run_pjecalc_engine(params: Dict[str, Any], cartao_ponto_df: Optional[pd.Data
             "liquido_devido_reclamante": float(liquido_devido_reclamante),
             "honorarios_pct": float(hon_pct),
             "honorarios_valor": float(honorarios_valor),
+            "valor_abatimento": float(valor_abatimento),
             "total_devido_reclamado": float(total_devido_reclamado),
             "pct_remuneratorias": pct_remun,
             "pct_tributaveis": pct_trib,
@@ -1246,508 +1101,267 @@ def run_pjecalc_engine(params: Dict[str, Any], cartao_ponto_df: Optional[pd.Data
 
 
 # ==============================================================================
-# GERADOR DE RELATÓRIO PDF IDÊNTICO À PLANILHA DE CÁLCULO DO PJE-CALC CIDADÃO
+# ASSISTENTE PERICIAL DE IA & GERADOR DE MINUTA DE PETIÇÃO (ART. 879 CLT)
 # ==============================================================================
-def build_pjecalc_pdf(result: Dict[str, Any]) -> bytes:
+def ask_pericial_ai(
+    user_prompt: str,
+    params: Dict[str, Any],
+    result: Dict[str, Any],
+    sentence_text: str,
+    lawyer_notes: str,
+    api_key: str = "",
+) -> Tuple[str, Dict[str, Any], bool]:
     """
-    Gera PDF oficial idêntico ao layout da Planilha de Cálculo do PJe-Calc Cidadão:
-    - Cabeçalho institucional repetido em todas as páginas;
-    - Pág. 1: Resumo do Cálculo (4 quadros oficiais);
-    - Pág. 2: Critério de Cálculo e Fundamentação Legal;
-    - Pág. 3: Dados do Cálculo;
-    - Págs. 4+: Demonstrativo de Verbas com fórmula sombreada e tabela mensal de 11 colunas;
-    - Rodapé paginado oficial ("Cálculo liquidado por ... Pág. X de Y").
+    Assistente pericial trabalhista:
+    - Interpreta comandos de ajuste direto nos parâmetros (ex.: ajustar horas extras, salário, abatimento);
+    - Consulta OpenAI/Gemini caso chave seja informada, ou responde com análise técnico-pericial estruturada.
     """
+    updated = dict(params)
+    changed = False
+    low = user_prompt.lower()
+
+    # Regras determinísticas instantâneas de ajuste por comando em linguagem natural
+    m_sal = re.search(r"sal[áa]rio\s*(?:para|de|=)?\s*R?\$?\s*([\d\.]+,\d{2}|\d+(?:\.\d+)?)", low)
+    if m_sal:
+        updated["salario_base"] = float(D(m_sal.group(1)))
+        changed = True
+
+    m_he50 = re.search(r"(?:he\s*50|horas?\s*extras?\s*50%?)\s*(?:para|de|=)?\s*(\d+(?:[,\.]\d+)?)", low)
+    if m_he50:
+        v = float(D(m_he50.group(1)))
+        updated["tem_he50"] = v > 0
+        updated["qtd_he50_mensal"] = v
+        changed = True
+
+    if "sem horas extras" in low or "zerar horas extras" in low or "excluir horas extras" in low:
+        updated["tem_he50"] = False
+        updated["qtd_he50_mensal"] = 0.0
+        updated["tem_he100"] = False
+        updated["qtd_he100_mensal"] = 0.0
+        changed = True
+
+    if "sem verbas rescis" in low or "excluir verbas rescis" in low or "zerar rescis" in low:
+        updated["tem_verbas_rescis"] = False
+        changed = True
+
+    if "incluir verbas rescis" in low or "com verbas rescis" in low:
+        updated["tem_verbas_rescis"] = True
+        changed = True
+
+    m_abat = re.search(r"(?:abater|deduzir|descontar|pago)\s*R?\$?\s*([\d\.]+,\d{2})", low)
+    if m_abat:
+        updated["valor_pago_abatimento"] = float(D(m_abat.group(1)))
+        changed = True
+
+    m_extra = re.search(r"(?:diferen[çc]a|parcela\s+mensal|adicional\s+mensal)\s*(?:de)?\s*R?\$?\s*([\d\.]+,\d{2})", low)
+    if m_extra:
+        updated["verba_extra_mensal"] = float(D(m_extra.group(1)))
+        changed = True
+
+    resumo = result["resumo"]
+    meta = result["meta"]
+    context_summary = (
+        f"Processo: {meta['processo']} | Período: {meta['inicio_calculo']} a {meta['fim_calculo']} "
+        f"({meta['meses_apurados']} meses) | Salário Base: R$ {fmt_brl(meta['salario_base'])} | "
+        f"Bruto Reclamante: R$ {fmt_brl(resumo['bruto_devido_reclamante'])} | "
+        f"Líquido Reclamante: R$ {fmt_brl(resumo['liquido_devido_reclamante'])} | "
+        f"Total Reclamado: R$ {fmt_brl(resumo['total_devido_reclamado'])}."
+    )
+
+    # Chamada opcional a LLM externo (OpenAI ou Gemini) se o usuário informar API Key
+    clean_key = (api_key or "").strip()
+    if clean_key:
+        try:
+            sys_msg = (
+                "Você é um perito contador trabalhista especialista em PJe-Calc Cidadão e liquidação de sentença (art. 879 CLT). "
+                "Responda de forma objetiva, técnica e conferindo divergências entre a sentença, o relato do advogado e os valores apurados."
+            )
+            full_prompt = (
+                f"{sys_msg}\n\nRESUMO ATUAL DO CÁLCULO:\n{context_summary}\n\n"
+                f"RELATO DO ADVOGADO:\n{lawyer_notes[:2500]}\n\n"
+                f"TRECHO DA SENTENÇA:\n{sentence_text[:2500]}\n\n"
+                f"PERGUNTA / SOLICITAÇÃO DO USUÁRIO:\n{user_prompt}"
+            )
+            if clean_key.startswith("AIza"):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
+                payload = json.dumps({"contents": [{"parts": [{"text": full_prompt}]}]}).encode("utf-8")
+                req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    ans = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return ans, updated, changed
+            else:
+                url = "https://api.openai.com/v1/chat/completions"
+                payload = json.dumps(
+                    {
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {"role": "system", "content": sys_msg},
+                            {"role": "user", "content": full_prompt},
+                        ],
+                        "temperature": 0.2,
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {clean_key}"},
+                )
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    ans = data["choices"][0]["message"]["content"]
+                    return ans, updated, changed
+        except Exception as e:
+            return f"⚠️ Falha na consulta à API externa ({e}). Diagnóstico local aplicado:\n\n{context_summary}", updated, changed
+
+    # Resposta analítica local imediata (sem depender de API externa)
+    verbas_txt = "\n".join(
+        f"- **{v['nome']}**: Principal R$ {fmt_brl(v['valor'])} | Corrigido R$ {fmt_brl(v['valor_corrigido'])} | Total R$ {fmt_brl(v['total_verba'])}"
+        for v in result["verbas"]
+    ) or "- Nenhuma verba ativa no momento."
+
+    reply = (
+        f"### Análise Técnico-Pericial (Padrão PJe-Calc)\n"
+        f"{'✅ **Parâmetros atualizados e cálculo recalculado automaticamente!**' if changed else 'ℹ️ **Diagnóstico dos parâmetros atuais:**'}\n\n"
+        f"- **Período Apurado:** {meta['inicio_calculo']} a {meta['fim_calculo']} ({meta['meses_apurados']} competências)\n"
+        f"- **Salário Base / Divisor:** R$ {fmt_brl(meta['salario_base'])} / {fmt_num(meta['divisor'], 2)}\n"
+        f"- **Modalidade / Aviso Prévio:** {meta['modalidade_rescisao']} ({meta['dias_aviso_previo']} dias)\n\n"
+        f"**Composição das Verbas Ativas:**\n{verbas_txt}\n\n"
+        f"**Totais Consolidados:**\n"
+        f"- Bruto Reclamante: **R$ {fmt_brl(resumo['bruto_devido_reclamante'])}**\n"
+        f"- Líquido Reclamante: **R$ {fmt_brl(resumo['liquido_devido_reclamante'])}**\n"
+        f"- Total Devido pelo Reclamado: **R$ {fmt_brl(resumo['total_devido_reclamado'])}**\n\n"
+        f"💡 *Dica: Você pode me pedir ajustes diretos aqui no chat, como: "
+        f"`\"ajustar salário para 3200,00\"`, `\"ajustar he 50 para 12\"`, `\"zerar verbas rescisórias\"` ou `\"abater R$ 1.500,00\"`.*"
+    )
+    return reply, updated, changed
+
+
+def build_minuta_peticao(params: Dict[str, Any], result: Dict[str, Any], lawyer_notes: str = "") -> str:
+    """Gera a minuta jurídica completa de apresentação de cálculos de liquidação (Art. 879 CLT)."""
     meta = result["meta"]
     resumo = result["resumo"]
     verbas = result["verbas"]
 
+    linhas_verbas = "\n".join(
+        f"   • {v['nome']}: Principal R$ {fmt_brl(v['valor'])} | Corrigido R$ {fmt_brl(v['valor_corrigido'])} | Juros R$ {fmt_brl(v['juros'])} | Total R$ {fmt_brl(v['total_verba'])}"
+        for v in verbas
+    )
+
+    obs_adv = ""
+    if lawyer_notes.strip():
+        obs_adv = f"\nIV. OBSERVAÇÕES TÉCNICAS CONFORME PARÂMETROS DOS AUTOS\n\n{lawyer_notes.strip()}\n"
+
+    return f"""EXCELENTÍSSIMO(A) SENHOR(A) DOUTOR(A) JUIZ(A) DO TRABALHO DA {params.get('vara_trabalho', 'VARA DO TRABALHO').upper()} DE {meta['municipio'].upper()}/{meta['estado'].upper()}
+
+Processo nº: {meta['processo']}
+
+{meta['reclamante'].upper()}, já devidamente qualificado(a) nos autos da Reclamatória Trabalhista em epígrafe, que move em face de {meta['reclamado'].upper()}, vem, respeitosamente, à presença de Vossa Excelência, por seu(sua) procurador(a) signatário(a), com fulcro no art. 879, § 1º-B, da Consolidação das Leis do Trabalho (CLT), apresentar os
+
+CÁLCULOS DE LIQUIDAÇÃO DE SENTENÇA
+
+elaborados em estrita observância ao comando sentencial transitado em julgado e aos parâmetros oficiais do sistema PJe-Calc Cidadão (CSJT), conforme demonstrativos analíticos anexos e síntese abaixo:
+
+I. PARÂMETROS CONTRATUAIS E PROCESSUAIS OBSERVADOS
+
+1. Data de Admissão: {meta['admissao']}
+2. Data de Demissão / Rescisão: {meta['demissao']} (Modalidade: {meta['modalidade_rescisao']})
+3. Data de Ajuizamento da Ação: {meta['ajuizamento']}
+4. Data de Atualização / Liquidação: {meta['liquidacao']}
+5. Período Liquidado: {meta['inicio_calculo']} a {meta['fim_calculo']} ({meta['meses_apurados']} competências mensais)
+6. Aviso Prévio Proporcional (Lei nº 12.506/2011): {meta['dias_aviso_previo']} dias (projeção até {meta['data_rescisao_projetada']})
+7. Salário Base / Maior Remuneração: R$ {fmt_brl(meta['salario_base'])} | Divisor: {fmt_num(meta['divisor'], 4)}
+
+II. CRITÉRIOS DE ATUALIZAÇÃO MONETÁRIA, JUROS E ENCARGOS LEGAIS
+
+1. Correção Monetária e Juros: {meta['criterio_correcao']}, observada a época própria de exigibilidade (Súmula 381 do TST).
+2. Reflexos Legais: Apurados competência a competência na forma da legislação trabalhista e jurisprudência consolidada (RSR mês a mês, 13º salário por ano civil, férias + 1/3 por período aquisitivo e FGTS 8% + multa de 40%).
+3. Contribuições Previdenciárias (INSS): Apuradas mês a mês pelo regime de competência (Súmula 368 do TST), discriminando-se a cota do segurado e a cota patronal.
+4. Imposto de Renda Retido na Fonte (IRRF): Apurado pelo regime de Rendimentos Recebidos Acumuladamente (RRA), nos termos do art. 12-A da Lei nº 7.713/88 e IN RFB nº 1.500/2014, sem incidência sobre juros de mora (Tema 808 do STF).
+
+III. DISCRIMINAÇÃO DAS VERBAS LIQUIDADAS
+
+{linhas_verbas}
+{obs_adv}
+IV. QUADRO RESUMO GERAL DA LIQUIDAÇÃO (ATUALIZADO ATÉ {meta['liquidacao']})
+
+1. Subtotal Principal (Valor Histórico): R$ {fmt_brl(resumo['subtotal_principal'])}
+2. Subtotal Corrigido: R$ {fmt_brl(resumo['subtotal_corrigido'])}
+3. Juros de Mora: R$ {fmt_brl(resumo['juros_mora'])}
+4. BRUTO DEVIDO AO RECLAMANTE: R$ {fmt_brl(resumo['bruto_devido_reclamante'])}
+   (-) Dedução Contribuição Previdenciária (INSS Segurado): -R$ {fmt_brl(resumo['inss_empregado'])}
+   (-) Dedução Imposto de Renda (IRRF - RRA): -R$ {fmt_brl(resumo['irpf_reclamante'])}
+   (-) Abatimento / Valores Pagos Comprovados: -R$ {fmt_brl(resumo.get('valor_abatimento', 0))}
+5. LÍQUIDO DEVIDO AO RECLAMANTE: R$ {fmt_brl(resumo['liquido_devido_reclamante'])}
+6. Contribuição Social Total (Segurado + Empregador): R$ {fmt_brl(D(resumo['inss_empregado']) + D(resumo['inss_empregador']))}
+7. Honorários Advocatícios Sucumbenciais ({fmt_num(resumo['honorarios_pct'], 2)}%): R$ {fmt_brl(resumo['honorarios_valor'])}
+8. TOTAL GERAL DEVIDO PELA RECLAMADA: R$ {fmt_brl(resumo['total_devido_reclamado'])}
+
+V. REQUERIMENTOS FINAIS
+
+Diante do exposto, requer a Vossa Excelência:
+a) A homologação dos presentes cálculos de liquidação, fixando-se o crédito total devido pela Reclamada em R$ {fmt_brl(resumo['total_devido_reclamado'])}, atualizado até {meta['liquidacao']}, sem prejuízo das atualizações ulteriores até o efetivo pagamento;
+b) A intimação da Reclamada para ciência e pagamento/garantia do juízo, nos termos do art. 880 da CLT, sob pena de penhora e bloqueio via SISBAJUD.
+
+Nestes termos,
+Pede e espera deferimento.
+
+{meta['municipio']}/{meta['estado']}, {meta['liquidacao']}.
+
+____________________________________________________
+{params.get('advogado_reclamante', 'ADVOGADO(A) DO RECLAMANTE')}
+{params.get('oab_advogado', 'OAB/RS 00.000')}
+"""
+
+
+def build_minuta_pdf(minuta_text: str, processo: str) -> bytes:
+    """Gera PDF formatado da Minuta de Petição de Apresentação de Cálculos."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        leftMargin=10 * mm,
-        rightMargin=10 * mm,
-        topMargin=36 * mm,
-        bottomMargin=14 * mm,
-        title=f"Planilha de Cálculo PJe-Calc - {meta['processo']}",
+        leftMargin=25 * mm,
+        rightMargin=20 * mm,
+        topMargin=25 * mm,
+        bottomMargin=20 * mm,
+        title=f"Minuta Peticao Liquidacao - {processo}",
     )
-
     styles = getSampleStyleSheet()
-    st_sec_title = ParagraphStyle(
-        "PjeSecTitle",
+    st_pet = ParagraphStyle(
+        "PeticaoBody",
         parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=9.5,
-        leading=12,
-        textColor=colors.black,
-        spaceBefore=4,
-        spaceAfter=4,
+        fontName="Times-Roman",
+        fontSize=11,
+        leading=16,
+        alignment=TA_LEFT,
+        spaceAfter=6,
     )
-    st_sub_title = ParagraphStyle(
-        "PjeSubTitle",
+    st_pet_bold = ParagraphStyle(
+        "PeticaoBold",
         parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8.0,
-        leading=10,
-        textColor=colors.black,
-        spaceBefore=4,
-        spaceAfter=2,
-    )
-    st_body = ParagraphStyle(
-        "PjeBody",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.5,
-        leading=10,
-        textColor=colors.black,
-    )
-    st_formula = ParagraphStyle(
-        "PjeFormula",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.2,
-        leading=9.5,
+        fontName="Times-Bold",
+        fontSize=11,
+        leading=16,
         alignment=TA_CENTER,
-        textColor=colors.black,
+        spaceBefore=6,
+        spaceAfter=8,
     )
-    st_cell = ParagraphStyle(
-        "PjeCell",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=6.8,
-        leading=8.2,
-        textColor=colors.black,
-    )
-    st_cell_bold = ParagraphStyle(
-        "PjeCellBold",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=6.8,
-        leading=8.2,
-        textColor=colors.black,
-    )
-    st_cell_right = ParagraphStyle(
-        "PjeCellRight",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=6.8,
-        leading=8.2,
-        alignment=TA_RIGHT,
-        textColor=colors.black,
-    )
-    st_cell_right_bold = ParagraphStyle(
-        "PjeCellRightBold",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=6.8,
-        leading=8.2,
-        alignment=TA_RIGHT,
-        textColor=colors.black,
-    )
-
-    now_str = datetime.now().strftime("%d/%m/%Y às %H:%M:%S")
-    header_gray = colors.HexColor("#DCDCDC")
-    row_alt = colors.HexColor("#F5F5F5")
-    border_gray = colors.HexColor("#7A7A7A")
-
-    def draw_header_footer(canvas_obj: Any, doc_obj: Any) -> None:
-        canvas_obj.saveState()
-        page_w, page_h = A4
-        left_x = 10 * mm
-        right_x = page_w - 10 * mm
-        top_y = page_h - 8 * mm
-
-        # Linha superior institucional PJe-Calc Cidadão
-        canvas_obj.setFont("Helvetica-Bold", 11)
-        canvas_obj.drawString(left_x, top_y - 3 * mm, "PJe-Calc Cidadão")
-        canvas_obj.setFont("Helvetica", 7.2)
-        canvas_obj.drawString(left_x, top_y - 6.8 * mm, "Sistema de Cálculos Trabalhistas")
-
-        # Quadro Central: PLANILHA DE CÁLCULO | Processo | Cálculo
-        box_x = left_x + 74 * mm
-        box_w = 64 * mm
-        canvas_obj.setStrokeColor(border_gray)
-        canvas_obj.setLineWidth(0.6)
-        canvas_obj.rect(box_x, top_y - 11.5 * mm, box_w, 11.5 * mm)
-        canvas_obj.setFillColor(header_gray)
-        canvas_obj.rect(box_x, top_y - 4.2 * mm, box_w, 4.2 * mm, fill=1, stroke=1)
-        canvas_obj.setFillColor(colors.black)
-        canvas_obj.setFont("Helvetica-Bold", 7.5)
-        canvas_obj.drawCentredString(box_x + box_w / 2, top_y - 3.1 * mm, "PLANILHA DE CÁLCULO")
-
-        canvas_obj.line(box_x + 44 * mm, top_y - 11.5 * mm, box_x + 44 * mm, top_y - 4.2 * mm)
-        canvas_obj.setFont("Helvetica-Bold", 6.2)
-        canvas_obj.drawString(box_x + 1.5 * mm, top_y - 6.8 * mm, "Processo")
-        canvas_obj.drawString(box_x + 45.5 * mm, top_y - 6.8 * mm, "Cálculo")
-        canvas_obj.setFont("Helvetica", 6.8)
-        canvas_obj.drawString(box_x + 1.5 * mm, top_y - 10.2 * mm, str(meta["processo"]))
-        canvas_obj.drawString(box_x + 45.5 * mm, top_y - 10.2 * mm, str(meta["calculo_numero"]))
-
-        # Bloco Direito: Data Ajuizamento / Data Liquidação
-        canvas_obj.setFont("Helvetica-Bold", 6.8)
-        canvas_obj.drawRightString(right_x - 18 * mm, top_y - 3.2 * mm, "Data Ajuizamento:")
-        canvas_obj.drawRightString(right_x - 18 * mm, top_y - 7.2 * mm, "Data Liquidação:")
-        canvas_obj.setFont("Helvetica", 6.8)
-        canvas_obj.drawRightString(right_x, top_y - 3.2 * mm, str(meta["ajuizamento"]))
-        canvas_obj.drawRightString(right_x, top_y - 7.2 * mm, str(meta["liquidacao"]))
-
-        # Quadro de identificação de partes e período (logo abaixo do topo)
-        y_partes = top_y - 13 * mm
-        canvas_obj.setFont("Helvetica-Bold", 6.8)
-        canvas_obj.drawString(left_x, y_partes - 2.5 * mm, f"Reclamante: {str(meta['reclamante'])[:68]}")
-        canvas_obj.drawString(left_x, y_partes - 6.2 * mm, f"Reclamado: {str(meta['reclamado'])[:68]}")
-        canvas_obj.drawRightString(
-            right_x,
-            y_partes - 2.5 * mm,
-            f"Período do Cálculo: {meta['inicio_calculo']} a {meta['fim_calculo']}",
-        )
-        canvas_obj.setFont("Helvetica", 6.5)
-        canvas_obj.drawRightString(
-            right_x,
-            y_partes - 6.2 * mm,
-            f"Admissão: {meta['admissao']} | Demissão: {meta['demissao']}",
-        )
-        canvas_obj.setLineWidth(0.8)
-        canvas_obj.line(left_x, y_partes - 8.2 * mm, right_x, y_partes - 8.2 * mm)
-
-        # Rodapé Oficial PJe-Calc
-        foot_y = 8.5 * mm
-        canvas_obj.setLineWidth(0.5)
-        canvas_obj.line(left_x, foot_y + 3.5 * mm, right_x, foot_y + 3.5 * mm)
-        canvas_obj.setFont("Helvetica", 6.5)
-        canvas_obj.drawString(
-            left_x,
-            foot_y,
-            f"Cálculo liquidado por ED Cálculos Trabalhistas (Padrão PJe-Calc) em {now_str}.",
-        )
-        canvas_obj.drawRightString(right_x, foot_y, f"Pág. {doc_obj.page}")
-        canvas_obj.restoreState()
-
     story: List[Any] = []
-    usable_w = A4[0] - 20 * mm
-
-    def pje_table_style(has_total_row: bool = True) -> TableStyle:
-        cmds = [
-            ("BACKGROUND", (0, 0), (-1, 0), header_gray),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.0),
-            ("GRID", (0, 0), (-1, -1), 0.45, border_gray),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-            ("LEFTPADDING", (0, 0), (-1, -1), 3.5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 3.5),
-        ]
-        if has_total_row:
-            cmds.append(("BACKGROUND", (0, -1), (-1, -1), header_gray))
-            cmds.append(("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"))
-        return TableStyle(cmds)
-
-    # ==========================================================================
-    # PÁGINA 1 — RESUMO DO CÁLCULO (QUADROS OFICIAIS PJE-CALC)
-    # ==========================================================================
-    story.append(Paragraph("RESUMO DO CÁLCULO", st_sec_title))
-
-    # 1.1 Descrição do Bruto Devido ao Reclamante
-    story.append(Paragraph("Descrição do Bruto Devido ao Reclamante", st_sub_title))
-    t1_data = [
-        [
-            Paragraph("Descrição", st_cell_bold),
-            Paragraph("Valor Corrigido", st_cell_right_bold),
-            Paragraph("Juros", st_cell_right_bold),
-            Paragraph("Total", st_cell_right_bold),
-        ]
-    ]
-    for v in verbas:
-        t1_data.append(
-            [
-                Paragraph(v["nome"], st_cell),
-                Paragraph(fmt_brl(v["valor_corrigido"]), st_cell_right),
-                Paragraph(fmt_brl(v["juros"]), st_cell_right),
-                Paragraph(fmt_brl(v["total_verba"]), st_cell_right),
-            ]
-        )
-    t1_data.append(
-        [
-            Paragraph("Total", st_cell_bold),
-            Paragraph(fmt_brl(resumo["subtotal_corrigido"]), st_cell_right_bold),
-            Paragraph(fmt_brl(resumo["juros_mora"]), st_cell_right_bold),
-            Paragraph(fmt_brl(resumo["bruto_devido_reclamante"]), st_cell_right_bold),
-        ]
-    )
-    t1 = Table(t1_data, colWidths=[usable_w * 0.55, usable_w * 0.15, usable_w * 0.15, usable_w * 0.15], repeatRows=1)
-    t1.setStyle(pje_table_style(True))
-    story.append(t1)
-    story.append(Spacer(1, 4 * mm))
-
-    # 1.2 Descrição de Créditos e Descontos do Reclamante
-    story.append(Paragraph("Descrição de Créditos e Descontos do Reclamante", st_sub_title))
-    t2_data = [
-        [Paragraph("Descrição", st_cell_bold), Paragraph("Valor", st_cell_right_bold)],
-        [Paragraph("VERBAS", st_cell), Paragraph(fmt_brl(resumo["total_verbas_bruto"]), st_cell_right)],
-        [Paragraph("FGTS", st_cell), Paragraph(fmt_brl(resumo["total_fgts_bruto"]), st_cell_right)],
-        [Paragraph("Bruto Devido ao Reclamante", st_cell_bold), Paragraph(fmt_brl(resumo["bruto_devido_reclamante"]), st_cell_right_bold)],
-        [Paragraph("DEDUÇÃO DE CONTRIBUIÇÃO SOCIAL", st_cell), Paragraph(f"-{fmt_brl(resumo['inss_empregado'])}", st_cell_right)],
-        [Paragraph("IRPF DEVIDO PELO RECLAMANTE", st_cell), Paragraph(f"-{fmt_brl(resumo['irpf_reclamante'])}", st_cell_right)],
-        [Paragraph("Total de Descontos", st_cell_bold), Paragraph(f"-{fmt_brl(resumo['total_descontos_reclamante'])}", st_cell_right_bold)],
-        [Paragraph("Líquido Devido ao Reclamante", st_cell_bold), Paragraph(fmt_brl(resumo["liquido_devido_reclamante"]), st_cell_right_bold)],
-    ]
-    t2 = Table(t2_data, colWidths=[usable_w * 0.78, usable_w * 0.22])
-    st2 = pje_table_style(True)
-    st2.add("BACKGROUND", (0, 3), (-1, 3), row_alt)
-    st2.add("BACKGROUND", (0, 6), (-1, 6), row_alt)
-    t2.setStyle(st2)
-    story.append(t2)
-    story.append(Spacer(1, 3 * mm))
-
-    # Quadro de Percentuais
-    t_pct = Table(
-        [
-            [
-                Paragraph(f"Percentual de Parcelas Remuneratórias: {fmt_num(resumo['pct_remuneratorias'], 2)}%", st_cell_bold),
-                Paragraph(f"Percentual de Parcelas Tributáveis: {fmt_num(resumo['pct_tributaveis'], 2)}%", st_cell_bold),
-            ]
-        ],
-        colWidths=[usable_w * 0.50, usable_w * 0.50],
-    )
-    t_pct.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), row_alt),
-                ("GRID", (0, 0), (-1, -1), 0.45, border_gray),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ]
-        )
-    )
-    story.append(t_pct)
-    story.append(Spacer(1, 4 * mm))
-
-    # 1.3 Descrição de Débitos do Reclamado por Credor
-    story.append(Paragraph("Descrição de Débitos do Reclamado por Credor", st_sub_title))
-    t3_data = [
-        [Paragraph("Descrição", st_cell_bold), Paragraph("Valor", st_cell_right_bold)],
-        [Paragraph("LÍQUIDO DEVIDO AO RECLAMANTE", st_cell), Paragraph(fmt_brl(resumo["liquido_devido_reclamante"]), st_cell_right)],
-        [Paragraph("CONTRIBUIÇÃO SOCIAL SOBRE SALÁRIOS DEVIDOS (SEGURADO + EMPREGADOR)", st_cell), Paragraph(fmt_brl(D(resumo["inss_empregado"]) + D(resumo["inss_empregador"])), st_cell_right)],
-        [Paragraph("IRPF DEVIDO PELO RECLAMANTE", st_cell), Paragraph(fmt_brl(resumo["irpf_reclamante"]), st_cell_right)],
-        [Paragraph(f"HONORÁRIOS ADVOCATÍCIOS SUCUMBENCIAIS ({fmt_num(resumo['honorarios_pct'], 2)}%)", st_cell), Paragraph(fmt_brl(resumo["honorarios_valor"]), st_cell_right)],
-        [Paragraph("Total Devido pelo Reclamado", st_cell_bold), Paragraph(fmt_brl(resumo["total_devido_reclamado"]), st_cell_right_bold)],
-    ]
-    t3 = Table(t3_data, colWidths=[usable_w * 0.78, usable_w * 0.22])
-    t3.setStyle(pje_table_style(True))
-    story.append(t3)
-
-    # ==========================================================================
-    # PÁGINA 2 — CRITÉRIO DE CÁLCULO E FUNDAMENTAÇÃO LEGAL + DADOS DO CÁLCULO
-    # ==========================================================================
-    story.append(PageBreak())
-    story.append(Paragraph("CRITÉRIO DE CÁLCULO E FUNDAMENTAÇÃO LEGAL", st_sec_title))
-
-    criterios_itens = [
-        f"1. Período Liquidado: {meta['inicio_calculo']} a {meta['fim_calculo']} ({meta['meses_apurados']} competências mensais), observada a prescrição quinquenal quando aplicável (Art. 7º, XXIX, CF/88).",
-        f"2. Modalidade Rescisória e Aviso Prévio: {meta['modalidade_rescisao']}. Prazo de aviso prévio apurado em {meta['dias_aviso_previo']} dias nos termos da Lei nº 12.506/2011 (projeção até {meta['data_rescisao_projetada']}).",
-        "3. Apuração Mensal (Competência a Competência): Os valores devidos são apurados e arredondados mês a mês (2 casas decimais, critério HALF_UP) idênticos à rotina do PJe-Calc Cidadão.",
-        "4. Reflexos Legais: Repouso Semanal Remunerado apurado mês a mês pela razão (Base Mensal / Dias Úteis) x Domingos e Feriados; 13º Salário apurado por ano civil; Férias + 1/3 apuradas por período aquisitivo; Aviso Prévio pela média dos últimos 12 meses.",
-        f"5. Atualização Monetária e Juros: {meta['criterio_correcao']}, observada a época própria de exigibilidade (Súmula 381 do TST).",
-        "6. Encargos Previdenciários e Fiscais: Contribuição social apurada mês a mês pelo regime de competência (Súmula 368 do TST) e IRRF pelo regime de Rendimentos Recebidos Acumuladamente (Art. 12-A da Lei nº 7.713/88).",
-        f"7. Observações da Sentença: {meta['fundamentacao_resumo']}",
-    ]
-    for item_txt in criterios_itens:
-        story.append(Paragraph(item_txt, st_body))
-        story.append(Spacer(1, 2 * mm))
-
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("DADOS DO CÁLCULO", st_sec_title))
-    dados_rows = [
-        [Paragraph("Parâmetro", st_cell_bold), Paragraph("Valor", st_cell_bold), Paragraph("Parâmetro", st_cell_bold), Paragraph("Valor", st_cell_bold)],
-        [Paragraph("Estado / Município", st_cell), Paragraph(f"{meta['estado']} / {meta['municipio']}", st_cell), Paragraph("Regime de Trabalho", st_cell), Paragraph("Tempo Integral", st_cell)],
-        [Paragraph("Data de Admissão", st_cell), Paragraph(meta["admissao"], st_cell), Paragraph("Data de Demissão", st_cell), Paragraph(meta["demissao"], st_cell)],
-        [Paragraph("Data de Ajuizamento", st_cell), Paragraph(meta["ajuizamento"], st_cell), Paragraph("Data de Liquidação", st_cell), Paragraph(meta["liquidacao"], st_cell)],
-        [Paragraph("Salário Base / Maior Remun.", st_cell), Paragraph(f"R$ {fmt_brl(meta['salario_base'])}", st_cell), Paragraph("Carga Horária (Divisor)", st_cell), Paragraph(fmt_num(meta["divisor"], 4), st_cell)],
-        [Paragraph("Prazo de Aviso Prévio", st_cell), Paragraph(f"{meta['dias_aviso_previo']} dias (Lei 12.506/2011)", st_cell), Paragraph("Projetar Aviso Prévio", st_cell), Paragraph("Sim" if meta["projetar_aviso_previo"] else "Não", st_cell)],
-        [Paragraph("Prescrição Quinquenal", st_cell), Paragraph("Sim" if meta["aplicar_prescricao_quinquenal"] else "Não", st_cell), Paragraph("Sábado como Dia Útil", st_cell), Paragraph("Sim" if meta["sabado_dia_util"] else "Não", st_cell)],
-    ]
-    t_dados = Table(dados_rows, colWidths=[usable_w * 0.25, usable_w * 0.25, usable_w * 0.25, usable_w * 0.25])
-    t_dados.setStyle(pje_table_style(False))
-    story.append(t_dados)
-
-    # ==========================================================================
-    # PÁGINAS SEGUINTES — DEMONSTRATIVO DE VERBAS (11 COLUNAS OFICIAIS PJE-CALC)
-    # ==========================================================================
-    story.append(PageBreak())
-    story.append(Paragraph("DEMONSTRATIVO DE VERBAS", st_sec_title))
-
-    col_w_11 = [
-        usable_w * 0.14,  # Período Mensal
-        usable_w * 0.09,  # Base
-        usable_w * 0.08,  # Divisor
-        usable_w * 0.09,  # Multiplicador
-        usable_w * 0.08,  # Quantidade
-        usable_w * 0.06,  # Dobra
-        usable_w * 0.09,  # Devido
-        usable_w * 0.08,  # Pago
-        usable_w * 0.09,  # Diferença
-        usable_w * 0.09,  # Índice Correção
-        usable_w * 0.11,  # Valor Corrigido
-    ]
-
-    for idx_v, v in enumerate(verbas):
-        if idx_v > 0:
-            story.append(Spacer(1, 5 * mm))
-
-        # Cabeçalho da verba + caixa sombreada com a fórmula oficial
-        hdr_verba = Table(
-            [
-                [
-                    Paragraph(f"<b>Nome:</b> {v['nome']}", st_cell),
-                    Paragraph(f"<b>Período:</b> {v['periodo_global']}", st_cell_right),
-                ],
-                [
-                    Paragraph(f"<b>Incidência(s):</b> {v['incidencias']}", st_cell),
-                    Paragraph(f"<b>Comentário:</b> {v['comentario']}", st_cell_right),
-                ],
-                [Paragraph(v["formula_pje"], st_formula), ""],
-            ],
-            colWidths=[usable_w * 0.55, usable_w * 0.45],
-        )
-        hdr_verba.setStyle(
-            TableStyle(
-                [
-                    ("SPAN", (0, 2), (1, 2)),
-                    ("BACKGROUND", (0, 2), (1, 2), header_gray),
-                    ("GRID", (0, 0), (-1, -1), 0.45, border_gray),
-                    ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ]
-            )
-        )
-        story.append(hdr_verba)
-
-        # Tabela mensal de 11 colunas
-        v_rows = [
-            [
-                Paragraph("Período Mensal", st_cell_bold),
-                Paragraph("Base", st_cell_right_bold),
-                Paragraph("Divisor", st_cell_right_bold),
-                Paragraph("Multiplicador", st_cell_right_bold),
-                Paragraph("Quantidade", st_cell_right_bold),
-                Paragraph("Dobra", st_cell_bold),
-                Paragraph("Devido", st_cell_right_bold),
-                Paragraph("Pago", st_cell_right_bold),
-                Paragraph("Diferença", st_cell_right_bold),
-                Paragraph("Índice Correção", st_cell_right_bold),
-                Paragraph("Valor Corrigido", st_cell_right_bold),
-            ]
-        ]
-
-        for r in v.get("ocorrencias", []):
-            v_rows.append(
-                [
-                    Paragraph(str(r.get("periodo_mensal", "")), st_cell),
-                    Paragraph(fmt_brl(r.get("base", 0)), st_cell_right),
-                    Paragraph(fmt_num(r.get("divisor", 1), 4), st_cell_right),
-                    Paragraph(fmt_num(r.get("multiplicador", 1), 8), st_cell_right),
-                    Paragraph(fmt_num(r.get("quantidade", 1), 4), st_cell_right),
-                    Paragraph(str(r.get("dobra", "Não")), st_cell),
-                    Paragraph(fmt_brl(r.get("devido", 0)), st_cell_right),
-                    Paragraph(fmt_brl(r.get("pago", 0)), st_cell_right),
-                    Paragraph(fmt_brl(r.get("diferenca", 0)), st_cell_right),
-                    Paragraph(fmt_num(r.get("indice_correcao", 1), 8), st_cell_right),
-                    Paragraph(fmt_brl(r.get("valor_corrigido", 0)), st_cell_right),
-                ]
-            )
-
-        v_rows.append(
-            [
-                Paragraph("Total", st_cell_bold),
-                "",
-                "",
-                "",
-                "",
-                "",
-                Paragraph(fmt_brl(v["valor_devido"]), st_cell_right_bold),
-                Paragraph(fmt_brl(v["valor_pago"]), st_cell_right_bold),
-                Paragraph(fmt_brl(v["valor"]), st_cell_right_bold),
-                "",
-                Paragraph(fmt_brl(v["valor_corrigido"]), st_cell_right_bold),
-            ]
-        )
-
-        tv = Table(v_rows, colWidths=col_w_11, repeatRows=1)
-        stv = pje_table_style(True)
-        stv.add("LEFTPADDING", (0, 0), (-1, -1), 2.0)
-        stv.add("RIGHTPADDING", (0, 0), (-1, -1), 2.0)
-        tv.setStyle(stv)
-        story.append(tv)
-
-    doc.build(story, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
+    for raw_line in minuta_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            story.append(Spacer(1, 3 * mm))
+            continue
+        if line in ("CÁLCULOS DE LIQUIDAÇÃO DE SENTENÇA",):
+            story.append(Paragraph(line, st_pet_bold))
+        else:
+            safe_line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if re.match(r"^(EXCELENTÍSSIMO|I\.|II\.|III\.|IV\.|V\.)", line):
+                story.append(Paragraph(f"<b>{safe_line}</b>", st_pet))
+            else:
+                story.append(Paragraph(safe_line, st_pet))
+    doc.build(story)
     return buf.getvalue()
-
-
-# ==============================================================================
-# GERADOR DE ARQUIVO .PJC (SCHEMA XML ESTRUTURADO PJE-CALC CIDADÃO)
-# ==============================================================================
-def build_pjc_xml(result: Dict[str, Any]) -> bytes:
-    """Gera arquivo .PJC estruturado no padrão do PJe-Calc Cidadão."""
-    meta = result["meta"]
-    resumo = result["resumo"]
-    root = ET.Element("CalculoPJeCalc", versao="2.11.0", origem="ED-Calculos-Trabalhistas")
-
-    proc_el = ET.SubElement(root, "Processo")
-    ET.SubElement(proc_el, "NumeroProcesso").text = str(meta["processo"])
-    ET.SubElement(proc_el, "NumeroCalculo").text = str(meta["calculo_numero"])
-    ET.SubElement(proc_el, "Reclamante").text = str(meta["reclamante"])
-    ET.SubElement(proc_el, "Reclamado").text = str(meta["reclamado"])
-
-    dados_el = ET.SubElement(root, "DadosCalculo")
-    ET.SubElement(dados_el, "Estado").text = str(meta["estado"])
-    ET.SubElement(dados_el, "Municipio").text = str(meta["municipio"])
-    ET.SubElement(dados_el, "DataAdmissao").text = str(meta["admissao"])
-    ET.SubElement(dados_el, "DataDemissao").text = str(meta["demissao"])
-    ET.SubElement(dados_el, "DataAjuizamento").text = str(meta["ajuizamento"])
-    ET.SubElement(dados_el, "DataLiquidacao").text = str(meta["liquidacao"])
-    ET.SubElement(dados_el, "SalarioBase").text = f"{meta['salario_base']:.2f}"
-    ET.SubElement(dados_el, "CargaHorariaPadrao").text = f"{meta['divisor']:.4f}"
-    ET.SubElement(dados_el, "PrazoAvisoPrevioDias").text = str(meta["dias_aviso_previo"])
-    ET.SubElement(dados_el, "ProjetarAvisoPrevio").text = str(meta["projetar_aviso_previo"]).lower()
-    ET.SubElement(dados_el, "SabadoDiaUtil").text = str(meta["sabado_dia_util"]).lower()
-
-    verbas_el = ET.SubElement(root, "Verbas")
-    for v in result["verbas"]:
-        v_el = ET.SubElement(verbas_el, "Verba", codigo=str(v["codigo"]))
-        ET.SubElement(v_el, "Nome").text = str(v["nome"])
-        ET.SubElement(v_el, "Incidencias").text = str(v["incidencias"])
-        ET.SubElement(v_el, "Formula").text = str(v["formula_pje"])
-        ET.SubElement(v_el, "ValorDevido").text = f"{v['valor_devido']:.2f}"
-        ET.SubElement(v_el, "ValorPago").text = f"{v['valor_pago']:.2f}"
-        ET.SubElement(v_el, "Diferenca").text = f"{v['valor']:.2f}"
-        ET.SubElement(v_el, "ValorCorrigido").text = f"{v['valor_corrigido']:.2f}"
-        ET.SubElement(v_el, "Juros").text = f"{v['juros']:.2f}"
-        oc_list_el = ET.SubElement(v_el, "Ocorrencias")
-        for r in v.get("ocorrencias", []):
-            oc_el = ET.SubElement(oc_list_el, "Ocorrencia")
-            ET.SubElement(oc_el, "PeriodoMensal").text = str(r.get("periodo_mensal", ""))
-            ET.SubElement(oc_el, "Base").text = f"{r.get('base', 0):.2f}"
-            ET.SubElement(oc_el, "Divisor").text = f"{r.get('divisor', 1):.4f}"
-            ET.SubElement(oc_el, "Multiplicador").text = f"{r.get('multiplicador', 1):.8f}"
-            ET.SubElement(oc_el, "Quantidade").text = f"{r.get('quantidade', 1):.4f}"
-            ET.SubElement(oc_el, "Devido").text = f"{r.get('devido', 0):.2f}"
-            ET.SubElement(oc_el, "Pago").text = f"{r.get('pago', 0):.2f}"
-            ET.SubElement(oc_el, "Diferenca").text = f"{r.get('diferenca', 0):.2f}"
-            ET.SubElement(oc_el, "IndiceCorrecao").text = f"{r.get('indice_correcao', 1):.8f}"
-            ET.SubElement(oc_el, "ValorCorrigido").text = f"{r.get('valor_corrigido', 0):.2f}"
-
-    res_el = ET.SubElement(root, "ResumoLiquidacao")
-    for k, val in resumo.items():
-        ET.SubElement(res_el, k).text = str(val)
-
-    ET.indent(root, space="  ")
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 # ==============================================================================
@@ -1757,6 +1371,19 @@ if "params" not in st.session_state:
     st.session_state["params"] = parse_sentence_parameters("")
 if "sentence_text" not in st.session_state:
     st.session_state["sentence_text"] = ""
+if "lawyer_notes" not in st.session_state:
+    st.session_state["lawyer_notes"] = ""
+if "ai_chat_history" not in st.session_state:
+    st.session_state["ai_chat_history"] = [
+        {
+            "role": "assistant",
+            "content": (
+                "Olá! Sou seu **Assistente Pericial Trabalhista (Padrão PJe-Calc)**. "
+                "Cole o **relato do advogado** e a **sentença** na barra lateral ou me diga aqui quais "
+                "verbas, quantidades ou valores pagos devem constar para eu alinhar o cálculo exatamente ao esperado."
+            ),
+        }
+    ]
 if "calc_result" not in st.session_state:
     st.session_state["calc_result"] = run_pjecalc_engine(st.session_state["params"])
 
@@ -1769,7 +1396,7 @@ st.markdown(
     <div style="padding: 14px 18px; border-radius: 10px; background: linear-gradient(90deg, #1E293B 0%, #334155 100%); color: #FFFFFF; margin-bottom: 16px;">
         <h2 style="margin: 0; font-size: 1.45rem;">⚖️ ED Cálculos Trabalhistas — Liquidação de Sentença (Art. 879 CLT)</h2>
         <p style="margin: 4px 0 0 0; font-size: 0.9rem; color: #CBD5E1;">
-            Motor matemático 100% fiel ao <b>PJe-Calc Cidadão (CSJT)</b> • Leitura de sentença/embargos • Entrega da liquidação pronta em <b>PDF oficial</b> e <b>.PJC</b>
+            Motor matemático 100% fiel ao <b>PJe-Calc Cidadão (CSJT)</b> • Assistente Pericial IA • <b>Minuta de Petição</b> + <b>PDF Oficial</b> + <b>.PJC</b>
         </p>
     </div>
     """,
@@ -1777,16 +1404,22 @@ st.markdown(
 )
 
 with st.sidebar:
-    st.header("📂 1. Sentença & Anexos")
+    st.header("📂 1. Sentença & Relato do Advogado")
     uploaded_files = st.file_uploader(
         "Envie a Sentença / Embargos / TRCT / Ponto (PDF, CSV, XLSX, TXT)",
         type=["pdf", "txt", "csv", "xlsx", "xls"],
         accept_multiple_files=True,
     )
+    lawyer_notes_input = st.text_area(
+        "📋 Relato / Orientação do Advogado (parâmetros esperados):",
+        value=st.session_state["lawyer_notes"],
+        height=115,
+        placeholder="Cole aqui o e-mail ou relato do advogado com as verbas deferidas, médias, valores pagos no TRCT ou estimativa...",
+    )
     pasted_text = st.text_area(
-        "Ou cole o texto do dispositivo da sentença:",
+        "⚖️ Texto do Dispositivo da Sentença / Embargos:",
         value=st.session_state["sentence_text"],
-        height=130,
+        height=115,
         placeholder="Cole aqui o dispositivo da sentença trabalhista...",
     )
 
@@ -1804,7 +1437,7 @@ with st.sidebar:
                 except Exception:
                     pass
 
-    if st.button("🔍 Ler Sentença e Extrair Parâmetros", use_container_width=True, type="primary"):
+    if st.button("🔍 Ler Documentos & Extrair Parâmetros", use_container_width=True, type="primary"):
         combined_chunks: List[str] = []
         if uploaded_files:
             for uf in uploaded_files:
@@ -1813,20 +1446,34 @@ with st.sidebar:
             combined_chunks.append(pasted_text.strip())
         full_txt = "\n\n".join(combined_chunks)
         st.session_state["sentence_text"] = full_txt
-        parsed = parse_sentence_parameters(full_txt)
+        st.session_state["lawyer_notes"] = lawyer_notes_input
+        parsed = parse_sentence_parameters(full_txt, lawyer_notes_input)
         st.session_state["params"] = parsed
         st.session_state["calc_result"] = run_pjecalc_engine(parsed, cartao_df)
-        st.success("Sentença processada e liquidada no padrão PJe-Calc Cidadão!")
+        st.success("Parâmetros extraídos da sentença e do relato do advogado!")
 
     st.divider()
-    st.caption("Padrão oficial: apuração competência a competência, Lei 12.506/2011, Súmula 381 TST e ADC 58 STF.")
+    st.subheader("🤖 Configuração Opcional da IA")
+    default_api_key = ""
+    try:
+        default_api_key = st.secrets.get("OPENAI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        default_api_key = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    ai_api_key = st.text_input(
+        "Chave API OpenAI ou Gemini (opcional)",
+        value=default_api_key,
+        type="password",
+        help="Se informada, ativa resposta generativa completa na aba Assistente IA. Sem chave, o motor pericial local já realiza ajustes e diagnósticos.",
+    )
 
-# Abas de trabalho
-tab_params, tab_resumo, tab_verbas, tab_export = st.tabs(
+# Abas de trabalho completas (incluindo Assistente IA e Minuta Pronta)
+tab_params, tab_ai, tab_resumo, tab_verbas, tab_minuta, tab_export = st.tabs(
     [
         "⚙️ Parâmetros do Cálculo",
-        "📊 Resumo da Liquidação (PJe-Calc)",
-        "📑 Demonstrativo Mensal por Verba",
+        "🤖 Assistente Pericial IA",
+        "📊 Resumo da Liquidação",
+        "📑 Demonstrativo por Verba",
+        "📝 Minuta de Petição Pronta",
         "📥 Baixar PDF Oficial & .PJC",
     ]
 )
@@ -1841,9 +1488,14 @@ with tab_params:
     p["estado"] = c3.text_input("UF", value=p["estado"])
     p["municipio"] = c4.text_input("Município", value=p["municipio"])
 
-    c5, c6 = st.columns(2)
+    c5, c6, c7 = st.columns([2, 2, 1.5])
     p["reclamante"] = c5.text_input("Reclamante", value=p["reclamante"])
     p["reclamado"] = c6.text_input("Reclamado", value=p["reclamado"])
+    p["vara_trabalho"] = c7.text_input("Vara do Trabalho", value=p.get("vara_trabalho", "1ª VARA DO TRABALHO"))
+
+    c_adv1, c_adv2 = st.columns(2)
+    p["advogado_reclamante"] = c_adv1.text_input("Advogado(a) Assinante (para Minuta)", value=p.get("advogado_reclamante", "ADVOGADO(A) DO RECLAMANTE"))
+    p["oab_advogado"] = c_adv2.text_input("Inscrição OAB", value=p.get("oab_advogado", "OAB/RS 00.000"))
 
     d1, d2, d3, d4 = st.columns(4)
     p["admissao"] = d1.date_input("Data de Admissão", value=parse_br_date(p["admissao"]), format="DD/MM/YYYY")
@@ -1869,7 +1521,7 @@ with tab_params:
     p["sabado_dia_util"] = chk3.checkbox("Considerar Sábado como Dia Útil", value=bool(p["sabado_dia_util"]))
 
     st.divider()
-    st.subheader("Verbas Deferidas na Sentença")
+    st.subheader("Verbas Deferidas & Deduções / Abatimentos (Alinhamento com Relato do Advogado)")
     v1, v2, v3, v4 = st.columns(4)
     p["tem_he50"] = v1.checkbox("Horas Extras 50%", value=bool(p["tem_he50"]))
     p["qtd_he50_mensal"] = v1.number_input("Qtd. Média Mensal HE 50%", min_value=0.0, value=float(p["qtd_he50_mensal"]), step=1.0)
@@ -1882,6 +1534,11 @@ with tab_params:
 
     p["tem_noturno"] = v4.checkbox("Adicional Noturno 20%", value=bool(p["tem_noturno"]))
     p["qtd_horas_noturnas_mensal"] = v4.number_input("Horas Noturnas Relógio/Mês", min_value=0.0, value=float(p["qtd_horas_noturnas_mensal"]), step=2.0)
+
+    ex1, ex2, ex3 = st.columns([2, 1.5, 1.5])
+    p["verba_extra_nome"] = ex1.text_input("Parcela Mensal Específica (ex.: Diferença Salarial / Comissões)", value=p.get("verba_extra_nome", "DIFERENÇAS SALARIAIS / PARCELA DEFERIDA"))
+    p["verba_extra_mensal"] = ex2.number_input("Valor Mensal da Parcela Específica (R$)", min_value=0.0, value=float(p.get("verba_extra_mensal", 0.0)), step=50.0)
+    p["valor_pago_abatimento"] = ex3.number_input("Abatimento / Valor Já Pago (TRCT) (R$)", min_value=0.0, value=float(p.get("valor_pago_abatimento", 0.0)), step=100.0)
 
     a1, a2, a3, a4 = st.columns(4)
     adicionais_opts = ["Nenhum", "Insalubridade", "Periculosidade (30%)"]
@@ -1900,6 +1557,34 @@ with tab_params:
         st.session_state["params"] = p
         st.session_state["calc_result"] = run_pjecalc_engine(p, cartao_df)
         st.success("Cálculo atualizado com sucesso!")
+
+with tab_ai:
+    st.subheader("🤖 Assistente Pericial Trabalhista (Conferência & Ajustes por Comando)")
+    st.caption(
+        "Converse com a IA para conferir por que algum valor divergiu do relato do advogado, tirar dúvidas sobre "
+        "critérios do PJe-Calc ou comandar alterações diretas (ex.: *\"ajustar he 50 para 10\"*, *\"zerar verbas rescisórias\"*, *\"abater R$ 2.100,00\"*)."
+    )
+
+    for msg in st.session_state["ai_chat_history"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_q = st.chat_input("Digite sua dúvida ou comando de ajuste para o cálculo...")
+    if user_q:
+        st.session_state["ai_chat_history"].append({"role": "user", "content": user_q})
+        ai_ans, updated_p, did_change = ask_pericial_ai(
+            user_q,
+            st.session_state["params"],
+            st.session_state["calc_result"],
+            st.session_state["sentence_text"],
+            st.session_state["lawyer_notes"],
+            api_key=ai_api_key,
+        )
+        if did_change:
+            st.session_state["params"] = updated_p
+            st.session_state["calc_result"] = run_pjecalc_engine(updated_p, cartao_df)
+        st.session_state["ai_chat_history"].append({"role": "assistant", "content": ai_ans})
+        st.rerun()
 
 res = st.session_state["calc_result"]
 resumo_data = res["resumo"]
@@ -1988,6 +1673,30 @@ with tab_verbas:
                 ]
             )
             st.dataframe(df_oc, use_container_width=True, hide_index=True)
+
+with tab_minuta:
+    st.subheader("📝 Minuta de Petição de Apresentação de Cálculos (Art. 879, § 1º-B, CLT)")
+    st.caption("Texto gerado automaticamente com base na liquidação atual. Você pode revisar/editar livremente antes de baixar.")
+    minuta_gerada = build_minuta_peticao(st.session_state["params"], res, st.session_state["lawyer_notes"])
+    minuta_editada = st.text_area("Corpo da Petição (editável):", value=minuta_gerada, height=460)
+
+    proc_clean_m = re.sub(r"[^0-9A-Za-z\-]", "_", str(res["meta"]["processo"]))
+    mp1, mp2 = st.columns(2)
+    mp1.download_button(
+        label="📄 Baixar Minuta de Petição em PDF",
+        data=build_minuta_pdf(minuta_editada, str(res["meta"]["processo"])),
+        file_name=f"Minuta_Peticao_Calculos_{proc_clean_m}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+        type="primary",
+    )
+    mp2.download_button(
+        label="📃 Baixar Minuta de Petição em Texto (.TXT)",
+        data=minuta_editada.encode("utf-8"),
+        file_name=f"Minuta_Peticao_Calculos_{proc_clean_m}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
 with tab_export:
     st.subheader("Exportação Oficial — Planilha de Cálculo em PDF & Arquivo .PJC")
