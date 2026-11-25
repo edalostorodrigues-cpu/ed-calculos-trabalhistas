@@ -729,6 +729,9 @@ def _get_gemini_client():
     return genai.Client(api_key=api_key)
 
 
+GEMINI_MODEL_NAME = "gemini-3.8-flash"
+
+
 def analyze_case_with_gemini(narrative: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
     client = _get_gemini_client()
     prompt = (
@@ -755,7 +758,7 @@ def analyze_case_with_gemini(narrative: str, files: List[Dict[str, Any]]) -> Dic
         contents.append(types.Part.from_bytes(data=f["bytes"], mime_type=f["mime"]))
 
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
     )
@@ -788,7 +791,7 @@ def analyze_sentence_with_gemini(notes: str, files: List[Dict[str, Any]]) -> Dic
         contents.append(types.Part.from_bytes(data=f["bytes"], mime_type=f["mime"]))
 
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
     )
@@ -844,7 +847,7 @@ def chat_with_case_strategist(
     conv_lines.append(f"ADVOGADO: {user_message}")
 
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_NAME,
         contents="\n".join(conv_lines),
         config=types.GenerateContentConfig(temperature=0.3),
     )
