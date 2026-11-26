@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import xml.etree.ElementTree as ET
-# ... existing code ...
+
     # Inicialização do estado da sessão
     if "params" not in st.session_state:
         st.session_state["params"] = _default_empty_params()
@@ -514,8 +514,6 @@ def _execute_full_pipeline(
 
 
 # ==============================================================================
-# INTERFACE ESTILO CALCMACHINE (4 PASSOS: SENTENÇA -> IA -> .PJC + JSON -> HISTÓRICO)
-# ==============================================================================
 # INTERFACE ESTILO SUITE CALCMACHINE (CONFIABILIDADE DETERMINÍSTICA + .PJC + JSON)
 # ==============================================================================
 st.set_page_config(
@@ -524,6 +522,26 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Inicialização segura do estado da sessão no nível raiz (sem indentação indevida)
+if "params" not in st.session_state:
+    st.session_state["params"] = _default_empty_params()
+if "calc_result" not in st.session_state:
+    st.session_state["calc_result"] = None
+if "audit_report" not in st.session_state:
+    st.session_state["audit_report"] = None
+if "has_analyzed" not in st.session_state:
+    st.session_state["has_analyzed"] = False
+if "sentence_pasted_text" not in st.session_state:
+    st.session_state["sentence_pasted_text"] = ""
+if "lawyer_notes" not in st.session_state:
+    st.session_state["lawyer_notes"] = ""
+if "data_base_liq" not in st.session_state:
+    st.session_state["data_base_liq"] = date.today()
+if "calc_json_text" not in st.session_state:
+    st.session_state["calc_json_text"] = ""
+if "current_calc_uid" not in st.session_state:
+    st.session_state["current_calc_uid"] = ""
 
 st.markdown(
     """
