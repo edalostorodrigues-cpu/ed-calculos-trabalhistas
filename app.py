@@ -355,34 +355,6 @@ def list_calculation_history(limit: int = 30) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# MODELO DE PARÂMETROS DO CÁLCULO TRABALHISTA (ESTRUTURA PJe-Calc)
-# ==============================================================================
-
-@dataclass
-class VerbaConfig:
-    nome: str
-    tipo: str  # DIFERENCA_SALARIAL, HORAS_EXTRAS, ADICIONAL_NOTURNO, INSALUBRIDADE, PERICULOSIDADE, AVISO_PREVIO, DECIMO_TERCEIRO, FERIAS_TERCO, MULTA_477, VERBA_FIXA_MENSAL
-    aliquota_ou_percentual: float = 0.0  # Ex: 0.50 para HE 50%, 0.20 para insalubridade 20%, 0.30 para periculosidade
-    quantidade_mensal: float = 0.0  # Ex: horas extras mensais ou valor fixo mensal
-    divisor: float = 220.0
-    inicio: str = ""
-    fim: str = ""
-    base_calculo: str = "SALARIO_BASE"  # SALARIO_BASE, SALARIO_MINIMO, DIFERENCA_SALARIAL
-    incide_fgts: bool = True
-    incide_inss: bool = True
-    incide_irrf: bool = True
-    gera_reflexos_13_ferias_aviso: bool = True
-    ativo: bool = True
-
-
-@dataclass
-class SalarioCompetencia:
-    competencia: str  # YYYY-MM
-    salario_pago: float
-    salario_devido: float
-
-
-# ==============================================================================
 # BUSCA DE ÍNDICES ECONÔMICOS OFICIAIS (BANCO CENTRAL DO BRASIL - SGS)
 # ==============================================================================
 
@@ -419,7 +391,6 @@ def fetch_bcb_series_monthly(series_code: int, start_date: str = "01/01/2015") -
 
 
 def get_fallback_rates() -> Tuple[Dict[str, Decimal], Dict[str, Decimal], Dict[str, Decimal]]:
-    """Tabela de contingência caso o servidor esteja offline sem acesso ao BACEN."""
     ipcae: Dict[str, Decimal] = {}
     selic: Dict[str, Decimal] = {}
     ipca: Dict[str, Decimal] = {}
@@ -438,12 +409,6 @@ def build_adc58_correction_tables(
     data_liquidacao: date,
     criterio_correcao: str = "ADC58_LEI_14905",
 ) -> Tuple[Dict[str, Decimal], Dict[str, Decimal], str, Optional[str]]:
-    """
-    Constrói os fatores acumulados por competência com 9 casas decimais:
-    - Fase Pré-Judicial: IPCA-E (BCB 10764) + Juros TR (BCB 226)
-    - Fase Judicial até 29/08/2024: SELIC (BCB 4390)
-    - A partir de 30/08/2024 (Lei 14.905/2024): IPCA (BCB 433) + Taxa Legal (SELIC - IPCA, mín 0%)
-    """
     ipcae_map = fetch_bcb_series_monthly(10764, "01/01/2015")
     selic_map = fetch_bcb_series_monthly(4390, "01/01/2015")
     ipca_map = fetch_bcb_series_monthly(433, "01/01/2015")
@@ -512,7 +477,6 @@ def build_adc58_correction_tables(
 # ==============================================================================
 
 def _calc_inss_segurado_competencia(base_val: Decimal, ano: int) -> Decimal:
-    """Calcula a contribuição previdenciária progressiva vigente na competência (EC 103/2019)."""
     if base_val <= 0:
         return Decimal("0.00")
     min_yr = min(INSS_PROGRESSIVE_TABLES.keys())
@@ -534,7 +498,6 @@ def _calc_inss_segurado_competencia(base_val: Decimal, ano: int) -> Decimal:
 
 
 def _calc_irrf_rra(base_liquida: Decimal, meses_rra: int, ano_liquidacao: int = 2026) -> Decimal:
-    """Calcula o IRRF sobre Rendimentos Recebidos Acumuladamente (Art. 12-A Lei 7.713/88) com tabela vigente na liquidação."""
     if base_liquida <= 0:
         return Decimal("0.00")
     nm = Decimal(str(max(1, meses_rra)))
@@ -578,8 +541,8 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     hist_map: Dict[str, Tuple[Decimal, Decimal]] = {}
     for h in hist_raw:
         comp = str(h.get("competencia", ""))[:7]
-        sp = Decimal(str(h.get("salario_pago", 0)))
-        sd = Decimal(str(h.get("salario_devido", sp)))
+        sp = Decimal(str(h.get("salario_pago", 0) or 0))
+        sd = Decimal(str(h.get("salario_devido", sp) or sp))
         if comp:
             hist_map[comp] = (sp, sd)
 
@@ -587,7 +550,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     if not comps_contrato:
         comps_contrato = [f"{inicio_calculo.year:04d}-{inicio_calculo.month:02d}"]
 
-    default_sal_pago = Decimal(str(params.get("ultima_remuneracao") or params.get("maior_remuneracao") or 2500.0))
+    default_sal_pago = Decimal(str(params.get("ultima_remuneracao") or params.get("maior_remuneracao") or 0))
     default_sal_devido = Decimal(str(params.get("maior_remuneracao") or default_sal_pago))
 
     historico_consolidado: List[Dict[str, Any]] = []
@@ -694,9 +657,9 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
         if not v.get("ativo", True):
             continue
         v_nome = str(v.get("nome", "Verba Trabalhista"))
-        v_tipo = str(v.get("tipo", "HORAS_EXTRAS"))
-        v_aliq = Decimal(str(v.get("aliquota_ou_percentual", 0)))
-        v_qtd = Decimal(str(v.get("quantidade_mensal", 0)))
+        v_tipo = str(v.get("tipo", "HORAS_EXTRAS")).upper().strip()
+        v_aliq = Decimal(str(v.get("aliquota_ou_percentual", 0) or 0))
+        v_qtd = Decimal(str(v.get("quantidade_mensal", 0) or 0))
         v_div = Decimal(str(v.get("divisor") or 220))
         v_ini = parse_date_br(v.get("inicio")) or inicio_calculo
         v_fim = parse_date_br(v.get("fim")) or fim_calculo
@@ -755,6 +718,11 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
                     dev = sal_base
                 else:
                     continue
+            elif v_tipo == "VERBA_UNICA_RESCISAO":
+                if ym == comps_contrato[-1]:
+                    dev = v_qtd if v_qtd > 0 else sal_base
+                else:
+                    continue
             else:
                 dev = v_qtd if v_qtd > 0 else (sal_base * v_aliq)
 
@@ -772,10 +740,9 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
         if not ocorrencias_v:
             continue
 
-        is_remun = v_tipo not in ("MULTA_477", "AVISO_PREVIO", "FERIAS_TERCO")
+        is_remun = v_tipo not in ("MULTA_477", "AVISO_PREVIO", "FERIAS_TERCO", "VERBA_UNICA_RESCISAO")
         _registrar_verba(v_nome, ocorrencias_v, v_fgts, v_inss, v_irrf, is_remuneratorio=is_remun)
 
-        # Reflexos Automáticos (13º Salário, Férias + 1/3, Aviso Prévio) conforme padrão PJe-Calc
         if v_reflexos and v_tipo in ("DIFERENCA_SALARIAL", "HORAS_EXTRAS", "ADICIONAL_NOTURNO", "INSALUBRIDADE", "PERICULOSIDADE"):
             media_mensal = sum(soma_mensal_para_reflexos) / Decimal(str(len(soma_mensal_para_reflexos)))
             ultima_comp = ocorrencias_v[-1]["competencia"]
@@ -832,7 +799,7 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     total_cs_patronal_corrigido = Decimal("0.00")
     cs_segurado_corrigido_por_comp: Dict[str, Decimal] = {}
 
-    aliquota_patronal_total = Decimal(str(params.get("aliquota_inss_patronal", 0.225)))  # 20% + RAT/SAT + Terceiros
+    aliquota_patronal_total = Decimal(str(params.get("aliquota_inss_patronal", 0.225)))
 
     for ym in comps_contrato:
         base_inss = money_round(inss_base_por_comp.get(ym, Decimal("0.00")))
@@ -951,10 +918,10 @@ def run_pjecalc_engine(params: Dict[str, Any]) -> Dict[str, Any]:
     total_descontos_reclamante = money_round(total_cs_segurado_corrigido + irrf_reclamante)
     liquido_reclamante = money_round(max(Decimal("0.00"), bruto_devido_reclamante - total_descontos_reclamante))
 
-    hon_pct = Decimal(str(params.get("honorarios_sucumbencia_pct", 15.0))) / Decimal("100")
+    hon_pct = Decimal(str(params.get("honorarios_sucumbencia_pct", 15.0) or 0)) / Decimal("100")
     honorarios_adv = money_round(bruto_devido_reclamante * hon_pct)
 
-    custas_pct = Decimal(str(params.get("custas_pct", 2.0))) / Decimal("100")
+    custas_pct = Decimal(str(params.get("custas_pct", 2.0) or 0)) / Decimal("100")
     custas_judiciais = money_round(bruto_devido_reclamante * custas_pct) if params.get("apurar_custas", True) else Decimal("0.00")
 
     total_devido_reclamado = money_round(
@@ -1052,7 +1019,7 @@ def build_pjc_xml_bytes(params: Dict[str, Any], result: Dict[str, Any]) -> bytes
     <DataAjuizamento>{params.get("data_ajuizamento", "")}</DataAjuizamento>
     <DataLiquidacao>{params.get("data_liquidacao", "")}</DataLiquidacao>
     <Estado>{html.escape(str(params.get("estado", "RS")))}</Estado>
-    <Municipio>{html.escape(str(params.get("municipio", "Porto Alegre")))}</Municipio>
+    <Municipio>{html.escape(str(params.get("municipio", "Gravataí")))}</Municipio>
   </IdentificacaoProcesso>
   <Partes>
     <Reclamante nome="{rec}" cpf="{rec_cpf}" />
@@ -1238,7 +1205,6 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
     # ==========================================================================
     story.extend(make_process_header("RESUMO DO CÁLCULO"))
 
-    # Quadro 1: Descrição do Bruto Devido ao Reclamante
     q1 = [
         [Paragraph("<b>Descrição do Bruto Devido ao Reclamante</b>", st_cell_b), Paragraph("<b>Valor Corrigido</b>", st_cell_rb), Paragraph("<b>Juros</b>", st_cell_rb), Paragraph("<b>Total</b>", st_cell_rb)],
         [Paragraph("Verbas", st_cell), Paragraph(fmt_brl(resumo["verbas_corrigido"]), st_cell_r), Paragraph(fmt_brl(resumo["juros_verbas"]), st_cell_r), Paragraph(fmt_brl(resumo["verbas_corrigido"] + resumo["juros_verbas"]), st_cell_r)],
@@ -1250,7 +1216,6 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
     story.append(t1)
     story.append(Spacer(1, 3.5 * mm))
 
-    # Quadro 2: Descrição de Créditos e Descontos do Reclamante
     q2 = [
         [Paragraph("<b>Descrição de Créditos e Descontos do Reclamante</b>", st_cell_b), Paragraph("<b>Valor</b>", st_cell_rb)],
         [Paragraph("Bruto Devido ao Reclamante", st_cell), Paragraph(fmt_brl(resumo["bruto_devido_reclamante"]), st_cell_r)],
@@ -1263,7 +1228,6 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
     story.append(t2)
     story.append(Spacer(1, 3.5 * mm))
 
-    # Quadro 3: Percentual de Parcelas Remuneratórias e Tributáveis
     q3 = [
         [Paragraph("<b>Percentual de Parcelas Remuneratórias e Tributáveis</b>", st_cell_b), Paragraph("<b>Percentual</b>", st_cell_rb)],
         [Paragraph("Percentual de Parcelas Remuneratórias (Art. 832, § 3º, CLT)", st_cell), Paragraph(f"{fmt_brl(resumo['pct_remuneratorio'])}%", st_cell_r)],
@@ -1274,7 +1238,6 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
     story.append(t3)
     story.append(Spacer(1, 3.5 * mm))
 
-    # Quadro 4: Descrição de Débitos do Reclamado por Credor
     q4 = [
         [Paragraph("<b>Descrição de Débitos do Reclamado por Credor</b>", st_cell_b), Paragraph("<b>Valor Total</b>", st_cell_rb)],
         [Paragraph("Líquido Devido ao Reclamante", st_cell), Paragraph(fmt_brl(resumo["liquido_reclamante"]), st_cell_r)],
@@ -1314,7 +1277,7 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
     story.extend(make_process_header("DADOS DO CÁLCULO E HISTÓRICO SALARIAL"))
 
     dados_calc = [
-        [Paragraph("<b>Estado:</b>", st_cell), Paragraph(html.escape(str(params.get("estado", "RS"))), st_cell), Paragraph("<b>Município:</b>", st_cell), Paragraph(html.escape(str(params.get("municipio", "Porto Alegre"))), st_cell)],
+        [Paragraph("<b>Estado:</b>", st_cell), Paragraph(html.escape(str(params.get("estado", "RS"))), st_cell), Paragraph("<b>Município:</b>", st_cell), Paragraph(html.escape(str(params.get("municipio", "Gravataí"))), st_cell)],
         [Paragraph("<b>Admissão:</b>", st_cell), Paragraph(fmt_date_br(params.get("admissao")), st_cell), Paragraph("<b>Demissão:</b>", st_cell), Paragraph(fmt_date_br(params.get("demissao")), st_cell)],
         [Paragraph("<b>Maior Remuneração:</b>", st_cell), Paragraph(fmt_brl_rs(params.get("maior_remuneracao")), st_cell), Paragraph("<b>Última Remuneração:</b>", st_cell), Paragraph(fmt_brl_rs(params.get("ultima_remuneracao")), st_cell)],
         [Paragraph("<b>Prazo Aviso Prévio:</b>", st_cell), Paragraph(f"{meta['prazo_aviso_dias']} dias", st_cell), Paragraph("<b>Carga Horária:</b>", st_cell), Paragraph(f"{params.get('carga_horaria', 220)}h", st_cell)],
@@ -1394,7 +1357,6 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
         story.append(tv)
         story.append(Spacer(1, 3 * mm))
 
-    # Demonstrativo de Juros sobre Verbas
     if result["juros_ocorrencias"]:
         story.append(Paragraph("DEMONSTRATIVO DE JUROS SOBRE VERBAS (DEDUÇÃO PRÉVIA DA CONTRIBUIÇÃO SOCIAL)", st_sub))
         j_rows = [[
@@ -1509,7 +1471,7 @@ def build_pjecalc_official_pdf_bytes(params: Dict[str, Any], result: Dict[str, A
 
 
 # ==============================================================================
-# EXTRATOR INTELIGENTE DE AUTOS E DECISÕES (PDF / GEMINI)
+# EXTRATOR INTELIGENTE DE AUTOS E DECISÕES (PDF MULTIMODAL + REGEX + GEMINI)
 # ==============================================================================
 
 def extract_text_from_uploaded_files(uploaded_files: List[Any]) -> str:
@@ -1536,24 +1498,76 @@ def extract_text_from_uploaded_files(uploaded_files: List[Any]) -> str:
     return "\n\n".join(chunks)
 
 
-def get_default_sample_params() -> Dict[str, Any]:
+def deterministic_regex_extract(raw_text: str, cidade_default: str = "Gravataí") -> Dict[str, Any]:
+    """Extração determinística inicial diretamente do texto do PDF antes mesmo da IA."""
+    cnj_m = re.search(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}", raw_text)
+    cpf_m = re.search(r"\d{3}\.\d{3}\.\d{3}-\d{2}", raw_text)
+    cnpj_m = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw_text)
+    vara_m = re.search(r"(\d+ª\s+Vara\s+do\s+Trabalho\s+de\s+[^\n\r,;]+)", raw_text, re.IGNORECASE)
+
+    rec_m = re.search(r"(?:RECLAMANTE|AUTOR[A]?)\s*[:\-]\s*([A-ZÀ-Ú\s]{5,80})", raw_text)
+    rdo_m = re.search(r"(?:RECLAMAD[OA]|R[ÉE]U)\s*[:\-]\s*([A-ZÀ-Ú0-9\s\.\-&]{5,90})", raw_text)
+
+    datas_br = re.findall(r"\b(\d{2}/\d{2}/\d{4})\b", raw_text)
+    datas_iso = []
+    for d_str in datas_br:
+        parsed = parse_date_br(d_str)
+        if parsed and date(1995, 1, 1) <= parsed <= date(2030, 12, 31):
+            datas_iso.append(parsed)
+    datas_iso = sorted(set(datas_iso))
+
+    adm_est = datas_iso[0].isoformat() if len(datas_iso) >= 1 else "2022-01-10"
+    dem_est = datas_iso[-2].isoformat() if len(datas_iso) >= 3 else (datas_iso[-1].isoformat() if datas_iso else "2024-06-15")
+    ajuiz_est = datas_iso[-1].isoformat() if datas_iso else date.today().isoformat()
+
     return {
-        "processo_cnj": "0020458-72.2023.5.04.0231",
+        "processo_cnj": cnj_m.group(0) if cnj_m else "0000000-00.2024.5.04.0000",
         "numero_calculo": "001/2026",
-        "vara_trabalho": "1ª Vara do Trabalho de Gravataí/RS",
+        "vara_trabalho": vara_m.group(1).strip() if vara_m else f"Vara do Trabalho de {cidade_default}",
         "estado": "RS",
-        "municipio": "Gravataí",
-        "cidade_assinatura": "Gravataí",
-        "reclamante": "CARLOS EDUARDO MENDES DA SILVA",
-        "cpf_reclamante": "018.492.730-44",
-        "reclamado": "METALÚRGICA SULBRASIL INDÚSTRIA E COMÉRCIO LTDA",
-        "cnpj_reclamado": "14.892.310/0001-65",
-        "admissao": "2021-03-01",
-        "demissao": "2024-02-15",
-        "data_ajuizamento": "2024-04-10",
+        "municipio": cidade_default,
+        "cidade_assinatura": cidade_default,
+        "reclamante": rec_m.group(1).strip().splitlines()[0] if rec_m else "RECLAMANTE EXTRAÍDO DOS AUTOS (CONFERIR NOME)",
+        "cpf_reclamante": cpf_m.group(0) if cpf_m else "",
+        "reclamado": rdo_m.group(1).strip().splitlines()[0] if rdo_m else "RECLAMADO EXTRAÍDO DOS AUTOS (CONFERIR RAZÃO SOCIAL)",
+        "cnpj_reclamado": cnpj_m.group(0) if cnpj_m else "",
+        "admissao": adm_est,
+        "demissao": dem_est,
+        "data_ajuizamento": ajuiz_est,
         "data_liquidacao": date.today().isoformat(),
-        "maior_remuneracao": 3450.00,
-        "ultima_remuneracao": 3450.00,
+        "maior_remuneracao": 2500.00,
+        "ultima_remuneracao": 2500.00,
+        "carga_horaria": 220,
+        "aplicar_prescricao": True,
+        "projetar_aviso": True,
+        "aplicar_multa_fgts_40": True,
+        "apurar_irrf": True,
+        "apurar_custas": True,
+        "honorarios_sucumbencia_pct": 15.0,
+        "custas_pct": 2.0,
+        "criterio_correcao": "ADC58_LEI_14905",
+        "verbas": [],
+    }
+
+
+def get_initial_empty_params(cidade_default: str = "Gravataí") -> Dict[str, Any]:
+    return {
+        "processo_cnj": "",
+        "numero_calculo": "001/2026",
+        "vara_trabalho": "",
+        "estado": "RS",
+        "municipio": cidade_default,
+        "cidade_assinatura": cidade_default,
+        "reclamante": "",
+        "cpf_reclamante": "",
+        "reclamado": "",
+        "cnpj_reclamado": "",
+        "admissao": "2022-01-10",
+        "demissao": "2024-06-15",
+        "data_ajuizamento": "2024-08-20",
+        "data_liquidacao": date.today().isoformat(),
+        "maior_remuneracao": 0.0,
+        "ultima_remuneracao": 0.0,
         "carga_horaria": 220,
         "aplicar_prescricao": True,
         "projetar_aviso": True,
@@ -1565,71 +1579,79 @@ def get_default_sample_params() -> Dict[str, Any]:
         "criterio_correcao": "ADC58_LEI_14905",
         "advogado_nome": "Dr. Advogado Responsável",
         "advogado_oab": "OAB/RS 00.000",
-        "historico_salarial": [
-            {"competencia": f"{y:04d}-{m:02d}", "salario_pago": 2950.00 if y < 2023 else 3450.00, "salario_devido": 2950.00 if y < 2023 else 3450.00}
-            for y, m in month_range(date(2021, 3, 1), date(2024, 3, 31))
-        ],
-        "verbas": [
-            {
-                "nome": "HORAS EXTRAS 50%",
-                "tipo": "HORAS_EXTRAS",
-                "aliquota_ou_percentual": 0.50,
-                "quantidade_mensal": 28.0,
-                "divisor": 220.0,
-                "inicio": "2021-03-01",
-                "fim": "2024-02-15",
-                "base_calculo": "SALARIO_BASE",
-                "incide_fgts": True,
-                "incide_inss": True,
-                "incide_irrf": True,
-                "gera_reflexos_13_ferias_aviso": True,
-                "ativo": True,
-            },
-            {
-                "nome": "ADICIONAL DE INSALUBRIDADE (20%)",
-                "tipo": "INSALUBRIDADE",
-                "aliquota_ou_percentual": 0.20,
-                "quantidade_mensal": 1.0,
-                "divisor": 220.0,
-                "inicio": "2021-03-01",
-                "fim": "2024-02-15",
-                "base_calculo": "SALARIO_MINIMO",
-                "incide_fgts": True,
-                "incide_inss": True,
-                "incide_irrf": True,
-                "gera_reflexos_13_ferias_aviso": True,
-                "ativo": True,
-            },
-        ],
+        "parecer_advogado": "",
+        "historico_salarial": [],
+        "verbas": [],
     }
 
 
-def analyze_case_with_gemini(raw_text: str, api_key: str, cidade_default: str = "Porto Alegre") -> Dict[str, Any]:
-    """Lê os autos com Gemini, identifica o vínculo correto e estrutura todos os parâmetros PJe-Calc."""
-    base = get_default_sample_params()
-    base["cidade_assinatura"] = cidade_default
-    base["municipio"] = cidade_default
+def analyze_case_with_gemini(
+    uploaded_files: List[Any],
+    raw_text: str,
+    api_key: str,
+    parecer_advogado: str = "",
+    cidade_default: str = "Gravataí",
+) -> Tuple[Dict[str, Any], Optional[str], str]:
+    """
+    Lê os PDFs anexados (via multimodal nativo PDF + texto extraído) + Parecer do Advogado.
+    Nunca substitui por dados fictícios caso falhe; retorna diagnóstico claro.
+    """
+    base = deterministic_regex_extract(raw_text, cidade_default)
+    base["parecer_advogado"] = parecer_advogado
 
-    if not api_key or not api_key.strip() or genai is None:
-        return base
+    if not api_key or not api_key.strip():
+        return (
+            base,
+            "⚠️ Chave da API Gemini não informada na barra lateral. Foi feita apenas a pré-extração básica por texto (CNJ/CPF/CNPJ/Datas). Informe sua chave Gemini para a IA ler todas as verbas e salários do PDF.",
+            "Pré-extração básica (sem chave Gemini)",
+        )
+
+    if genai is None or types is None:
+        return (
+            base,
+            "⚠️ Biblioteca `google-genai` não está instalada no ambiente.",
+            "Erro de dependência",
+        )
+
+    bloco_parecer = (
+        f"\nPARECER E INSTRUÇÕES OBRIGATÓRIAS DO ADVOGADO (SIGA RIGOROSAMENTE):\n{parecer_advogado.strip()}\n"
+        if parecer_advogado and parecer_advogado.strip()
+        else "\nPARECER DO ADVOGADO: Nenhuma observação adicional informada; siga estritamente o título judicial dos autos.\n"
+    )
 
     prompt = f"""
-Você é um Perito Contador Trabalhista especialista em PJe-Calc Cidadão.
-Analise os documentos processuais abaixo (sentença, acórdão, petição inicial, CTPS, contracheques) e extraia EXCLUSIVAMENTE um JSON válido com a estrutura exata abaixo.
-Regras obrigatórias:
-1. Se houver mais de um registro de emprego na CTPS, identifique autonomamente o vínculo contratual que corresponde ao Reclamado desta ação trabalhista.
-2. Extraia exatamente o percentual de honorários sucumbenciais e custas fixados pelo juiz na sentença/acórdão.
-3. Liste todas as verbas deferidas e seus períodos exatos.
+Você é um Perito Contador Trabalhista sênior especialista no sistema oficial PJe-Calc Cidadão.
+Analise integralmente os arquivos anexados do processo (Sentença, Acórdão, Petição Inicial, CTPS, Contracheques, Cartões de Ponto) e o parecer do advogado abaixo.
 
-Estrutura JSON obrigatória:
+{bloco_parecer}
+
+REGRAS OBRIGATÓRIAS DE EXTRAÇÃO:
+1. Extraia os dados REAIS deste processo (não invente nomes, datas ou valores).
+2. Se houver múltiplos contratos na CTPS, identifique autonomamente o contrato referente ao Reclamado desta ação trabalhista.
+3. Extraia exatamente o percentual de honorários sucumbenciais e custas fixados na sentença/acórdão.
+4. Para cada verba deferida, mapeie o `tipo` usando EXCLUSIVAMENTE um dos códigos válidos:
+   - `DIFERENCA_SALARIAL` (quando há salário devido maior que o pago)
+   - `HORAS_EXTRAS` (use `aliquota_ou_percentual`: 0.50 para 50%, 1.00 para 100%, `quantidade_mensal`: média de horas/mês, `divisor`: 220 ou 200 ou 180)
+   - `ADICIONAL_NOTURNO` (use `aliquota_ou_percentual`: 0.20, `quantidade_mensal`: horas noturnas/mês, `divisor`: 220)
+   - `INSALUBRIDADE` (use `aliquota_ou_percentual`: 0.10, 0.20 ou 0.40)
+   - `PERICULOSIDADE` (use `aliquota_ou_percentual`: 0.30)
+   - `AVISO_PREVIO`
+   - `DECIMO_TERCEIRO`
+   - `FERIAS_TERCO`
+   - `MULTA_477`
+   - `VERBA_FIXA_MENSAL` (use `quantidade_mensal` como valor mensal fixo em R$)
+   - `VERBA_UNICA_RESCISAO` (use `quantidade_mensal` como valor único em R$ na rescisão)
+5. Se houver evolução salarial mês a mês nos contracheques/autos, preencha `historico_salarial` com `competencia` ("YYYY-MM"), `salario_pago` e `salario_devido`. Caso contrário, informe `maior_remuneracao` e `ultima_remuneracao` reais do contrato.
+
+Retorne EXCLUSIVAMENTE um JSON válido neste formato exato:
 {{
   "processo_cnj": "0000000-00.0000.5.00.0000",
   "vara_trabalho": "Xª Vara do Trabalho de ...",
   "estado": "RS",
   "municipio": "{cidade_default}",
-  "reclamante": "NOME COMPLETO",
+  "reclamante": "NOME COMPLETO DO RECLAMANTE",
   "cpf_reclamante": "000.000.000-00",
-  "reclamado": "RAZAO SOCIAL RECLAMADO",
+  "reclamado": "RAZAO SOCIAL COMPLETA DO RECLAMADO",
   "cnpj_reclamado": "00.000.000/0001-00",
   "admissao": "YYYY-MM-DD",
   "demissao": "YYYY-MM-DD",
@@ -1640,11 +1662,17 @@ Estrutura JSON obrigatória:
   "aplicar_prescricao": true,
   "projetar_aviso": true,
   "aplicar_multa_fgts_40": true,
+  "apurar_irrf": true,
+  "apurar_custas": true,
   "honorarios_sucumbencia_pct": 15.0,
   "custas_pct": 2.0,
+  "resumo_analise_ia": "Breve explicação objetiva do que foi identificado na sentença/autos e como o parecer do advogado foi aplicado.",
+  "historico_salarial": [
+    {{"competencia": "YYYY-MM", "salario_pago": 0.0, "salario_devido": 0.0}}
+  ],
   "verbas": [
     {{
-      "nome": "NOME DA VERBA",
+      "nome": "NOME DA VERBA DEFERIDA",
       "tipo": "HORAS_EXTRAS",
       "aliquota_ou_percentual": 0.5,
       "quantidade_mensal": 20.0,
@@ -1659,39 +1687,71 @@ Estrutura JSON obrigatória:
     }}
   ]
 }}
-
-TEXTO DOS AUTOS:
-{raw_text[:45000]}
 """
+
+    contents_payload: List[Any] = [prompt]
+
+    # Envia os PDFs diretamente de forma multimodal para ler tanto texto quanto páginas digitalizadas/CTPS
+    total_pdf_bytes = 0
+    for uf in uploaded_files:
+        raw_b = uf.getvalue()
+        if uf.name.lower().endswith(".pdf") and (total_pdf_bytes + len(raw_b)) <= 18 * 1024 * 1024:
+            contents_payload.append(
+                types.Part.from_bytes(data=raw_b, mime_type="application/pdf")
+            )
+            total_pdf_bytes += len(raw_b)
+
+    if raw_text and raw_text.strip():
+        contents_payload.append(f"TEXTO EXTRAÍDO DOS AUTOS:\n{raw_text[:80000]}")
+
     try:
         client = genai.Client(api_key=api_key.strip())
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=contents_payload,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
             ),
         )
-        parsed = json.loads(response.text)
-        if isinstance(parsed, dict):
-            base.update({k: v for k, v in parsed.items() if v is not None})
-            adm = parse_date_br(base.get("admissao")) or date(2021, 3, 1)
-            dem = parse_date_br(base.get("demissao")) or date(2024, 2, 15)
-            sal = float(base.get("ultima_remuneracao") or base.get("maior_remuneracao") or 2500.0)
+        raw_resp = (response.text or "").strip()
+        if raw_resp.startswith("```"):
+            raw_resp = re.sub(r"^```(?:json)?\s*", "", raw_resp)
+            raw_resp = re.sub(r"\s*```$", "", raw_resp)
+
+        parsed = json.loads(raw_resp)
+        if not isinstance(parsed, dict):
+            return base, "⚠️ A resposta da IA não retornou um objeto estruturado válido.", "Falha de formato"
+
+        for k, v in parsed.items():
+            if v is not None and v != "":
+                base[k] = v
+
+        adm = parse_date_br(base.get("admissao")) or date(2022, 1, 10)
+        dem = parse_date_br(base.get("demissao")) or date(2024, 6, 15)
+        sal_p = float(base.get("ultima_remuneracao") or base.get("maior_remuneracao") or 2500.0)
+        sal_d = float(base.get("maior_remuneracao") or sal_p)
+
+        if not base.get("historico_salarial"):
             base["historico_salarial"] = [
-                {"competencia": f"{y:04d}-{m:02d}", "salario_pago": sal, "salario_devido": sal}
+                {"competencia": f"{y:04d}-{m:02d}", "salario_pago": sal_p, "salario_devido": sal_d}
                 for y, m in month_range(adm, dem)
             ]
-    except Exception:
-        pass
 
-    return base
+        resumo_ia = str(parsed.get("resumo_analise_ia", "Autos lidos e parametrizados conforme decisão judicial."))
+        return base, None, resumo_ia
+
+    except Exception as exc:
+        return (
+            base,
+            f"⚠️ Erro ao consultar a IA Gemini: {exc}. Verifique se sua chave API está ativa e tente novamente.",
+            "Erro na chamada da IA",
+        )
 
 
 def build_petition_minuta(params: Dict[str, Any], result: Dict[str, Any]) -> str:
     resumo = result["resumo"]
-    cidade = params.get("cidade_assinatura") or params.get("municipio") or "Porto Alegre"
+    cidade = params.get("cidade_assinatura") or params.get("municipio") or "Gravataí"
     hoje_extenso = datetime.now().strftime("%d/%m/%Y")
     return f"""EXCELENTÍSSIMO(A) SENHOR(A) DOUTOR(A) JUIZ(A) DA {str(params.get('vara_trabalho', 'VARA DO TRABALHO')).upper()}
 
@@ -1776,13 +1836,13 @@ def _recompute_from_current_params(params: Dict[str, Any], save_to_history: bool
     st.session_state["pjc_bytes"] = build_pjc_xml_bytes(params, res)
     st.session_state["pdf_bytes"] = build_pjecalc_official_pdf_bytes(params, res)
     st.session_state["minuta_txt"] = build_petition_minuta(params, res)
-    if save_to_history:
+    if save_to_history and params.get("processo_cnj"):
         save_calculation_history(params, res)
     return res
 
 
 if "params" not in st.session_state:
-    _recompute_from_current_params(get_default_sample_params(), save_to_history=False)
+    _recompute_from_current_params(get_initial_empty_params("Gravataí"), save_to_history=False)
 
 # ==============================================================================
 # BARRA LATERAL (CONFIGURAÇÕES, SINCRONIZAÇÃO E IDENTIFICAÇÃO DO ESCRITÓRIO)
@@ -1799,10 +1859,10 @@ with st.sidebar:
 
     st.divider()
     api_key_input = st.text_input(
-        "Chave API Gemini (Leitura de Autos)",
+        "Chave API Gemini (Obrigatória para IA)",
         type="password",
         value=os.environ.get("GEMINI_API_KEY", ""),
-        help="Necessária para leitura automática de PDFs (sentenças, acórdãos, iniciais e CTPS).",
+        help="Cole sua chave Gemini (AIza...) para ler sentenças, acórdãos, CTPS e contracheques.",
     )
 
     st.markdown("**Dados do Escritório & Minuta**")
@@ -1823,24 +1883,17 @@ with st.sidebar:
     st.session_state["params"]["cidade_assinatura"] = cidade_sb
 
     st.divider()
-    st.markdown("**Agente PJe-Calc & Sincronização**")
+    st.markdown("**Regras & Tabelas Vigentes**")
     sync_meta = st.session_state.get("sync_status_info", SYNC_STATUS_INFO)
     st.caption(
-        f"• **Status:** `{sync_meta['status']}` ({sync_meta['fonte']})\n"
+        f"• **Status:** `{sync_meta['status']}`\n"
         f"• **Tabelas INSS / IRRF (RRA):** Vigentes até `{sync_meta['ultima_competencia']}`\n"
-        f"• **Índices BACEN (SGS):** Atualização automática (SELIC, IPCA, IPCA-E, TR)"
+        f"• **Índices BACEN:** SELIC, IPCA, IPCA-E e TR sincronizados"
     )
 
-    with st.expander("Sincronização Automática & PJe-Calc", expanded=False):
-        pjc_ep_sb = st.text_input(
-            "URL PJe-Calc Cidadão Local",
-            value=st.session_state.get("pjecalc_endpoint", "http://localhost:9257/pjecalc"),
-            key="sb_pjc_endpoint",
-        )
-        st.session_state["pjecalc_endpoint"] = pjc_ep_sb
-
+    with st.expander("Atualizar Tabelas Legais (.JSON)", expanded=False):
         feed_url_sb = st.text_input(
-            "URL Feed de Tabelas Legais (JSON)",
+            "URL Feed de Tabelas (JSON)",
             value=st.session_state.get("tables_feed_url", ""),
             placeholder="https://.../tabelas_pjecalc.json",
             key="sb_tables_feed_url",
@@ -1848,11 +1901,11 @@ with st.sidebar:
         st.session_state["tables_feed_url"] = feed_url_sb
 
         uploaded_tbl = st.file_uploader(
-            "Atualizar Tabelas Vigentes (.JSON)",
+            "Importar Pacote de Tabelas (.JSON)",
             type=["json"],
             key="sb_upload_tables_json",
         )
-        if st.button("🔄 Sincronizar Agora (BACEN + Tabelas)", use_container_width=True, key="btn_sync_all_now"):
+        if st.button("🔄 Sincronizar Agora", use_container_width=True, key="btn_sync_all_now"):
             raw_json_str = uploaded_tbl.getvalue().decode("utf-8") if uploaded_tbl is not None else None
             new_sync = sync_legal_tables_dynamic(remote_url=feed_url_sb, raw_json_override=raw_json_str)
             st.session_state["sync_status_info"] = new_sync
@@ -1868,41 +1921,57 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
     st.markdown(
         """
         <div class="hero-banner">
-            <h1>JurisCalc Pro — Liquidação Trabalhista Automatizada</h1>
-            <p>Leitura inteligente de sentenças e acórdãos, apuração mês a mês no padrão PJe-Calc, atualização ADC 58 / Lei 14.905/2024 e emissão pronta de Planilha PDF, arquivo .PJC e Minuta.</p>
+            <h1>JurisCalc Pro — Liquidação Trabalhista</h1>
+            <p>Anexe os autos do processo, informe seu parecer/orientações jurídicas e gere automaticamente a Planilha PDF, o arquivo .PJC e a Minuta no padrão oficial PJe-Calc.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("1. Importar Autos do Processo (PDF: Sentença, Acórdão, Inicial, CTPS, Contracheques)", expanded=True):
+    with st.container(border=True):
+        st.subheader("1. Autos do Processo & Parecer do Advogado")
         uploaded_docs = st.file_uploader(
-            "Selecione os arquivos do processo em PDF ou TXT",
+            "Anexe os arquivos do processo (Sentença, Acórdão, Petição Inicial, CTPS, Contracheques em PDF ou TXT)",
             type=["pdf", "txt"],
             accept_multiple_files=True,
         )
-        col_btn1, col_btn2 = st.columns([1, 1])
-        with col_btn1:
-            if st.button("🤖 Analisar Autos com IA e Liquidar Automaticamente", type="primary", use_container_width=True):
-                if not uploaded_docs:
-                    st.warning("Anexe ao menos um PDF do processo ou utilize os parâmetros abaixo para calcular.")
-                else:
-                    with st.spinner("Extraindo dados do processo, identificando vínculo contratual e liquidando verbas..."):
-                        raw_txt = extract_text_from_uploaded_files(uploaded_docs)
-                        extracted_params = analyze_case_with_gemini(raw_txt, api_key_input, cidade_sb)
-                        extracted_params["advogado_nome"] = adv_nome_sb
-                        extracted_params["advogado_oab"] = adv_oab_sb
-                        extracted_params["cidade_assinatura"] = cidade_sb
-                        _recompute_from_current_params(extracted_params, save_to_history=True)
-                        st.success("Autos analisados e liquidação concluída com sucesso!")
-        with col_btn2:
-            if st.button("📋 Carregar Caso Modelo Demonstrativo", use_container_width=True):
-                sample = get_default_sample_params()
-                sample["advogado_nome"] = adv_nome_sb
-                sample["advogado_oab"] = adv_oab_sb
-                sample["cidade_assinatura"] = cidade_sb
-                _recompute_from_current_params(sample, save_to_history=False)
-                st.info("Caso modelo carregado.")
+
+        parecer_adv_input = st.text_area(
+            "Parecer / Comentários do Advogado para a IA considerar na análise (Opcional, mas recomendado)",
+            value=st.session_state["params"].get("parecer_advogado", ""),
+            placeholder=(
+                "Ex.: Considerar apenas o vínculo com a empresa X (01/03/2022 a 15/08/2024); "
+                "aplicar divisor 200 conforme norma coletiva; calcular 25 horas extras 50% por mês com reflexos em 13º, férias + 1/3, aviso prévio e FGTS + 40%; "
+                "honorários sucumbenciais de 10% fixados na sentença."
+            ),
+            height=110,
+        )
+        st.session_state["params"]["parecer_advogado"] = parecer_adv_input
+
+        if st.button("🤖 Analisar Autos + Parecer e Gerar Cálculo Completo", type="primary", use_container_width=True):
+            if not uploaded_docs:
+                st.error("Por favor, anexe pelo menos um arquivo PDF ou TXT do processo antes de iniciar a análise.")
+            else:
+                with st.spinner("Lendo documentos do processo, aplicando seu parecer e liquidando verbas no padrão PJe-Calc..."):
+                    raw_txt = extract_text_from_uploaded_files(uploaded_docs)
+                    extracted_params, err_msg, resumo_ia = analyze_case_with_gemini(
+                        uploaded_files=uploaded_docs,
+                        raw_text=raw_txt,
+                        api_key=api_key_input,
+                        parecer_advogado=parecer_adv_input,
+                        cidade_default=cidade_sb,
+                    )
+                    extracted_params["advogado_nome"] = adv_nome_sb
+                    extracted_params["advogado_oab"] = adv_oab_sb
+                    extracted_params["cidade_assinatura"] = cidade_sb
+                    _recompute_from_current_params(extracted_params, save_to_history=True)
+                    st.session_state["last_ai_error"] = err_msg
+                    st.session_state["last_ai_summary"] = resumo_ia
+
+    if st.session_state.get("last_ai_error"):
+        st.warning(st.session_state["last_ai_error"])
+    elif st.session_state.get("last_ai_summary"):
+        st.success(f"**Análise Concluída:** {st.session_state['last_ai_summary']}")
 
     params = st.session_state["params"]
     result = st.session_state["result"]
@@ -1954,12 +2023,13 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
     st.write("")
 
     # Botões de Exportação Direta
+    proc_slug = re.sub(r"[^0-9A-Za-z\-]", "_", str(params.get("processo_cnj") or "calculo"))
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button(
             "📄 Baixar Planilha Oficial (PDF Padrão PJe-Calc)",
             data=st.session_state.get("pdf_bytes", b""),
-            file_name=f"Planilha_PJeCalc_{params.get('processo_cnj', 'calculo')}.pdf",
+            file_name=f"Planilha_PJeCalc_{proc_slug}.pdf",
             mime="application/pdf",
             type="primary",
             use_container_width=True,
@@ -1968,7 +2038,7 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
         st.download_button(
             "💾 Baixar Arquivo Interoperável (.PJC)",
             data=st.session_state.get("pjc_bytes", b""),
-            file_name=f"Calculo_{params.get('processo_cnj', 'calculo')}.pjc",
+            file_name=f"Calculo_{proc_slug}.pjc",
             mime="application/xml",
             use_container_width=True,
         )
@@ -1976,7 +2046,7 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
         st.download_button(
             "📝 Baixar Minuta de Apresentação (.TXT)",
             data=st.session_state.get("minuta_txt", "").encode("utf-8"),
-            file_name=f"Minuta_Liquidacao_{params.get('processo_cnj', 'calculo')}.txt",
+            file_name=f"Minuta_Liquidacao_{proc_slug}.txt",
             mime="text/plain",
             use_container_width=True,
         )
@@ -2007,16 +2077,16 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
             params["municipio"] = st.text_input("Município / Cidade da Minuta", value=params.get("municipio", "Gravataí"))
             params["cidade_assinatura"] = params["municipio"]
         with col_c:
-            params["admissao"] = st.text_input("Data de Admissão (AAAA-MM-DD)", value=params.get("admissao", "2021-03-01"))
-            params["demissao"] = st.text_input("Data de Demissão (AAAA-MM-DD)", value=params.get("demissao", "2024-02-15"))
-            params["data_ajuizamento"] = st.text_input("Data de Ajuizamento (AAAA-MM-DD)", value=params.get("data_ajuizamento", "2024-04-10"))
+            params["admissao"] = st.text_input("Data de Admissão (AAAA-MM-DD)", value=params.get("admissao", "2022-01-10"))
+            params["demissao"] = st.text_input("Data de Demissão (AAAA-MM-DD)", value=params.get("demissao", "2024-06-15"))
+            params["data_ajuizamento"] = st.text_input("Data de Ajuizamento (AAAA-MM-DD)", value=params.get("data_ajuizamento", "2024-08-20"))
             params["data_liquidacao"] = st.text_input("Data de Liquidação (AAAA-MM-DD)", value=params.get("data_liquidacao", date.today().isoformat()))
 
         col_d, col_e, col_f, col_g = st.columns(4)
         with col_d:
-            params["maior_remuneracao"] = st.number_input("Maior Remuneração (R$)", value=float(params.get("maior_remuneracao", 3450.0)), step=50.0)
+            params["maior_remuneracao"] = st.number_input("Maior Remuneração (R$)", value=float(params.get("maior_remuneracao", 0.0)), step=50.0)
         with col_e:
-            params["ultima_remuneracao"] = st.number_input("Última Remuneração (R$)", value=float(params.get("ultima_remuneracao", 3450.0)), step=50.0)
+            params["ultima_remuneracao"] = st.number_input("Última Remuneração (R$)", value=float(params.get("ultima_remuneracao", 0.0)), step=50.0)
         with col_f:
             params["honorarios_sucumbencia_pct"] = st.number_input("Honorários Sucumbenciais (%)", value=float(params.get("honorarios_sucumbencia_pct", 15.0)), step=1.0)
         with col_g:
@@ -2033,7 +2103,25 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
             params["apurar_irrf"] = st.checkbox("Apurar IRRF (RRA)", value=bool(params.get("apurar_irrf", True)))
 
         st.markdown("#### Verbas Deferidas no Cálculo")
-        df_verbas = pd.DataFrame(params.get("verbas", []))
+        verbas_list = params.get("verbas", [])
+        if not verbas_list:
+            verbas_list = [
+                {
+                    "nome": "HORAS EXTRAS 50%",
+                    "tipo": "HORAS_EXTRAS",
+                    "aliquota_ou_percentual": 0.50,
+                    "quantidade_mensal": 0.0,
+                    "divisor": 220.0,
+                    "inicio": params.get("admissao", "2022-01-10"),
+                    "fim": params.get("demissao", "2024-06-15"),
+                    "incide_fgts": True,
+                    "incide_inss": True,
+                    "incide_irrf": True,
+                    "gera_reflexos_13_ferias_aviso": True,
+                    "ativo": True,
+                }
+            ]
+        df_verbas = pd.DataFrame(verbas_list)
         edited_verbas = st.data_editor(
             df_verbas,
             num_rows="dynamic",
@@ -2042,9 +2130,9 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
         )
         if st.button("✅ Recalcular Liquidação e Atualizar Arquivos", type="primary"):
             params["verbas"] = edited_verbas.to_dict(orient="records")
-            adm = parse_date_br(params.get("admissao")) or date(2021, 3, 1)
-            dem = parse_date_br(params.get("demissao")) or date(2024, 2, 15)
-            sal_p = float(params.get("ultima_remuneracao", 3450.0))
+            adm = parse_date_br(params.get("admissao")) or date(2022, 1, 10)
+            dem = parse_date_br(params.get("demissao")) or date(2024, 6, 15)
+            sal_p = float(params.get("ultima_remuneracao", 0.0))
             sal_d = float(params.get("maior_remuneracao", sal_p))
             params["historico_salarial"] = [
                 {"competencia": f"{y:04d}-{m:02d}", "salario_pago": sal_p, "salario_devido": sal_d}
@@ -2072,6 +2160,8 @@ if nav_page == "⚖️ Novo Cálculo (.PJC + Planilha)":
         st.dataframe(df_resumo, use_container_width=True, hide_index=True)
 
     with tab_verbas:
+        if not result["verbas_detalhadas"]:
+            st.info("Nenhuma verba apurada ainda. Anexe os autos acima ou adicione verbas na aba 'Conferência dos Parâmetros'.")
         for vd in result["verbas_detalhadas"]:
             with st.expander(f"📌 {vd['nome']} — Total Corrigido: {fmt_brl_rs(vd['total_corrigido'])}", expanded=False):
                 df_oc = pd.DataFrame([
