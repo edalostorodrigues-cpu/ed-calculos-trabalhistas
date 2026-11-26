@@ -1691,7 +1691,7 @@ Retorne EXCLUSIVAMENTE um JSON válido neste formato exato:
 
     contents_payload: List[Any] = [prompt]
 
-    # Envia os PDFs diretamente de forma multimodal para ler tanto texto quanto páginas digitalizadas/CTPS
+    # Envia os PDFs diretamente de forma multimodal (até 18 MB por chamada) e garante o texto integral extraído
     total_pdf_bytes = 0
     for uf in uploaded_files:
         raw_b = uf.getvalue()
@@ -1702,18 +1702,36 @@ Retorne EXCLUSIVAMENTE um JSON válido neste formato exato:
             total_pdf_bytes += len(raw_b)
 
     if raw_text and raw_text.strip():
-        contents_payload.append(f"TEXTO EXTRAÍDO DOS AUTOS:\n{raw_text[:80000]}")
+        contents_payload.append(f"TEXTO EXTRAÍDO DOS AUTOS:\n{raw_text[:180000]}")
 
     try:
         client = genai.Client(api_key=api_key.strip())
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents_payload,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
+        candidate_models = ["gemini-3.8-flash", "gemini-3-flash", "gemini-2.5-pro"]
+        response = None
+        last_err: Optional[Exception] = None
+
+        for model_name in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents_payload,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                if response and response.text:
+                    break
+            except Exception as model_exc:
+                last_err = model_exc
+                err_str = str(model_exc)
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    continue
+                raise
+
+        if response is None:
+            raise last_err or RuntimeError("Nenhum modelo Gemini disponível respondeu.")
+
         raw_resp = (response.text or "").strip()
         if raw_resp.startswith("```"):
             raw_resp = re.sub(r"^```(?:json)?\s*", "", raw_resp)
